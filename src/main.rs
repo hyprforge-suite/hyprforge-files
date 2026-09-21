@@ -1928,7 +1928,7 @@ impl App {
             if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                 return Some(Message::ModifiersChanged(*modifiers));
             }
-            key_press(&event).map(Message::KeyPressed)
+            hyprforge_ui::keys::key_press(&event).map(Message::KeyPressed)
         });
         Subscription::batch([
             keys,
@@ -2669,100 +2669,6 @@ const RESIZE_SETTLE: u64 = 400;
 /// though nothing paints their background, so activating one makes a
 /// fill appear in exactly the right shape with no reflow.
 const TAB_PADDING_X: u16 = 14;
-
-/// One iced key press, as the keymap reads it — or `None` for a key no
-/// binding can name.
-///
-/// Two fields, deliberately from two places — the CLAUDE.md rule on the
-/// three things iced reports for a key press:
-///
-/// - `key` comes from iced's *unmodified* `key`, which is what a binding
-///   is matched against. Ctrl+Shift+N arrives as `n` with Ctrl and Shift
-///   held, which is exactly how the binding is written.
-/// - `text` comes from iced's `text`, what the press actually typed, and
-///   is only ever used for typing into search. Reading `key` for that
-///   would turn `Shift+/` into `/`.
-fn key_press(event: &keyboard::Event) -> Option<keymap::KeyPress> {
-    let keyboard::Event::KeyPressed { key: pressed, modifiers, text, .. } = event else {
-        return None;
-    };
-    let mods = keymap::Modifiers {
-        ctrl: modifiers.control(),
-        alt: modifiers.alt(),
-        shift: modifiers.shift(),
-        logo: modifiers.logo(),
-    };
-    let key = match pressed.as_ref() {
-        Key::Named(named) => match named {
-            key::Named::Enter => keymap::Key::Enter,
-            key::Named::Backspace => keymap::Key::Backspace,
-            key::Named::Escape => keymap::Key::Escape,
-            key::Named::Delete => keymap::Key::Delete,
-            key::Named::Tab => keymap::Key::Tab,
-            key::Named::Space => keymap::Key::Space,
-            key::Named::ArrowUp => keymap::Key::Up,
-            key::Named::ArrowDown => keymap::Key::Down,
-            key::Named::ArrowLeft => keymap::Key::Left,
-            key::Named::ArrowRight => keymap::Key::Right,
-            key::Named::Home => keymap::Key::Home,
-            key::Named::End => keymap::Key::End,
-            key::Named::PageUp => keymap::Key::PageUp,
-            key::Named::PageDown => keymap::Key::PageDown,
-            key::Named::Insert => keymap::Key::Insert,
-            key::Named::ContextMenu => keymap::Key::Menu,
-            other => keymap::Key::F(function_key_number(other)?),
-        },
-        Key::Character(c) => {
-            let mut chars = c.chars();
-            match (chars.next(), chars.next()) {
-                (Some(ch), None) => keymap::Key::Char(ch.to_lowercase().next().unwrap_or(ch)),
-                _ => return None,
-            }
-        }
-        _ => return None,
-    };
-    let text = text.as_ref().and_then(|t| {
-        let mut chars = t.chars();
-        match (chars.next(), chars.next()) {
-            (Some(ch), None) => Some(ch),
-            _ => None,
-        }
-    });
-    Some(keymap::KeyPress { key, mods, text })
-}
-
-/// F1 to F24 as their number, `None` for any other named key.
-fn function_key_number(named: key::Named) -> Option<u8> {
-    use key::Named as N;
-    let n = match named {
-        N::F1 => 1,
-        N::F2 => 2,
-        N::F3 => 3,
-        N::F4 => 4,
-        N::F5 => 5,
-        N::F6 => 6,
-        N::F7 => 7,
-        N::F8 => 8,
-        N::F9 => 9,
-        N::F10 => 10,
-        N::F11 => 11,
-        N::F12 => 12,
-        N::F13 => 13,
-        N::F14 => 14,
-        N::F15 => 15,
-        N::F16 => 16,
-        N::F17 => 17,
-        N::F18 => 18,
-        N::F19 => 19,
-        N::F20 => 20,
-        N::F21 => 21,
-        N::F22 => 22,
-        N::F23 => 23,
-        N::F24 => 24,
-        _ => return None,
-    };
-    Some(n)
-}
 
 /// Moves `paths` to the Trash, off the UI thread. Returns each item that
 /// went — as stored path, original path and record, which is what an
