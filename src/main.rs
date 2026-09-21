@@ -1498,7 +1498,7 @@ impl App {
                     let outcome = self.active_tab_mut().browser.perform(action);
                     self.handle_outcome(self.active, outcome)
                 }
-                Some(Resolved::Type(c)) => {
+                Some(Resolved::Text(c)) => {
                     let outcome =
                         self.active_tab_mut().browser.update(BrowserMessage::TypeToSearch(c));
                     self.handle_outcome(self.active, outcome)
