@@ -1,0 +1,96 @@
+# CI for the standalone hyprforge-files repository (this file only takes
+# effect at `.github/workflows/ci.yml` — the path `./split.sh` produces
+# once `crates/hyprforge-files` becomes a repository root).
+#
+# What this checks: the crate builds, clippy is silent (a clippy warning
+# is a build failure in Hyprforge), and the tests that need nothing but
+# this process. That is a real amount for this crate — the browser model,
+# the archive round trips against real zip/tar/7z files built in a
+# tempdir, the job queue and the transfers panel all run here.
+#
+# What it deliberately does NOT check:
+#   - `tests/nested_clipboard.rs` is `#[ignore]`d: it writes a real
+#     Wayland clipboard and refuses the session's own display, so it
+#     needs a nested compositor. A plain `cargo test` skipping it is
+#     correct, not a pass on that question.
+#   - it never opens a window, and never launches anything. Whether a
+#     double-click reaches the right application is the shared MIME
+#     database's answer on a real machine, and a runner has none.
+#
+# A green run means the code is internally consistent. It does not mean
+# the window has ever drawn.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tier-1:
+    name: "Tier 1 (no compositor, no clipboard): build, clippy -D warnings, cargo test"
+    runs-on: ubuntu-latest
+    env:
+      # Cargo fetches git dependencies with libgit2, which does not honour
+      # the `url.<..>.insteadOf` rewrite the step below installs, so the
+      # credential never reaches the clone and the build fails with
+      # "failed to authenticate" — which reads like a code problem and is
+      # not one. This is the setting cargo's own error names.
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Let cargo fetch the suite while it is still a private repository
+        # This crate takes its hyprforge-* siblings as git dependencies on
+        # the suite repository. While that repository is PRIVATE the
+        # built-in GITHUB_TOKEN cannot read it — an Actions token is
+        # scoped to the repository its workflow runs in and grants
+        # nothing on another private repository in the same account.
+        #
+        # SUITE_READ is a fine-grained token with read-only Contents on
+        # the suite repository and nothing else. It has to be added to
+        # this repository's secrets before CI can pass; there is no way
+        # to copy one between repositories, so a new component's first
+        # run fails on authentication until someone sets it.
+        #
+        # An `extraheader` rather than a credential in the URL: the URL
+        # form is the shape of a GitHub App installation token, not a
+        # personal access token, and GitHub refuses it. The token arrives
+        # by environment variable so it is never on a command line a
+        # failing step would echo.
+        #
+        # Delete this step and the secret the day the suite repository
+        # becomes public.
+        env:
+          SUITE_READ: ${{ secrets.SUITE_READ }}
+        run: |
+          git config --global http."https://github.com/".extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SUITE_READ" | base64 -w0)"
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        # `rustup show` is what makes rustup notice rust-toolchain.toml
+        # here and install exactly the channel and components it pins,
+        # rather than whatever `stable` resolves to on the day the job
+        # runs — which matters because clippy's lint set moves between
+        # releases and this job treats a warning as a failure.
+        run: rustup show
+
+      - name: Cache the cargo registry and build output
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install native dependencies
+        # The `*-sys` crates in this crate's graph, confirmed with
+        # `cargo tree --edges normal,build` rather than assumed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y pkg-config libxkbcommon-dev libwayland-dev
+
+      - name: cargo build
+        run: cargo build --all-targets
+
+      - name: cargo clippy --all-targets -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: "cargo test (tier 1 only)"
+        run: cargo test --all-targets
