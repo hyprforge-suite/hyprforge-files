@@ -58,6 +58,16 @@ pub struct JobSummary {
     /// wording `OpsError`'s `Display` produces.
     pub failed: Vec<String>,
     pub cancelled: bool,
+    /// The archive this job stopped on for want of a password.
+    ///
+    /// Carried as a field rather than left to be recognised in
+    /// `failed` by its wording: "did this need a password" is a
+    /// question the window acts on (it opens a prompt), and deciding it
+    /// by matching a sentence would break the moment that sentence was
+    /// reworded — which is exactly the sort of thing a message is
+    /// allowed to do. Always `None` for a paste; see
+    /// `crate::archive_jobs`.
+    pub needs_password: Option<std::path::PathBuf>,
 }
 
 impl JobSummary {
@@ -75,6 +85,18 @@ pub struct JobControl {
 }
 
 impl JobControl {
+    /// Builds one over a decision channel and a cancel flag.
+    ///
+    /// For a job that runs somewhere other than [`start`] — see
+    /// [`crate::archive_jobs`], which reports the same events but does
+    /// its work through a different library.
+    pub fn new(
+        decisions: std::sync::mpsc::Sender<CollisionDecision>,
+        cancel: Arc<AtomicBool>,
+    ) -> JobControl {
+        JobControl { decisions, cancel }
+    }
+
     /// Answers the collision the job is paused on.
     pub fn answer(&self, decision: CollisionDecision) {
         // A job that already finished has dropped its receiver; an answer
@@ -313,6 +335,18 @@ pub fn undo(done: hyprforge_files_core::undo::Undoable) -> (Vec<std::path::PathB
                 }
                 match hyprforge_fileops::trash(&copy) {
                     Ok(_) => touched(&mut dirs, &copy),
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+        }
+        // Both go to the Trash rather than being deleted, the rule
+        // `Copied` above already follows: an undo that loses a file is
+        // worse than no undo, and an extracted folder may well have
+        // things in it by now that the extraction did not put there.
+        Undoable::Extracted(into) | Undoable::Compressed(into) => {
+            if exists(&into) {
+                match hyprforge_fileops::trash(&into) {
+                    Ok(_) => touched(&mut dirs, &into),
                     Err(e) => errors.push(e.to_string()),
                 }
             }

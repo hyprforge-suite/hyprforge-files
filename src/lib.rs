@@ -9,8 +9,11 @@
 //! `hyprforge-files-core`, because the portal's open/save dialog has to
 //! render the same one. What this crate owns is the window around it
 //! and the things a dialog deliberately does not have: launching what
-//! you double-click, and file operations.
+//! you double-click, and file operations — including the ones that go
+//! through an archive, which `archive_jobs` runs the same way `jobs`
+//! runs a paste.
 
+pub mod archive_jobs;
 pub mod jobs;
 pub mod launch;
 pub mod system_clipboard;

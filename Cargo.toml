@@ -1,8 +1,14 @@
 [package]
 name = "hyprforge-files"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A file manager for Hyprland: tabs, a sidebar, list and grid views, the freedesktop trash, copy and paste with other applications, and zip/tar/7z archives browsed and edited in place."
+repository = "https://github.com/adamrpostjr/hyprforge"
+documentation = "https://docs.rs/hyprforge-files"
+readme = "README.md"
+keywords = ["hyprland", "wayland", "file-manager", "iced", "linux"]
+categories = ["os::linux-apis", "gui"]
 
 [[bin]]
 name = "hyprforge-files"
@@ -13,19 +19,24 @@ path = "src/main.rs"
 # portal's open/save dialog has to render the same one. This crate is
 # the window around it: navigation chrome, the keyboard grammar, and
 # the file operations a dialog deliberately does not have.
-hyprforge-files-core.workspace = true
-hyprforge-fileops.workspace = true
+hyprforge-files-core = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-fileops = { git = "https://github.com/adamrpostjr/hyprforge" }
 # What a file is, and which applications can open it — see
 # `launch.rs` for why the launching itself is still the desktop's.
-hyprforge-mime.workspace = true
+hyprforge-mime = { git = "https://github.com/adamrpostjr/hyprforge" }
+# Zip, tar and 7z. The browsing of them is `hyprforge-files-core`'s
+# (through `FsBackend`); what this crate adds is the long, cancellable
+# work — extracting, compressing and rewriting — which needs the backend
+# directly rather than through a listing.
+hyprforge-archive = { git = "https://github.com/adamrpostjr/hyprforge" }
 # The Wayland clipboard, so copied files reach other applications and
 # theirs reach this one. The library only — this app never needs the
 # clipboard history daemon to be installed or running.
-hyprforge-clipboard.workspace = true
-hyprforge-ui.workspace = true
-hyprforge-look.workspace = true
-hyprforge-appearance.workspace = true
-hyprforge-paths.workspace = true
+hyprforge-clipboard = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-ui = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-look = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-appearance = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-paths = { git = "https://github.com/adamrpostjr/hyprforge" }
 # `tokio` on top of the workspace base, the same addition
 # `hyprforge-settings` makes and for the same reason: it selects iced's
 # tokio executor, so the futures a `Task` runs are polled inside a tokio
@@ -41,21 +52,38 @@ hyprforge-paths.workspace = true
 # across the top and down the other, and stops — iced's `Border` has a
 # single width for all four sides, so the open bottom edge that makes a
 # tab a tab rather than a floating pill has to be a drawn path.
-iced = { workspace = true, features = ["tokio", "canvas"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+iced = { version = "0.14", default-features = false, features = [
+    "wgpu",
+    "tiny-skia",
+    "crisp",
+    "thread-pool",
+    "linux-theme-detection",
+    "x11",
+    "wayland",
+    "tokio",
+    "canvas",
+] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Not a dev-dependency: a file opened out of an archive is unpacked to a
+# scratch directory first — see `App::open_from_archive`.
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
+# Building an encrypted zip by hand, to prove the window opens a password
+# prompt rather than reporting a failure. This crate's own writer will
+# not produce one — encrypting an archive is not a thing it offers.
+zip = "8"
 # The `mock` feature turns on `hyprforge_files_core::backend::MockBackend`,
 # which this crate's tests drive the whole window against — the window
 # owns an `Arc<dyn FsBackend>`, so its update loop (stale generations,
 # tab routing, folder counts) can be exercised without a real disk.
-hyprforge-files-core = { workspace = true, features = ["mock"] }
+hyprforge-files-core = { git = "https://github.com/adamrpostjr/hyprforge", features = ["mock"] }
 # `MockFilesystem`, so undo's tests can trash into a temporary directory
 # rather than the real Trash of whoever runs them.
-hyprforge-fileops = { workspace = true, features = ["mock"] }
+hyprforge-fileops = { git = "https://github.com/adamrpostjr/hyprforge", features = ["mock"] }

@@ -174,11 +174,66 @@ directory.
 **G — Transfers (`1f`).** `hyprforge-fileops::ops` already reports progress and
 cancels per chunk; this is the popover and the queue window over it.
 
+*Partly built.* The panel shows every running job — the window had always kept
+a `Vec` and drawn the first, which only started to matter once extracting,
+compressing and rewriting an archive became jobs too. Each row has a bar, a
+rate and an estimate, and failures now live in a panel that keeps them rather
+than a status line the next job overwrites.
+
+Not built, and each for a reason rather than for lack of time:
+
+- **Pause.** `JobControl` can cancel but not pause, and pausing a job that is
+  midway through rewriting an archive is not a state worth being able to sit
+  in — the rewrite holds a temporary file beside the original until it
+  finishes.
+- ~~**A queue.**~~ Built, and it turned out to be a correctness fix rather
+  than a scheduling preference — see below.
+- **Completed/Failed tabs, retry policy, "Retry as root".** The failures panel
+  covers what the Failed tab is for. A retry policy needs a queue; "as root"
+  needs privilege escalation this suite does not do.
+- **"Queue survives window close · resumes on reconnect".** Jobs are threads
+  in this process, and the remote transfers that line is really about need
+  phase I's mounts.
+- **A Start button on a queued row.** `1f` has one. A job here is queued
+  either because the machine is busy, where starting it early gains nothing,
+  or because it would rewrite an archive another job is already rewriting —
+  where starting it early is the data loss the queue exists to prevent. A
+  button that is only sometimes safe is worse than no button.
+
+The queue serialises on *conflict* first and a count second. Two jobs that
+rewrite the same archive never run together, whatever else is going on,
+because each reads the whole archive and writes a whole new one: the later
+rename wins and the earlier edit is silently lost. Everything else runs two at
+a time, and a blocked job does not hold up an unrelated one behind it.
+
 **H — the command palette.** `1l`'s idea, inside `1b`.
 
 **I — Devices, mounts, archives (`1j`)** and the terminal drawer (`1i`).
 Archives and network shares were already phases 6 and 7 of the original plan;
 the drawer is new and is the most cuttable thing here.
+
+*Archives are done, ahead of this order* — see `hyprforge-archive` and
+`hyprforge-files-core::archive`. Two deliberate departures from `1j`, and one
+thing still owed:
+
+- The mockup labels the pane **read-only**. It is not: members can be added,
+  renamed and deleted, and a file opened out of an archive is watched so an
+  edit can be offered back. Decided with the user; the rest of `1j` is
+  followed.
+- The mockup's buttons are **Extract here** and **Extract to…**. What shipped
+  is *Extract* (into a new folder named after the archive, so a tarbomb cannot
+  scatter two hundred files) and *Extract Here* (into the folder in view).
+  There is no destination picker: inside an archive "here" means the folder
+  the archive lives in, which is the only real folder on screen, and a picker
+  that almost always answers that is a dialog charging for something nobody
+  chose.
+- **Still owed from `1j`:** the `Packed` column (per-member compressed size,
+  which `hyprforge_archive::Member::compressed` already carries and nothing
+  displays) and the summary line — `zstd · 3 entries · 20.3 MB → 7.0 MB`.
+
+`1f` draws an extraction sitting in the transfers queue beside a copy, and
+that already works the way it has to: archive jobs report the same `JobEvent`
+as a paste, so when phase G builds the popover they appear in it for free.
 
 ## Deferred, and what that costs
 
