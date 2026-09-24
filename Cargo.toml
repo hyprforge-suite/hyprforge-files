@@ -29,6 +29,10 @@ hyprforge-mime = { git = "https://github.com/adamrpostjr/hyprforge" }
 # work — extracting, compressing and rewriting — which needs the backend
 # directly rather than through a listing.
 hyprforge-archive = { git = "https://github.com/adamrpostjr/hyprforge" }
+# Grid thumbnails and the preview pane: decoded within a budget, with
+# the EXIF orientation applied — the same decode the image viewer uses,
+# so a photograph is the same way up in both.
+hyprforge-image = { git = "https://github.com/adamrpostjr/hyprforge" }
 # The Wayland clipboard, so copied files reach other applications and
 # theirs reach this one. The library only — this app never needs the
 # clipboard history daemon to be installed or running.
@@ -62,6 +66,8 @@ iced = { version = "0.14", default-features = false, features = [
     "wayland",
     "tokio",
     "canvas",
+    # Thumbnails and the preview pane draw decoded pixels.
+    "image",
 ] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }

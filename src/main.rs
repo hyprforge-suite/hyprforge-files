@@ -1490,6 +1490,12 @@ impl App {
                 Message::PrefsSaved,
             ),
             Outcome::Pins(change) => self.change_pins(&change),
+            Outcome::LoadThumbnails(paths) => Task::run(thumbnail_stream(paths), |(path, handle)| {
+                Message::Browser(BrowserMessage::ThumbnailLoaded(path, handle))
+            }),
+            Outcome::LoadPreview(path) => Task::perform(decode_preview(path), |(path, handle)| {
+                Message::Browser(BrowserMessage::PreviewLoaded(path, handle))
+            }),
             Outcome::CountFolders(folders) => {
                 Task::perform(count_folders(self.backend.clone(), folders), |counts| {
                     Message::Browser(BrowserMessage::CountsLoaded(counts))
@@ -4449,6 +4455,60 @@ const COUNT_BUDGET: usize = 400;
 /// settings, over whatever is on disk for everything a tab does not own.
 /// A tab's `Prefs` was copied when it opened, so its pinned list and
 /// window size are out of date by the time it saves.
+/// A grid thumbnail's decode edge, physical pixels: twice the grid icon's
+/// logical size, so it stays sharp on a 2x display.
+const THUMBNAIL_EDGE: u32 = 112;
+
+/// The preview pane's picture, physical pixels, for the same reason.
+const PREVIEW_EDGE: u32 = (hyprforge_files_core::browser::PREVIEW_WIDTH as u32) * 2;
+
+/// Decodes `path` within `edge` into something the view can draw, or
+/// `None` when it would not decode — which the browser shows as the icon.
+fn decode_to_handle(path: &std::path::Path, edge: u32) -> Option<iced::widget::image::Handle> {
+    hyprforge_image::decode_to_fit(path, &hyprforge_image::Budget::for_edge(edge))
+        .map(|d| iced::widget::image::Handle::from_rgba(d.size.width, d.size.height, d.pixels))
+        .map_err(|e| tracing::debug!(error = %e, path = %path.display(), "no thumbnail"))
+        .ok()
+}
+
+/// Grid thumbnails, one at a time, each sent back as soon as it exists.
+///
+/// One at a time on purpose: a task per picture would put a whole
+/// folder's decodes in flight at once, and a decode's peak is the full
+/// photograph before it is shrunk — the resource CLAUDE.md says to ask
+/// about, not only the result. Sequential keeps the peak at one picture
+/// however many there are; streaming keeps the first ones on screen
+/// arriving first.
+fn thumbnail_stream(
+    paths: Vec<PathBuf>,
+) -> impl iced::futures::Stream<Item = (PathBuf, iced::widget::image::Handle)> {
+    iced::stream::channel(16, async move |mut out| {
+        use iced::futures::SinkExt;
+        for path in paths {
+            let for_task = path.clone();
+            let handle = tokio::task::spawn_blocking(move || decode_to_handle(&for_task, THUMBNAIL_EDGE))
+                .await
+                .ok()
+                .flatten();
+            if let Some(handle) = handle {
+                // A closed channel means the window moved on; stop.
+                if out.send((path, handle)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    })
+}
+
+async fn decode_preview(path: PathBuf) -> (PathBuf, Option<iced::widget::image::Handle>) {
+    let for_task = path.clone();
+    let handle = tokio::task::spawn_blocking(move || decode_to_handle(&for_task, PREVIEW_EDGE))
+        .await
+        .ok()
+        .flatten();
+    (path, handle)
+}
+
 fn merge_tab_prefs(on_disk: &Prefs, mut from_tab: Prefs) -> Prefs {
     from_tab.pinned = on_disk.pinned.clone();
     from_tab.window_width = on_disk.window_width;
