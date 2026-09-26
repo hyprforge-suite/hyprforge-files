@@ -125,9 +125,14 @@ pub fn thumbnail(path: &Path, cache: Option<&hyprforge_thumbnails::Cache>) -> Op
     } else if ext == "pdf" {
         pdf_page(path, NORMAL).map(|png| png.and_then(|b| hyprforge_thumbnails::decode_png(&b)))
     } else {
-        probe(path).map(|info| {
-            info.and_then(|info| frame(path, NORMAL, &info, true)).and_then(|b| hyprforge_thumbnails::decode_png(&b))
-        })
+        // A video: its first real frame — past the black most videos
+        // open on — as the photo viewer finds it, so the one cache holds
+        // one answer. See `hyprforge_video::frame`.
+        match hyprforge_video::frame::first_real_frame(path, NORMAL) {
+            Ok(png) => Ok(png.and_then(|b| hyprforge_thumbnails::decode_png(&b))),
+            Err(hyprforge_video::frame::Unavailable::Missing) => Err(Unavailable::Missing),
+            Err(hyprforge_video::frame::Unavailable::Busy) => Err(Unavailable::Busy),
+        }
     };
     match made {
         Ok(Some(rgba)) => {

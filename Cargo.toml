@@ -33,6 +33,10 @@ hyprforge-process = { git = "https://github.com/adamrpostjr/hyprforge" }
 # The freedesktop thumbnail cache — thumbnails made once per version of a
 # file, shared with every other program that makes them.
 hyprforge-thumbnails = { git = "https://github.com/adamrpostjr/hyprforge" }
+# A video's thumbnail is its first real frame, found the same way the
+# photo viewer finds it — the two share one thumbnail cache, and two
+# programs picking different frames would each find the other's there.
+hyprforge-video = { git = "https://github.com/adamrpostjr/hyprforge" }
 # Zip, tar and 7z. The browsing of them is `hyprforge-files-core`'s
 # (through `FsBackend`); what this crate adds is the long, cancellable
 # work — extracting, compressing and rewriting — which needs the backend
