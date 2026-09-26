@@ -4469,16 +4469,7 @@ const THUMBNAIL_EDGE: u32 = 112;
 /// The preview pane's picture, physical pixels, for the same reason.
 const PREVIEW_EDGE: u32 = (hyprforge_files_core::browser::PREVIEW_WIDTH as u32) * 2;
 
-/// Decodes `path` within `edge` into something the view can draw, or
-/// `None` when it would not decode — which the browser shows as the icon.
-fn decode_to_handle(path: &std::path::Path, edge: u32) -> Option<iced::widget::image::Handle> {
-    hyprforge_image::decode_to_fit(path, &hyprforge_image::Budget::for_edge(edge))
-        .map(|d| iced::widget::image::Handle::from_rgba(d.size.width, d.size.height, d.pixels))
-        .map_err(|e| tracing::debug!(error = %e, path = %path.display(), "no thumbnail"))
-        .ok()
-}
-
-/// Grid thumbnails, one at a time, each sent back as soon as it exists.
+/// Thumbnails, one at a time, each sent back as soon as it exists.
 ///
 /// One at a time on purpose: a task per picture would put a whole
 /// folder's decodes in flight at once, and a decode's peak is the full
@@ -4488,12 +4479,14 @@ fn decode_to_handle(path: &std::path::Path, edge: u32) -> Option<iced::widget::i
 /// arriving first.
 fn thumbnail_stream(
     paths: Vec<PathBuf>,
-) -> impl iced::futures::Stream<Item = (PathBuf, iced::widget::image::Handle)> {
+) -> impl iced::futures::Stream<Item = (PathBuf, hyprforge_files_core::preview::Picture)> {
     iced::stream::channel(16, async move |mut out| {
         use iced::futures::SinkExt;
         for path in paths {
             let for_task = path.clone();
-            let handle = tokio::task::spawn_blocking(move || decode_to_handle(&for_task, THUMBNAIL_EDGE))
+            let handle = tokio::task::spawn_blocking(move || {
+                hyprforge_files::preview::thumbnail(&for_task, THUMBNAIL_EDGE)
+            })
                 .await
                 .ok()
                 .flatten();

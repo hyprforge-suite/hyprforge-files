@@ -83,12 +83,32 @@ fn file(path: &Path, kind: &str, mime: &hyprforge_mime::MimeDb, backend: &dyn Fs
     None
 }
 
+/// A thumbnail of `path`, `edge` physical pixels at its widest — the
+/// same pictures the pane draws, asked for smaller. The browser only asks
+/// about names `preview::wants_thumbnail` accepts; one that turns out not
+/// to be what its name said comes back `None` and keeps its icon.
+pub fn thumbnail(path: &Path, edge: u32) -> Option<Picture> {
+    if hyprforge_image::format::looks_decodable(path) {
+        return decode(path, edge);
+    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "svg" => Some(Picture::from_path(path)),
+        "pdf" => pdf(path, edge).picture,
+        _ => media(path, edge, true).picture,
+    }
+}
+
+fn decode(path: &Path, edge: u32) -> Option<Picture> {
+    hyprforge_image::decode_to_fit(path, &hyprforge_image::Budget::for_edge(edge))
+        .map(|d| Picture::Raster(iced::widget::image::Handle::from_rgba(d.size.width, d.size.height, d.pixels)))
+        .map_err(|e| tracing::debug!(error = %e, "no picture"))
+        .ok()
+}
+
 /// A picture this build decodes, and how big it really is.
 fn picture(path: &Path, edge: u32) -> Preview {
-    let picture = hyprforge_image::decode_to_fit(path, &hyprforge_image::Budget::for_edge(edge))
-        .map(|d| Picture::Raster(iced::widget::image::Handle::from_rgba(d.size.width, d.size.height, d.pixels)))
-        .map_err(|e| tracing::debug!(error = %e, "no preview picture"))
-        .ok();
+    let picture = decode(path, edge);
     let mut details = Vec::new();
     if let Ok(measured) = hyprforge_image::measure(path) {
         let (w, h) = measured.display_size();
