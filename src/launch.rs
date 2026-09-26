@@ -270,6 +270,24 @@ mod tests {
         assert!(message.contains("usual application"), "and what still works");
     }
 
+    /// `open` hands a path to `gio open`, which turns it into a file://
+    /// URI and asks that *scheme's* handler before it asks what the
+    /// file is. A desktop entry claiming the scheme therefore becomes
+    /// the opener of everything — measured: double-clicking a PNG with
+    /// the viewer as its default re-raised this window instead. The
+    /// user's defaults are only reachable while nothing claims it.
+    #[test]
+    fn the_desktop_entry_never_claims_every_file_on_the_machine() {
+        let entry = include_str!("../packaging/hyprforge-files.desktop");
+        let types = entry
+            .lines()
+            .find_map(|line| line.strip_prefix("MimeType="))
+            .expect("the entry declares its types");
+        let types: Vec<&str> = types.split(';').filter(|t| !t.is_empty()).collect();
+        assert!(!types.contains(&"x-scheme-handler/file"), "claims: {types:?}");
+        assert!(types.contains(&"inode/directory"), "a folder must still reach Files");
+    }
+
     /// A path with no file name at all (the filesystem root) must still
     /// produce a sentence rather than panicking on an `unwrap` of
     /// `file_name()` — which returns `None` for `/`.

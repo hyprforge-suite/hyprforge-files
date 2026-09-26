@@ -17,6 +17,14 @@ Keywords=files;folder;browse;manager;explorer;finder;
 StartupNotify=true
 # Declaring this is what lets "Open containing folder" in other
 # applications, and `xdg-open` on a directory, reach this program at all.
-# inode/directory is the type a folder has; the two x-scheme handlers are
-# how a file:// or trash:// URI is routed.
-MimeType=inode/directory;x-scheme-handler/file;x-scheme-handler/trash;
+# inode/directory is the type a folder has; the x-scheme handler is how a
+# trash:// URI is routed.
+#
+# Never x-scheme-handler/file. GLib's launch_default_for_uri asks the
+# *scheme's* handler before it looks at the file's type, and `gio open
+# photo.png` goes through a file:// URI — so claiming the scheme made this
+# program the opener of every file on the machine, whatever mimeapps.list
+# said. Double-clicking a picture in Files re-raised Files instead of
+# starting the viewer. A folder reaches this program through
+# inode/directory, which is all the scheme claim was ever meant to do.
+MimeType=inode/directory;x-scheme-handler/trash;
