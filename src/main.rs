@@ -171,6 +171,7 @@ fn main() -> iced::Result {
         last_window_size,
         resize_generation: 0,
         clipboard: Arc::new(hyprforge_files::system_clipboard::SystemClipboard::new()),
+        drag: Arc::new(hyprforge_files::drag_out::DragOut::new()),
         // A handful of small files, read once before the window opens —
         // the same budget the sidebar's `stat`s already spend here. It
         // is not the per-double-click cost it would be if a chooser
@@ -209,7 +210,7 @@ fn main() -> iced::Result {
     // otherwise the window opens showing nothing at all, forever, for
     // the same reason CLAUDE.md's "a five-second gap" rule exists: an
     // outcome nobody satisfies is silent, not merely slow.
-    let boot_task = Task::batch([app.handle_outcome(0, outcome), app.load_pinned()]);
+    let boot_task = Task::batch([app.handle_outcome(0, outcome), app.load_pinned(), app.attach_drag()]);
 
     // `iced::application` calls this closure exactly once; a `RefCell`
     // lets `main` build the real starting state above (which needs I/O)
@@ -468,6 +469,8 @@ enum Message {
     Job(JobEvent),
     /// A finished move emptied the clipboard.
     ClipboardCleared,
+    /// How starting a drag out of the window went — see `drag_out`.
+    DragResult(Result<(), String>),
     /// A finished restore removed the records of what it put back.
     TrashTidied,
     /// An undo finished: the folders it changed, and anything it could
@@ -601,6 +604,10 @@ struct App {
     status: Option<String>,
     /// Copied and cut files, shared by every tab.
     clipboard: Arc<dyn FileClipboard>,
+    /// Dragging files out to another application. Attached once the
+    /// window exists — see `drag_out`'s module doc for why it cannot wait
+    /// for the first drag.
+    drag: Arc<hyprforge_files::drag_out::DragOut>,
     /// Pastes in progress, oldest first.
     jobs: Vec<RunningJob>,
     /// A trash or delete waiting on the confirmation dialog.
@@ -1675,6 +1682,7 @@ impl App {
                 Task::none()
             }
             Outcome::CopyText(text) => iced::clipboard::write(text),
+            Outcome::DragOut(paths) => self.start_drag(paths),
             Outcome::Paste(into) => self.read_clipboard_for(into),
             Outcome::FocusRename { id, select } => Task::batch([
                 iced::widget::operation::focus(id.clone()),
@@ -2407,6 +2415,32 @@ impl App {
         Task::batch([save, self.load_pinned()])
     }
 
+    /// Joins the window's Wayland connection so files can be dragged out
+    /// of it. At startup, because the drag source has to have seen the
+    /// button press a drag begins with — see `drag_out`.
+    fn attach_drag(&self) -> Task<Message> {
+        let drag = self.drag.clone();
+        window::latest().and_then(move |id| {
+            let drag = drag.clone();
+            window::run(id, move |w| drag.attach(w)).discard()
+        })
+    }
+
+    /// Hands `paths` to the compositor as a drag. On the event loop's
+    /// thread, through `window::run`, because that is where the window's
+    /// surface can be named.
+    fn start_drag(&self, paths: Vec<PathBuf>) -> Task<Message> {
+        if paths.is_empty() {
+            return Task::none();
+        }
+        let drag = self.drag.clone();
+        let offers = hyprforge_files_core::clipboard::drag_offers(&paths);
+        window::latest().and_then(move |id| {
+            let (drag, offers) = (drag.clone(), offers.clone());
+            window::run(id, move |w| drag.start(w, offers)).map(Message::DragResult)
+        })
+    }
+
     /// Reads each pinned folder off the UI thread — a pin can be on a
     /// slow or vanished mount.
     fn load_pinned(&self) -> Task<Message> {
@@ -2679,6 +2713,11 @@ impl App {
             Message::RestoreReady(tab_id, items, errors) => self.restore(tab_id, items, errors),
             Message::ClipboardCleared => {
                 self.sync_can_paste();
+                Task::none()
+            }
+            Message::DragResult(Ok(())) => Task::none(),
+            Message::DragResult(Err(why)) => {
+                self.status = Some(why);
                 Task::none()
             }
             Message::Job(event) => self.job_event(event),
@@ -4681,6 +4720,8 @@ mod tests {
             last_window_size: (900, 600),
             resize_generation: 0,
             clipboard: Arc::new(MemoryClipboard::new()),
+            // Never attached: no window, so every drag is refused.
+            drag: Arc::new(hyprforge_files::drag_out::DragOut::new()),
             // Empty, not the machine's own: these tests are about the
             // window's loop, and what happens to be installed here is
             // none of their business. Tests that need a database build

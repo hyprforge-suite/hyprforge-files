@@ -14,6 +14,7 @@
 //! runs a paste.
 
 pub mod archive_jobs;
+pub mod drag_out;
 pub mod jobs;
 pub mod launch;
 pub mod system_clipboard;

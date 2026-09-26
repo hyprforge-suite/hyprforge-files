@@ -37,6 +37,12 @@ hyprforge-image = { git = "https://github.com/adamrpostjr/hyprforge" }
 # theirs reach this one. The library only — this app never needs the
 # clipboard history daemon to be installed or running.
 hyprforge-clipboard = { git = "https://github.com/adamrpostjr/hyprforge" }
+# Dragging files out of the window — see `drag_out.rs`. `system` because
+# a drag has to be started on winit's own connection, joined through the
+# `wl_display` pointer the window hands out, and only libwayland's
+# backend can adopt a display it did not open. winit already builds it,
+# so this adds nothing to the link.
+wayland-client = { version = "0.31", features = ["system"] }
 hyprforge-ui = { git = "https://github.com/adamrpostjr/hyprforge" }
 hyprforge-look = { git = "https://github.com/adamrpostjr/hyprforge" }
 hyprforge-appearance = { git = "https://github.com/adamrpostjr/hyprforge" }
