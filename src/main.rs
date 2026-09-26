@@ -92,6 +92,19 @@ fn main() -> iced::Result {
     // suite does it.
     hyprforge_ui::theme::init(hyprforge_appearance::look::resolve());
 
+    // Sweep the thumbnail cache of files that are gone, at most once a
+    // day, on its own thread: it reads the head of every cached PNG, and
+    // the window has no reason to wait for that. Nothing is joined — a
+    // sweep cut short by the window closing has lost nothing but time.
+    std::thread::spawn(|| {
+        if let Some(cache) = hyprforge_thumbnails::Cache::standard() {
+            let removed = cache.prune(PRUNE_EVERY);
+            if removed > 0 {
+                tracing::debug!(removed, "thumbnails of deleted files removed");
+            }
+        }
+    });
+
     // One backend, held for the life of the window and handed to every
     // read. `RoutingBackend` is what decides that the trash lists by its
     // records rather than by its storage directory — see
@@ -176,7 +189,7 @@ fn main() -> iced::Result {
         // the same budget the sidebar's `stat`s already spend here. It
         // is not the per-double-click cost it would be if a chooser
         // loaded it each time.
-        mime: hyprforge_mime::MimeDb::load(),
+        mime: Arc::new(hyprforge_mime::MimeDb::load()),
         chooser: None,
         compressing: None,
         unlocking: None,
@@ -615,7 +628,10 @@ struct App {
     /// What the desktop knows about file types and the applications
     /// that open them. Read once at startup, and again after this
     /// window changes a default.
-    mime: hyprforge_mime::MimeDb,
+    /// Shared, not owned: the icon lookup reads it on a worker thread,
+    /// and a clone of the whole database per folder would be the cost of
+    /// a reload every time the listing changed.
+    mime: Arc<hyprforge_mime::MimeDb>,
     /// An open "which application?" chooser.
     chooser: Option<Chooser>,
     /// An open "Compress\u{2026}" dialog.
@@ -1500,8 +1516,12 @@ impl App {
             Outcome::LoadThumbnails(paths) => Task::run(thumbnail_stream(paths), |(path, handle)| {
                 Message::Browser(BrowserMessage::ThumbnailLoaded(path, handle))
             }),
-            Outcome::LoadPreview(path) => Task::perform(decode_preview(path), |(path, handle)| {
-                Message::Browser(BrowserMessage::PreviewLoaded(path, handle))
+            Outcome::LoadPreview(path) => Task::perform(
+                build_preview(path, self.mime.clone(), self.backend.clone()),
+                |(path, preview)| Message::Browser(BrowserMessage::PreviewLoaded(path, preview)),
+            ),
+            Outcome::LoadIcons(keys) => Task::perform(resolve_icons(keys, self.mime.clone()), |icons| {
+                Message::Browser(BrowserMessage::IconsLoaded(icons))
             }),
             Outcome::CountFolders(folders) => {
                 Task::perform(count_folders(self.backend.clone(), folders), |counts| {
@@ -3057,7 +3077,7 @@ impl App {
                 )
             }
             Message::MimeReloaded(db) => {
-                self.mime = db;
+                self.mime = Arc::new(db);
                 Task::none()
             }
             Message::DefaultSet(Err(e)) => {
@@ -4494,23 +4514,14 @@ const COUNT_BUDGET: usize = 400;
 /// settings, over whatever is on disk for everything a tab does not own.
 /// A tab's `Prefs` was copied when it opened, so its pinned list and
 /// window size are out of date by the time it saves.
-/// A grid thumbnail's decode edge, physical pixels: twice the grid icon's
-/// logical size, so it stays sharp on a 2x display.
-const THUMBNAIL_EDGE: u32 = 112;
+/// How often the shared thumbnail cache is swept for thumbnails of files
+/// that no longer exist — see `hyprforge_thumbnails::Cache::prune`.
+const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The preview pane's picture, physical pixels, for the same reason.
 const PREVIEW_EDGE: u32 = (hyprforge_files_core::browser::PREVIEW_WIDTH as u32) * 2;
 
-/// Decodes `path` within `edge` into something the view can draw, or
-/// `None` when it would not decode — which the browser shows as the icon.
-fn decode_to_handle(path: &std::path::Path, edge: u32) -> Option<iced::widget::image::Handle> {
-    hyprforge_image::decode_to_fit(path, &hyprforge_image::Budget::for_edge(edge))
-        .map(|d| iced::widget::image::Handle::from_rgba(d.size.width, d.size.height, d.pixels))
-        .map_err(|e| tracing::debug!(error = %e, path = %path.display(), "no thumbnail"))
-        .ok()
-}
-
-/// Grid thumbnails, one at a time, each sent back as soon as it exists.
+/// Thumbnails, one at a time, each sent back as soon as it exists.
 ///
 /// One at a time on purpose: a task per picture would put a whole
 /// folder's decodes in flight at once, and a decode's peak is the full
@@ -4520,12 +4531,19 @@ fn decode_to_handle(path: &std::path::Path, edge: u32) -> Option<iced::widget::i
 /// arriving first.
 fn thumbnail_stream(
     paths: Vec<PathBuf>,
-) -> impl iced::futures::Stream<Item = (PathBuf, iced::widget::image::Handle)> {
+) -> impl iced::futures::Stream<Item = (PathBuf, hyprforge_files_core::preview::Picture)> {
+    // The freedesktop cache every other program shares — a thumbnail is
+    // made once per version of a file, and a picture another program
+    // already thumbnailed costs nothing here. See `preview::thumbnail`.
+    let cache = hyprforge_thumbnails::Cache::standard();
     iced::stream::channel(16, async move |mut out| {
         use iced::futures::SinkExt;
         for path in paths {
             let for_task = path.clone();
-            let handle = tokio::task::spawn_blocking(move || decode_to_handle(&for_task, THUMBNAIL_EDGE))
+            let cache = cache.clone();
+            let handle = tokio::task::spawn_blocking(move || {
+                hyprforge_files::preview::thumbnail(&for_task, cache.as_ref())
+            })
                 .await
                 .ok()
                 .flatten();
@@ -4539,13 +4557,106 @@ fn thumbnail_stream(
     })
 }
 
-async fn decode_preview(path: PathBuf) -> (PathBuf, Option<iced::widget::image::Handle>) {
+/// The preview pane's content for `path`, built on a worker thread — see
+/// `hyprforge_files::preview` for what it reads and how each part is
+/// bounded.
+async fn build_preview(
+    path: PathBuf,
+    mime: Arc<hyprforge_mime::MimeDb>,
+    backend: Arc<dyn FsBackend>,
+) -> (PathBuf, Option<hyprforge_files_core::preview::Preview>) {
     let for_task = path.clone();
-    let handle = tokio::task::spawn_blocking(move || decode_to_handle(&for_task, PREVIEW_EDGE))
-        .await
-        .ok()
-        .flatten();
-    (path, handle)
+    let preview = tokio::task::spawn_blocking(move || {
+        hyprforge_files::preview::build(&for_task, &mime, backend.as_ref(), PREVIEW_EDGE)
+    })
+    .await
+    .ok()
+    .flatten();
+    (path, preview)
+}
+
+/// The size theme icons are looked up at: 32 logical at 2x, the one
+/// density whose artwork holds up both shrunk to a list row and grown to
+/// a grid cell. Nearly every file-type icon is an SVG, which iced
+/// rasterises at whatever size it is drawn, so this chooses the *design*
+/// (how much detail the artist drew) rather than the pixels.
+const ICON_SIZE: u32 = 32;
+const ICON_SCALE: u32 = 2;
+
+/// The configured icon theme's chain, loaded the first time a listing
+/// asks for an icon — on a worker thread, since loading asks gsettings
+/// which theme is set — and kept. Changing the theme needs a new window,
+/// the same as every other GTK-style application.
+fn theme_icons() -> &'static hyprforge_icons::Icons {
+    static ICONS: std::sync::OnceLock<hyprforge_icons::Icons> = std::sync::OnceLock::new();
+    ICONS.get_or_init(hyprforge_icons::Icons::load)
+}
+
+/// The icon for one browser key — see `hyprforge_files_core::icon`'s
+/// `IconSource` for the four kinds of key.
+///
+/// A file's type is decided by name alone, as its key is: sniffing
+/// contents would mean opening every file in the folder to draw its icon.
+fn resolve_icon(key: &str, mime: &hyprforge_mime::MimeDb) -> Option<hyprforge_files_core::preview::Picture> {
+    use hyprforge_files_core::icon::IconSource;
+    use hyprforge_files_core::preview::Picture;
+    let themed = |names: &[&str]| theme_icons().lookup(names, ICON_SIZE, ICON_SCALE).map(|p| Picture::from_path(&p));
+    match IconSource::of(key) {
+        IconSource::Folder => themed(&["folder", "inode-directory"]),
+        // The place's own name first, and a plain folder when the theme
+        // has nothing by that name — a theme without `folder-cloud` still
+        // draws a folder rather than the coloured mark.
+        IconSource::Themed(name) => themed(&[name, "folder"]),
+        IconSource::File(path) => user_icon(path).or_else(|| {
+            tracing::warn!(path = %path.display(), "[sidebar.icons] names an image that cannot be drawn; using the theme's folder");
+            themed(&["folder"])
+        }),
+        IconSource::Type(sample) => {
+            let names = match mime.type_of(Path::new(&sample)) {
+                Some(kind) => mime.icon_names(kind),
+                // Not a claim that it is binary — only that no rule names
+                // it. The theme's own "unknown" keeps the listing one
+                // theme's drawing rather than a badge among icons.
+                None => vec!["application-octet-stream".to_string(), "unknown".to_string()],
+            };
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            themed(&names)
+        }
+    }
+}
+
+/// An image the user chose for a folder: an SVG as itself, and anything
+/// else decoded to icon size by the budgeted decode — a user's file can
+/// be a 40-megapixel photograph, and it is drawn at eighteen pixels.
+fn user_icon(path: &Path) -> Option<hyprforge_files_core::preview::Picture> {
+    use hyprforge_files_core::preview::Picture;
+    if !path.is_file() {
+        return None;
+    }
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
+        return Some(Picture::from_path(path));
+    }
+    let decoded = hyprforge_image::decode_to_fit(path, &hyprforge_image::Budget::for_edge(ICON_SIZE * ICON_SCALE)).ok()?;
+    Some(Picture::Raster(iced::widget::image::Handle::from_rgba(decoded.size.width, decoded.size.height, decoded.pixels)))
+}
+
+/// Icons for each key, found on a worker thread — every lookup stats
+/// files, the first one reads the theme's index files, and none of that
+/// belongs on the thread drawing the window.
+async fn resolve_icons(
+    keys: Vec<String>,
+    mime: Arc<hyprforge_mime::MimeDb>,
+) -> Vec<(String, Option<hyprforge_files_core::preview::Picture>)> {
+    tokio::task::spawn_blocking(move || {
+        keys.into_iter()
+            .map(|key| {
+                let found = resolve_icon(&key, &mime);
+                (key, found)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn merge_tab_prefs(on_disk: &Prefs, mut from_tab: Prefs) -> Prefs {
@@ -4726,7 +4837,7 @@ mod tests {
             // window's loop, and what happens to be installed here is
             // none of their business. Tests that need a database build
             // one.
-            mime: hyprforge_mime::MimeDb::default(),
+            mime: Arc::default(),
             chooser: None,
             compressing: None,
             unlocking: None,
@@ -4787,7 +4898,7 @@ mod tests {
     fn opening_a_kind_nothing_handles_asks_instead_of_guessing() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::Activated("/a/part.stl".into()));
         let chooser = app.chooser.expect("a chooser, not a browser");
         assert_eq!(chooser.mime.as_deref(), Some("model/stl"));
@@ -4806,7 +4917,7 @@ mod tests {
     fn opening_a_handled_kind_does_not_ask() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::Activated("/a/page.html".into()));
         assert_eq!(app.chooser, None);
     }
@@ -4818,7 +4929,7 @@ mod tests {
     fn an_unknown_name_is_still_handed_to_the_desktop() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::Activated("/a/mystery.qqq".into()));
         assert_eq!(app.chooser, None);
 
@@ -4833,7 +4944,7 @@ mod tests {
     fn open_with_starts_from_the_applications_for_that_kind() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::OpenWith("/a/page.html".into()));
         let chooser = app.chooser.clone().expect("a chooser");
         assert_eq!(chooser.reason, ChooserReason::Asked);
@@ -4852,7 +4963,7 @@ mod tests {
     fn escape_closes_the_chooser_and_other_keys_do_not_reach_the_listing() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::OpenWith("/a/page.html".into()));
 
         let typing = hyprforge_files_core::keymap::KeyPress {
@@ -4880,7 +4991,7 @@ mod tests {
     fn picking_an_application_closes_the_chooser() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::OpenWith("/a/page.html".into()));
         let _ = app.update(Message::ChooseApp("browser.desktop".to_string()));
         assert_eq!(app.chooser, None);
@@ -6566,6 +6677,7 @@ mod tests {
             label: "Home".to_string(),
             path: PathBuf::from("/home"),
             tint: hyprforge_files_core::sidebar::Tint::Accent,
+            place: None,
         };
     }
 }
