@@ -175,7 +175,7 @@ fn main() -> iced::Result {
         // the same budget the sidebar's `stat`s already spend here. It
         // is not the per-double-click cost it would be if a chooser
         // loaded it each time.
-        mime: hyprforge_mime::MimeDb::load(),
+        mime: Arc::new(hyprforge_mime::MimeDb::load()),
         chooser: None,
         compressing: None,
         unlocking: None,
@@ -608,7 +608,10 @@ struct App {
     /// What the desktop knows about file types and the applications
     /// that open them. Read once at startup, and again after this
     /// window changes a default.
-    mime: hyprforge_mime::MimeDb,
+    /// Shared, not owned: the icon lookup reads it on a worker thread,
+    /// and a clone of the whole database per folder would be the cost of
+    /// a reload every time the listing changed.
+    mime: Arc<hyprforge_mime::MimeDb>,
     /// An open "which application?" chooser.
     chooser: Option<Chooser>,
     /// An open "Compress\u{2026}" dialog.
@@ -1495,6 +1498,9 @@ impl App {
             }),
             Outcome::LoadPreview(path) => Task::perform(decode_preview(path), |(path, handle)| {
                 Message::Browser(BrowserMessage::PreviewLoaded(path, handle))
+            }),
+            Outcome::LoadIcons(keys) => Task::perform(resolve_icons(keys, self.mime.clone()), |icons| {
+                Message::Browser(BrowserMessage::IconsLoaded(icons))
             }),
             Outcome::CountFolders(folders) => {
                 Task::perform(count_folders(self.backend.clone(), folders), |counts| {
@@ -3018,7 +3024,7 @@ impl App {
                 )
             }
             Message::MimeReloaded(db) => {
-                self.mime = db;
+                self.mime = Arc::new(db);
                 Task::none()
             }
             Message::DefaultSet(Err(e)) => {
@@ -4509,6 +4515,65 @@ async fn decode_preview(path: PathBuf) -> (PathBuf, Option<iced::widget::image::
     (path, handle)
 }
 
+/// The size theme icons are looked up at: 32 logical at 2x, the one
+/// density whose artwork holds up both shrunk to a list row and grown to
+/// a grid cell. Nearly every file-type icon is an SVG, which iced
+/// rasterises at whatever size it is drawn, so this chooses the *design*
+/// (how much detail the artist drew) rather than the pixels.
+const ICON_SIZE: u32 = 32;
+const ICON_SCALE: u32 = 2;
+
+/// The configured icon theme's chain, loaded the first time a listing
+/// asks for an icon — on a worker thread, since loading asks gsettings
+/// which theme is set — and kept. Changing the theme needs a new window,
+/// the same as every other GTK-style application.
+fn theme_icons() -> &'static hyprforge_icons::Icons {
+    static ICONS: std::sync::OnceLock<hyprforge_icons::Icons> = std::sync::OnceLock::new();
+    ICONS.get_or_init(hyprforge_icons::Icons::load)
+}
+
+/// The icon names worth asking the theme for, for one browser key.
+///
+/// By name alone, as the key is: sniffing contents would mean opening
+/// every file in the folder to draw its icon.
+fn icon_names_for(key: &str, mime: &hyprforge_mime::MimeDb) -> Vec<String> {
+    use hyprforge_files_core::icon;
+    if key == icon::FOLDER_KEY {
+        return vec!["folder".to_string(), "inode-directory".to_string()];
+    }
+    match mime.type_of(Path::new(&icon::sample_name(key))) {
+        Some(kind) => mime.icon_names(kind),
+        // Not a claim that it is binary — only that no rule names it. The
+        // theme's own "unknown" keeps the listing one theme's drawing
+        // rather than a badge among icons.
+        None => vec!["application-octet-stream".to_string(), "unknown".to_string()],
+    }
+}
+
+/// Theme icons for each key, found on a worker thread — every lookup
+/// stats files, the first one reads the theme's index files, and none of
+/// that belongs on the thread drawing the window.
+async fn resolve_icons(
+    keys: Vec<String>,
+    mime: Arc<hyprforge_mime::MimeDb>,
+) -> Vec<(String, Option<hyprforge_files_core::icon::ThemeIcon>)> {
+    tokio::task::spawn_blocking(move || {
+        let icons = theme_icons();
+        keys.into_iter()
+            .map(|key| {
+                let names = icon_names_for(&key, &mime);
+                let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                let found = icons
+                    .lookup(&names, ICON_SIZE, ICON_SCALE)
+                    .map(|path| hyprforge_files_core::icon::ThemeIcon::from_path(&path));
+                (key, found)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 fn merge_tab_prefs(on_disk: &Prefs, mut from_tab: Prefs) -> Prefs {
     from_tab.pinned = on_disk.pinned.clone();
     from_tab.window_width = on_disk.window_width;
@@ -4685,7 +4750,7 @@ mod tests {
             // window's loop, and what happens to be installed here is
             // none of their business. Tests that need a database build
             // one.
-            mime: hyprforge_mime::MimeDb::default(),
+            mime: Arc::default(),
             chooser: None,
             compressing: None,
             unlocking: None,
@@ -4746,7 +4811,7 @@ mod tests {
     fn opening_a_kind_nothing_handles_asks_instead_of_guessing() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::Activated("/a/part.stl".into()));
         let chooser = app.chooser.expect("a chooser, not a browser");
         assert_eq!(chooser.mime.as_deref(), Some("model/stl"));
@@ -4765,7 +4830,7 @@ mod tests {
     fn opening_a_handled_kind_does_not_ask() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::Activated("/a/page.html".into()));
         assert_eq!(app.chooser, None);
     }
@@ -4777,7 +4842,7 @@ mod tests {
     fn an_unknown_name_is_still_handed_to_the_desktop() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::Activated("/a/mystery.qqq".into()));
         assert_eq!(app.chooser, None);
 
@@ -4792,7 +4857,7 @@ mod tests {
     fn open_with_starts_from_the_applications_for_that_kind() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::OpenWith("/a/page.html".into()));
         let chooser = app.chooser.clone().expect("a chooser");
         assert_eq!(chooser.reason, ChooserReason::Asked);
@@ -4811,7 +4876,7 @@ mod tests {
     fn escape_closes_the_chooser_and_other_keys_do_not_reach_the_listing() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::OpenWith("/a/page.html".into()));
 
         let typing = hyprforge_files_core::keymap::KeyPress {
@@ -4839,7 +4904,7 @@ mod tests {
     fn picking_an_application_closes_the_chooser() {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
-        app.mime = mime;
+        app.mime = Arc::new(mime);
         let _ = app.handle_outcome(0, Outcome::OpenWith("/a/page.html".into()));
         let _ = app.update(Message::ChooseApp("browser.desktop".to_string()));
         assert_eq!(app.chooser, None);

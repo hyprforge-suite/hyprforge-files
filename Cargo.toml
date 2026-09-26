@@ -24,6 +24,9 @@ hyprforge-fileops = { git = "https://github.com/adamrpostjr/hyprforge" }
 # What a file is, and which applications can open it — see
 # `launch.rs` for why the launching itself is still the desktop's.
 hyprforge-mime = { git = "https://github.com/adamrpostjr/hyprforge" }
+# Which file in the configured icon theme a type's icon is — the listing's
+# icons. hyprforge-mime says which name a type's icon has; this finds it.
+hyprforge-icons = { git = "https://github.com/adamrpostjr/hyprforge" }
 # Zip, tar and 7z. The browsing of them is `hyprforge-files-core`'s
 # (through `FsBackend`); what this crate adds is the long, cancellable
 # work — extracting, compressing and rewriting — which needs the backend
@@ -68,6 +71,8 @@ iced = { version = "0.14", default-features = false, features = [
     "canvas",
     # Thumbnails and the preview pane draw decoded pixels.
     "image",
+    # The icon theme's file-type icons are SVG.
+    "svg",
 ] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
