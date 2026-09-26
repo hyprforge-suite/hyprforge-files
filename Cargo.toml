@@ -27,6 +27,9 @@ hyprforge-mime = { git = "https://github.com/adamrpostjr/hyprforge" }
 # Which file in the configured icon theme a type's icon is — the listing's
 # icons. hyprforge-mime says which name a type's icon has; this finds it.
 hyprforge-icons = { git = "https://github.com/adamrpostjr/hyprforge" }
+# The preview pane asks poppler and ffmpeg for a PDF's page and a video's
+# frame, and nothing may wait on another program without a bound.
+hyprforge-process = { git = "https://github.com/adamrpostjr/hyprforge" }
 # Zip, tar and 7z. The browsing of them is `hyprforge-files-core`'s
 # (through `FsBackend`); what this crate adds is the long, cancellable
 # work — extracting, compressing and rewriting — which needs the backend

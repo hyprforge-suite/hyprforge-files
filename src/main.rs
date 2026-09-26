@@ -1496,9 +1496,10 @@ impl App {
             Outcome::LoadThumbnails(paths) => Task::run(thumbnail_stream(paths), |(path, handle)| {
                 Message::Browser(BrowserMessage::ThumbnailLoaded(path, handle))
             }),
-            Outcome::LoadPreview(path) => Task::perform(decode_preview(path), |(path, handle)| {
-                Message::Browser(BrowserMessage::PreviewLoaded(path, handle))
-            }),
+            Outcome::LoadPreview(path) => Task::perform(
+                build_preview(path, self.mime.clone(), self.backend.clone()),
+                |(path, preview)| Message::Browser(BrowserMessage::PreviewLoaded(path, preview)),
+            ),
             Outcome::LoadIcons(keys) => Task::perform(resolve_icons(keys, self.mime.clone()), |icons| {
                 Message::Browser(BrowserMessage::IconsLoaded(icons))
             }),
@@ -4506,13 +4507,22 @@ fn thumbnail_stream(
     })
 }
 
-async fn decode_preview(path: PathBuf) -> (PathBuf, Option<iced::widget::image::Handle>) {
+/// The preview pane's content for `path`, built on a worker thread — see
+/// `hyprforge_files::preview` for what it reads and how each part is
+/// bounded.
+async fn build_preview(
+    path: PathBuf,
+    mime: Arc<hyprforge_mime::MimeDb>,
+    backend: Arc<dyn FsBackend>,
+) -> (PathBuf, Option<hyprforge_files_core::preview::Preview>) {
     let for_task = path.clone();
-    let handle = tokio::task::spawn_blocking(move || decode_to_handle(&for_task, PREVIEW_EDGE))
-        .await
-        .ok()
-        .flatten();
-    (path, handle)
+    let preview = tokio::task::spawn_blocking(move || {
+        hyprforge_files::preview::build(&for_task, &mime, backend.as_ref(), PREVIEW_EDGE)
+    })
+    .await
+    .ok()
+    .flatten();
+    (path, preview)
 }
 
 /// The size theme icons are looked up at: 32 logical at 2x, the one
@@ -4556,7 +4566,7 @@ fn icon_names_for(key: &str, mime: &hyprforge_mime::MimeDb) -> Vec<String> {
 async fn resolve_icons(
     keys: Vec<String>,
     mime: Arc<hyprforge_mime::MimeDb>,
-) -> Vec<(String, Option<hyprforge_files_core::icon::ThemeIcon>)> {
+) -> Vec<(String, Option<hyprforge_files_core::preview::Picture>)> {
     tokio::task::spawn_blocking(move || {
         let icons = theme_icons();
         keys.into_iter()
@@ -4565,7 +4575,7 @@ async fn resolve_icons(
                 let names: Vec<&str> = names.iter().map(String::as_str).collect();
                 let found = icons
                     .lookup(&names, ICON_SIZE, ICON_SCALE)
-                    .map(|path| hyprforge_files_core::icon::ThemeIcon::from_path(&path));
+                    .map(|path| hyprforge_files_core::preview::Picture::from_path(&path));
                 (key, found)
             })
             .collect()
