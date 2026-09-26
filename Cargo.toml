@@ -30,6 +30,9 @@ hyprforge-icons = { git = "https://github.com/adamrpostjr/hyprforge" }
 # The preview pane asks poppler and ffmpeg for a PDF's page and a video's
 # frame, and nothing may wait on another program without a bound.
 hyprforge-process = { git = "https://github.com/adamrpostjr/hyprforge" }
+# The freedesktop thumbnail cache — thumbnails made once per version of a
+# file, shared with every other program that makes them.
+hyprforge-thumbnails = { git = "https://github.com/adamrpostjr/hyprforge" }
 # Zip, tar and 7z. The browsing of them is `hyprforge-files-core`'s
 # (through `FsBackend`); what this crate adds is the long, cancellable
 # work — extracting, compressing and rewriting — which needs the backend

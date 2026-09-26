@@ -92,6 +92,19 @@ fn main() -> iced::Result {
     // suite does it.
     hyprforge_ui::theme::init(hyprforge_appearance::look::resolve());
 
+    // Sweep the thumbnail cache of files that are gone, at most once a
+    // day, on its own thread: it reads the head of every cached PNG, and
+    // the window has no reason to wait for that. Nothing is joined — a
+    // sweep cut short by the window closing has lost nothing but time.
+    std::thread::spawn(|| {
+        if let Some(cache) = hyprforge_thumbnails::Cache::standard() {
+            let removed = cache.prune(PRUNE_EVERY);
+            if removed > 0 {
+                tracing::debug!(removed, "thumbnails of deleted files removed");
+            }
+        }
+    });
+
     // One backend, held for the life of the window and handed to every
     // read. `RoutingBackend` is what decides that the trash lists by its
     // records rather than by its storage directory — see
@@ -4462,9 +4475,9 @@ const COUNT_BUDGET: usize = 400;
 /// settings, over whatever is on disk for everything a tab does not own.
 /// A tab's `Prefs` was copied when it opened, so its pinned list and
 /// window size are out of date by the time it saves.
-/// A grid thumbnail's decode edge, physical pixels: twice the grid icon's
-/// logical size, so it stays sharp on a 2x display.
-const THUMBNAIL_EDGE: u32 = 112;
+/// How often the shared thumbnail cache is swept for thumbnails of files
+/// that no longer exist — see `hyprforge_thumbnails::Cache::prune`.
+const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The preview pane's picture, physical pixels, for the same reason.
 const PREVIEW_EDGE: u32 = (hyprforge_files_core::browser::PREVIEW_WIDTH as u32) * 2;
@@ -4480,12 +4493,17 @@ const PREVIEW_EDGE: u32 = (hyprforge_files_core::browser::PREVIEW_WIDTH as u32) 
 fn thumbnail_stream(
     paths: Vec<PathBuf>,
 ) -> impl iced::futures::Stream<Item = (PathBuf, hyprforge_files_core::preview::Picture)> {
+    // The freedesktop cache every other program shares — a thumbnail is
+    // made once per version of a file, and a picture another program
+    // already thumbnailed costs nothing here. See `preview::thumbnail`.
+    let cache = hyprforge_thumbnails::Cache::standard();
     iced::stream::channel(16, async move |mut out| {
         use iced::futures::SinkExt;
         for path in paths {
             let for_task = path.clone();
+            let cache = cache.clone();
             let handle = tokio::task::spawn_blocking(move || {
-                hyprforge_files::preview::thumbnail(&for_task, THUMBNAIL_EDGE)
+                hyprforge_files::preview::thumbnail(&for_task, cache.as_ref())
             })
                 .await
                 .ok()

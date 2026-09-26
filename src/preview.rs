@@ -83,27 +83,86 @@ fn file(path: &Path, kind: &str, mime: &hyprforge_mime::MimeDb, backend: &dyn Fs
     None
 }
 
-/// A thumbnail of `path`, `edge` physical pixels at its widest — the
-/// same pictures the pane draws, asked for smaller. The browser only asks
-/// about names `preview::wants_thumbnail` accepts; one that turns out not
-/// to be what its name said comes back `None` and keeps its icon.
-pub fn thumbnail(path: &Path, edge: u32) -> Option<Picture> {
-    if hyprforge_image::format::looks_decodable(path) {
-        return decode(path, edge);
+/// A picture file this small is decoded directly and never cached: a
+/// second copy of it would cost about as much space as it saves time,
+/// and "as small as possible" is the cache's first rule.
+const SMALL_PICTURE: u64 = 64 * 1024;
+
+/// A thumbnail of `path`: from the shared cache while the file is
+/// unchanged, and made — then stored — only when it is not.
+///
+/// The browser only asks about names `preview::wants_thumbnail` accepts;
+/// one that turns out not to be what its name said is recorded as a
+/// failure, so it is not tried again until it changes. A tool that is
+/// not installed, or did not answer in time, is *not* a failure: the
+/// same file may well work after the user installs ffmpeg, or when the
+/// machine is less busy.
+pub fn thumbnail(path: &Path, cache: Option<&hyprforge_thumbnails::Cache>) -> Option<Picture> {
+    use hyprforge_thumbnails::{Lookup, Stamp, NORMAL};
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+    // Drawn by iced from the file itself, at whatever size: there is
+    // nothing to store.
+    if ext == "svg" {
+        return Some(Picture::from_path(path));
     }
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "svg" => Some(Picture::from_path(path)),
-        "pdf" => pdf(path, edge).picture,
-        _ => media(path, edge, true).picture,
+    let stamp = Stamp::of(path).ok()?;
+    let is_picture = hyprforge_image::format::looks_decodable(path);
+    if is_picture && stamp.size <= SMALL_PICTURE {
+        return decode_rgba(path, NORMAL).map(raster);
+    }
+    // The cache is keyed by an absolute URI; every listing path is one,
+    // and anything else is simply not cached.
+    let cache = cache.filter(|_| path.is_absolute());
+    if let Some(cache) = cache {
+        match cache.get(path, stamp) {
+            Lookup::Current(rgba) => return Some(raster(rgba)),
+            Lookup::Failed => return None,
+            Lookup::Missing => {}
+        }
+    }
+    let made: Result<Option<hyprforge_thumbnails::Rgba>, Unavailable> = if is_picture {
+        Ok(decode_rgba(path, NORMAL))
+    } else if ext == "pdf" {
+        pdf_page(path, NORMAL).map(|png| png.and_then(|b| hyprforge_thumbnails::decode_png(&b)))
+    } else {
+        probe(path).map(|info| {
+            info.and_then(|info| frame(path, NORMAL, &info, true)).and_then(|b| hyprforge_thumbnails::decode_png(&b))
+        })
+    };
+    match made {
+        Ok(Some(rgba)) => {
+            if let Some(cache) = cache {
+                if let Err(e) = cache.put(path, stamp, &rgba) {
+                    tracing::debug!(error = %e, "thumbnail not stored");
+                }
+            }
+            Some(raster(rgba))
+        }
+        Ok(None) => {
+            if let Some(cache) = cache {
+                let _ = cache.put_failed(path, stamp);
+            }
+            None
+        }
+        Err(_) => None,
     }
 }
 
-fn decode(path: &Path, edge: u32) -> Option<Picture> {
+fn raster(rgba: hyprforge_thumbnails::Rgba) -> Picture {
+    Picture::Raster(iced::widget::image::Handle::from_rgba(rgba.width, rgba.height, rgba.pixels))
+}
+
+/// A picture decoded within `edge`, by the same budgeted decode the
+/// viewer uses.
+fn decode_rgba(path: &Path, edge: u32) -> Option<hyprforge_thumbnails::Rgba> {
     hyprforge_image::decode_to_fit(path, &hyprforge_image::Budget::for_edge(edge))
-        .map(|d| Picture::Raster(iced::widget::image::Handle::from_rgba(d.size.width, d.size.height, d.pixels)))
+        .map(|d| hyprforge_thumbnails::Rgba { width: d.size.width, height: d.size.height, pixels: d.pixels })
         .map_err(|e| tracing::debug!(error = %e, "no picture"))
         .ok()
+}
+
+fn decode(path: &Path, edge: u32) -> Option<Picture> {
+    decode_rgba(path, edge).map(raster)
 }
 
 /// A picture this build decodes, and how big it really is.
@@ -205,15 +264,20 @@ fn first_names(mut names: Vec<(String, bool)>, total: usize) -> Listing {
 }
 
 /// A PDF's first page and its page count, from poppler's own tools.
-fn pdf(path: &Path, edge: u32) -> Preview {
-    let page = run(Command::new("pdftoppm")
+/// A PDF's first page as PNG bytes, its longer side `edge` pixels.
+fn pdf_page(path: &Path, edge: u32) -> Result<Option<Vec<u8>>, Unavailable> {
+    run(Command::new("pdftoppm")
         .args(["-f", "1", "-l", "1", "-singlefile", "-png", "-scale-to"])
         .arg(edge.to_string())
-        .arg(path));
+        .arg(path))
+}
+
+fn pdf(path: &Path, edge: u32) -> Preview {
+    let page = pdf_page(path, edge);
     let mut details = Vec::new();
     match &page {
-        Err(Missing) => details.push(install("poppler", "a PDF's first page")),
-        Ok(None) => {}
+        Err(Unavailable::Missing) => details.push(install("poppler", "a PDF's first page")),
+        Err(Unavailable::Busy) | Ok(None) => {}
         Ok(Some(_)) => {
             if let Ok(Some(info)) = run(Command::new("pdfinfo").arg(path)) {
                 let info = String::from_utf8_lossy(&info);
@@ -232,18 +296,49 @@ fn pdf(path: &Path, edge: u32) -> Preview {
 }
 
 /// A video's frame, or a song's cover, with what `ffprobe` says about it.
-fn media(path: &Path, edge: u32, video: bool) -> Preview {
-    let probe = run(Command::new("ffprobe")
+/// What `ffprobe` says about a video or a song.
+fn probe(path: &Path) -> Result<Option<Probe>, Unavailable> {
+    let json = run(Command::new("ffprobe")
         .args(["-v", "error", "-print_format", "json", "-show_entries"])
         .arg("format=duration:format_tags=title,artist,album:stream=codec_type,width,height:stream_disposition=attached_pic")
-        .arg(path));
-    let info = match probe {
-        Err(Missing) => {
+        .arg(path))?;
+    Ok(json.map(|json| Probe::parse(&json)))
+}
+
+/// A video's frame, or a song's embedded cover, as PNG bytes fitted
+/// inside an `edge`-pixel square — so a portrait video is as bounded as a
+/// landscape one.
+fn frame(path: &Path, edge: u32, info: &Probe, video: bool) -> Option<Vec<u8>> {
+    if !video && !info.has_cover {
+        return None;
+    }
+    let mut command = Command::new("ffmpeg");
+    command.args(["-v", "error"]);
+    if video {
+        // A tenth of the way in, and never more than half a minute: the
+        // first frame of most videos is black, and seeking far into a
+        // long one is slow on a spinning disk.
+        let at = info.duration.map_or(0.0, |d| (d * 0.1).min(30.0));
+        command.arg("-ss").arg(format!("{at:.2}"));
+    }
+    command
+        .arg("-i")
+        .arg(path)
+        .args(["-an", "-frames:v", "1", "-vf"])
+        .arg(format!("scale={edge}:{edge}:force_original_aspect_ratio=decrease"))
+        .args(["-f", "image2pipe", "-c:v", "png", "-"]);
+    run(&mut command).ok().flatten()
+}
+
+/// A video's frame, or a song's cover, with what `ffprobe` says about it.
+fn media(path: &Path, edge: u32, video: bool) -> Preview {
+    let info = match probe(path) {
+        Err(Unavailable::Missing) => {
             let what = if video { "a video's frame and length" } else { "a song's cover and tags" };
             return Preview { details: vec![install("ffmpeg", what)], ..Preview::default() };
         }
-        Ok(None) => return Preview::default(),
-        Ok(Some(json)) => Probe::parse(&json),
+        Err(Unavailable::Busy) | Ok(None) => return Preview::default(),
+        Ok(Some(info)) => info,
     };
 
     let mut details = Vec::new();
@@ -258,27 +353,8 @@ fn media(path: &Path, edge: u32, video: bool) -> Preview {
     if let Some((w, h)) = info.size.filter(|_| video) {
         details.push(("Dimensions".to_string(), format!("{w} × {h}")));
     }
-
-    // A tenth of the way in, and never more than half a minute: the first
-    // frame of most videos is black, and seeking far into a long one is
-    // slow on a spinning disk.
-    let at = info.duration.map_or(0.0, |d| (d * 0.1).min(30.0));
-    let picture = if video || info.has_cover {
-        let mut command = Command::new("ffmpeg");
-        command.args(["-v", "error"]);
-        if video {
-            command.arg("-ss").arg(format!("{at:.2}"));
-        }
-        command
-            .arg("-i")
-            .arg(path)
-            .args(["-an", "-frames:v", "1", "-vf"])
-            .arg(format!("scale={edge}:-2"))
-            .args(["-f", "image2pipe", "-c:v", "png", "-"]);
-        run(&mut command).ok().flatten().map(|png| Picture::Raster(iced::widget::image::Handle::from_bytes(png)))
-    } else {
-        None
-    };
+    let picture =
+        frame(path, edge, &info, video).map(|png| Picture::Raster(iced::widget::image::Handle::from_bytes(png)));
     Preview { picture, details, ..Preview::default() }
 }
 
@@ -344,21 +420,29 @@ fn install(package: &str, what: &str) -> (String, String) {
     ("Preview".to_string(), format!("Install {package} to see {what} here."))
 }
 
-/// The program is not installed.
-struct Missing;
+/// Why a helper gave no verdict on a file — as distinct from answering
+/// that it could not do it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unavailable {
+    /// Not installed: the one case worth telling the user about.
+    Missing,
+    /// Did not finish in time, or could not be started. Says nothing
+    /// about the file, so it is never recorded as the file's failure.
+    Busy,
+}
 
 /// Runs `command` to completion within the usual bound: its standard
-/// output when it succeeded, `None` when it ran and failed — a damaged
-/// PDF, a video with no frames, a timeout — and [`Missing`] when it is
-/// not installed at all, which is the one case worth telling the user.
-fn run(command: &mut Command) -> Result<Option<Vec<u8>>, Missing> {
+/// output when it succeeded, `None` when it ran and said no — a damaged
+/// PDF, a video with no frames — and [`Unavailable`] when there was no
+/// verdict at all.
+fn run(command: &mut Command) -> Result<Option<Vec<u8>>, Unavailable> {
     match hyprforge_process::output(command, hyprforge_process::TIMEOUT) {
         Ok(out) if out.status.success() && !out.stdout.is_empty() => Ok(Some(out.stdout)),
         Ok(_) => Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Missing),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Unavailable::Missing),
         Err(e) => {
             tracing::debug!(error = %e, "preview helper did not finish");
-            Ok(None)
+            Err(Unavailable::Busy)
         }
     }
 }
@@ -465,6 +549,87 @@ mod tests {
         assert_eq!(listing.names, [("z-sub".to_string(), true), ("b.txt".to_string(), false)]);
         assert_eq!(listing.total, 2, "what is shown, not counting the dotfile");
         assert!(preview.details.iter().any(|(l, v)| l == "Hidden" && v.starts_with('1')));
+    }
+
+    /// An uncompressed 24-bit BMP of `side` pixels square — the simplest
+    /// picture this build decodes that can be written by hand, and
+    /// large enough past 150 pixels to be worth caching.
+    fn bmp(path: &Path, side: u32) {
+        let row = (side * 3).div_ceil(4) * 4;
+        let data = row * side;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"BM");
+        b.extend_from_slice(&(54 + data).to_le_bytes());
+        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(&54u32.to_le_bytes());
+        b.extend_from_slice(&40u32.to_le_bytes());
+        b.extend_from_slice(&(side as i32).to_le_bytes());
+        b.extend_from_slice(&(side as i32).to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&24u16.to_le_bytes());
+        b.extend_from_slice(&[0; 24]);
+        for y in 0..side {
+            for x in 0..row {
+                b.push(((x * 7 + y * 13) % 251) as u8);
+            }
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn scratch_cache(dir: &Path) -> hyprforge_thumbnails::Cache {
+        hyprforge_thumbnails::Cache::at(dir.join("thumbnails"))
+    }
+
+    fn cached(dir: &Path, source: &Path) -> bool {
+        dir.join("thumbnails/normal").join(hyprforge_thumbnails::thumbnail_name(source)).exists()
+    }
+
+    /// Made once, stored, and read back from the cache afterwards —
+    /// which is only allowed while the file is unchanged.
+    #[test]
+    fn a_thumbnail_is_made_once_and_then_read_from_the_cache() {
+        use hyprforge_thumbnails::{Lookup, Stamp};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = scratch_cache(dir.path());
+        let photo = dir.path().join("photo.bmp");
+        bmp(&photo, 200);
+
+        assert!(thumbnail(&photo, Some(&cache)).is_some());
+        assert!(cached(dir.path(), &photo), "stored after it was made");
+        let stamp = Stamp::of(&photo).unwrap();
+        let Lookup::Current(stored) = cache.get(&photo, stamp) else { panic!("not current") };
+        assert!(stored.width <= hyprforge_thumbnails::NORMAL && stored.height <= hyprforge_thumbnails::NORMAL);
+
+        // Changed: the old thumbnail no longer answers for it.
+        bmp(&photo, 180);
+        let changed = Stamp { mtime: stamp.mtime + 1, ..Stamp::of(&photo).unwrap() };
+        assert_eq!(cache.get(&photo, changed), Lookup::Missing);
+    }
+
+    /// A picture small enough to decode directly is never given a second
+    /// copy of itself in the cache.
+    #[test]
+    fn a_small_picture_is_never_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = scratch_cache(dir.path());
+        let icon = dir.path().join("small.bmp");
+        bmp(&icon, 40);
+        assert!(std::fs::metadata(&icon).unwrap().len() <= SMALL_PICTURE);
+        assert!(thumbnail(&icon, Some(&cache)).is_some(), "still drawn");
+        assert!(!cached(dir.path(), &icon), "but not stored");
+    }
+
+    /// A file that is not what its name says fails once and is not tried
+    /// again until it changes.
+    #[test]
+    fn a_file_that_cannot_be_thumbnailed_is_remembered_as_a_failure() {
+        use hyprforge_thumbnails::{Lookup, Stamp};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = scratch_cache(dir.path());
+        let fake = dir.path().join("renamed.png");
+        std::fs::write(&fake, vec![7u8; SMALL_PICTURE as usize + 1]).unwrap();
+        assert!(thumbnail(&fake, Some(&cache)).is_none());
+        assert_eq!(cache.get(&fake, Stamp::of(&fake).unwrap()), Lookup::Failed);
     }
 
     /// No poppler: the pane says what would show more, rather than
