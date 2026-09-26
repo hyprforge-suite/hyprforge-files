@@ -129,6 +129,19 @@ from Hyprland's own `decoration:rounding`). So the design's numbers become the
 from the Theme with the design's inner/outer distinction preserved as a
 relationship rather than two magic numbers.
 
+### Where these pieces live now
+
+When Settings adopted the same design, the parts of this pass that are not
+about files moved to the shared UI crate, and Files takes them back through
+re-exports, so none of its call sites changed: the type ramp, the radius
+ladder and the bar, field and row heights (`hyprforge-ui/src/density.rs`,
+with Files' grid, menu and sidebar sizes left in
+`hyprforge-files-core/src/density.rs`); the drawn marks
+(`hyprforge-ui/src/glyph.rs`); and `selectable_row_style`, the inset field
+and search field, the segmented control, `spaced_caps` and the `Tint` roles
+(`hyprforge-ui/src/widgets/`). A change to any of them changes both apps,
+which is the point.
+
 ## Phases
 
 Each is independently shippable and leaves the app working.
