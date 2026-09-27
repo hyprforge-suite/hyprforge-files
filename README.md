@@ -16,6 +16,14 @@ can be edited in place too: add, rename and delete, each rewrite going
 to a temporary file beside the original and renamed over it, so an
 interrupted edit never leaves a truncated archive.
 
+A **preview pane** beside the listing shows the selected file — a
+picture, the first lines of a text file, a folder's or an archive's
+contents, a PDF's first page, a video's frame or a song's cover — and
+the grid draws real thumbnails of pictures, SVGs, PDFs and videos,
+the costly ones kept in the freedesktop thumbnail cache every other
+file manager and viewer already shares. Files can be copied and pasted with other
+applications, and dragged out of the window into them.
+
 Part of [Hyprforge](https://github.com/adamrpostjr/hyprforge), a suite of
 native Hyprland desktop applications. This repository is a split of the
 `crates/hyprforge-files` directory there; development happens in the
@@ -31,7 +39,9 @@ branch on which host it is in.
 
 What this crate owns is the window around it, and the things a dialog
 deliberately does not have: launching what you double-click, file
-operations, the transfers panel, and the archive jobs.
+operations, the transfers panel, the archive jobs, reading what the
+preview pane and the thumbnails show, the system clipboard, and dragging
+files out to another application.
 
 ## Installing
 
@@ -45,6 +55,11 @@ Arch users can build the `hyprforge-files` package from the monorepo's
 Nothing else in the suite is required. A missing `appearance.toml` is
 first-run, not an error, and the app draws correctly themed on a machine
 where the Settings app has never been installed.
+
+`pdftoppm` (poppler) and `ffmpeg` are optional too: without them a PDF,
+a video or a song previews as the details the listing already knows and
+a sentence naming what to install, and a PDF or a video gets no
+thumbnail.
 
 ## Licence
 

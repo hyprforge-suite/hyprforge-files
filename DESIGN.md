@@ -161,6 +161,9 @@ heading: it reads as broken rather than as not-yet.
 section is the first thing that will want it and the role should exist before
 the first consumer rather than arrive with it.
 
+*Built.* Titlebar tabs, the density pass, and a sidebar of Places, Pinned
+(with item counts) and Trash; `hyprforge-look` carries `info`.
+
 **B — the fuzzy path bar.** `~/pr/hy/src → ~/projects/hyprsuite/src`, resolving
 as you type. The single best idea in the document and the thing neither Finder
 nor Explorer has. Needs a matcher (`hyprforge-emoji` already has a search
@@ -170,10 +173,20 @@ function worth looking at for prior art) and a resolution preview.
 thumbnails, which is the preview crate from the original plan. Column view
 (`1c`) is new: cascading panes plus a metadata rail.
 
+*Partly built.* The grid and the list draw real thumbnails — pictures and
+SVGs in both, PDFs and videos in the grid — through the shared freedesktop
+cache, and a preview pane shows the selected file (`hyprforge-files-core`'s
+`preview`, read by the app's `preview.rs`). Column view is not built: its
+segment in the view toggle is drawn disabled.
+
 **D — Trash, properly (`1k`).** Arguably the highest value-per-line here: the
 data is already parsed and the current view is knowingly wrong to a user. Origin-location column, per-item age, restore
 in place, Empty with a confirm. The host already maps stored names back to
 original ones; this is the UI that was always going to be needed.
+
+*Built.* The Trash lists each item under the name it had, with an Original
+Location column and its deletion date in the date column; Restore puts the
+selection back, and Empty Trash always asks first.
 
 **E — Properties (`1g`) and Preferences (`1h`).** Properties is an inspector
 docked right with General/Permissions/Open-with tabs. Preferences is
@@ -227,7 +240,7 @@ the drawer is new and is the most cuttable thing here.
 
 *Archives are done, ahead of this order* — see `hyprforge-archive` and
 `hyprforge-files-core::archive`. Two deliberate departures from `1j`, and one
-thing still owed:
+what was owed:
 
 - The mockup labels the pane **read-only**. It is not: members can be added,
   renamed and deleted, and a file opened out of an archive is watched so an
@@ -240,9 +253,10 @@ thing still owed:
   the archive lives in, which is the only real folder on screen, and a picker
   that almost always answers that is a dialog charging for something nobody
   chose.
-- **Still owed from `1j`:** the `Packed` column (per-member compressed size,
-  which `hyprforge_archive::Member::compressed` already carries and nothing
-  displays) and the summary line — `zstd · 3 entries · 20.3 MB → 7.0 MB`.
+- ~~**Still owed from `1j`:**~~ Built: the `Packed` column (per-member
+  compressed size, from `hyprforge_archive::Member::compressed`, shown only
+  inside an archive) and the summary line —
+  `zstd · 3 entries · 20.3 MB → 7.0 MB`.
 
 `1f` draws an extraction sitting in the transfers queue beside a copy, and
 that already works the way it has to: archive jobs report the same `JobEvent`
@@ -268,6 +282,9 @@ D comes second rather than fourth because it is the only place the app is
 currently *wrong* rather than merely unfinished: it shows a stored filename
 where the user expects the name their file had. Everything else is honest
 about being incomplete.
+
+A, D and the thumbnail and preview half of C have since been built;
+see each phase above.
 
 The portal open/save dialog is not a phase — it inherits every one of these for
 free, because it renders the same view. That is the payoff for the `Mode` seam.

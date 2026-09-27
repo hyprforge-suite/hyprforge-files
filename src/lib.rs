@@ -11,7 +11,10 @@
 //! and the things a dialog deliberately does not have: launching what
 //! you double-click, and file operations — including the ones that go
 //! through an archive, which `archive_jobs` runs the same way `jobs`
-//! runs a paste.
+//! runs a paste — and the parts that need the window's own connection
+//! or a disk: reading what the preview pane and the thumbnails show
+//! (`preview`), the Wayland clipboard (`system_clipboard`) and dragging
+//! files out to another application (`drag_out`).
 
 pub mod archive_jobs;
 pub mod drag_out;

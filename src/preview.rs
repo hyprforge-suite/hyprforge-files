@@ -8,12 +8,18 @@
 //!   lines of it;
 //! - a folder: names only, no `stat` per entry, and no more than
 //!   [`FOLDER_SCAN`] of them counted;
+//! - an archive: its top level, through the backend that already
+//!   browses one as a folder;
 //! - pictures: decoded to the pane's width by `hyprforge-image`, the
-//!   same budgeted decode the grid uses;
+//!   same budgeted decode the grid uses; an SVG is handed to iced as
+//!   the file, which draws it at whatever size the pane is;
 //! - PDFs, video and audio: another program, `pdftoppm` or `ffmpeg`,
 //!   through `hyprforge_process::output` with its timeout, asked for a
 //!   picture already scaled to the pane — so what comes back is a few
 //!   hundred kilobytes of PNG whatever the source was.
+//!
+//! The listing's thumbnails come from here too ([`thumbnail`]): the same
+//! readers, through the shared freedesktop cache.
 //!
 //! # The tools are optional
 //!
@@ -268,8 +274,7 @@ fn first_names(mut names: Vec<(String, bool)>, total: usize) -> Listing {
     Listing { names, total }
 }
 
-/// A PDF's first page and its page count, from poppler's own tools.
-/// A PDF's first page as PNG bytes, its longer side `edge` pixels.
+/// A PDF's first page as PNG bytes, from poppler's own `pdftoppm`, its longer side `edge` pixels.
 fn pdf_page(path: &Path, edge: u32) -> Result<Option<Vec<u8>>, Unavailable> {
     run(Command::new("pdftoppm")
         .args(["-f", "1", "-l", "1", "-singlefile", "-png", "-scale-to"])
