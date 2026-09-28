@@ -24,7 +24,7 @@ the costly ones kept in the freedesktop thumbnail cache every other
 file manager and viewer already shares. Files can be copied and pasted with other
 applications, and dragged out of the window into them.
 
-Part of [Hyprforge](https://github.com/adamrpostjr/hyprforge), a suite of
+Part of [Hyprforge](https://github.com/hyprforge-suite/hyprforge), a suite of
 native Hyprland desktop applications. This repository is a split of the
 `crates/hyprforge-files` directory there; development happens in the
 monorepo and `sync.sh` keeps this copy in step.
