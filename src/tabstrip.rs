@@ -9,7 +9,7 @@
 //! sides, so there is no way to ask a container for three of them. The
 //! shape is drawn instead: a canvas paints the fill and the three-sided
 //! stroke, and the tab's actual contents — icon, label, close — sit on
-//! top of it in a [`stack`](iced::widget::stack).
+//! top of it in a [`stack`](iced::widget::stack()).
 //!
 //! # How an inactive tab recedes
 //!

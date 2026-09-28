@@ -7,7 +7,7 @@
 //! - text: the first [`TEXT_BYTES`] of the file, at most [`TEXT_LINES`]
 //!   lines of it;
 //! - a folder: names only, no `stat` per entry, and no more than
-//!   [`FOLDER_SCAN`] of them counted;
+//!   `FOLDER_SCAN` of them counted;
 //! - an archive: its top level, through the backend that already
 //!   browses one as a folder;
 //! - pictures: decoded to the pane's width by `hyprforge-image`, the
