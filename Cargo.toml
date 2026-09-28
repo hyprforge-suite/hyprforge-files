@@ -19,47 +19,47 @@ path = "src/main.rs"
 # portal's open/save dialog has to render the same one. This crate is
 # the window around it: navigation chrome, the keyboard grammar, and
 # the file operations a dialog deliberately does not have.
-hyprforge-files-core = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-fileops = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-files-core = "0.1"
+hyprforge-fileops = "0.1"
 # What a file is, and which applications can open it — see
 # `launch.rs` for why the launching itself is still the desktop's.
-hyprforge-mime = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-mime = "0.1"
 # Which file in the configured icon theme a type's icon is — the listing's
 # icons. hyprforge-mime says which name a type's icon has; this finds it.
-hyprforge-icons = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-icons = "0.1"
 # The preview pane asks poppler and ffmpeg for a PDF's page and a video's
 # frame, and nothing may wait on another program without a bound.
-hyprforge-process = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-process = "0.1"
 # The freedesktop thumbnail cache — thumbnails made once per version of a
 # file, shared with every other program that makes them.
-hyprforge-thumbnails = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-thumbnails = "0.1"
 # A video's thumbnail is its first real frame, found the same way the
 # photo viewer finds it — the two share one thumbnail cache, and two
 # programs picking different frames would each find the other's there.
-hyprforge-video = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-video = "0.1"
 # Zip, tar and 7z. The browsing of them is `hyprforge-files-core`'s
 # (through `FsBackend`); what this crate adds is the long, cancellable
 # work — extracting, compressing and rewriting — which needs the backend
 # directly rather than through a listing.
-hyprforge-archive = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-archive = "0.1"
 # Grid thumbnails and the preview pane: decoded within a budget, with
 # the EXIF orientation applied — the same decode the image viewer uses,
 # so a photograph is the same way up in both.
-hyprforge-image = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-image = "0.1"
 # The Wayland clipboard, so copied files reach other applications and
 # theirs reach this one. The library only — this app never needs the
 # clipboard history daemon to be installed or running.
-hyprforge-clipboard = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-clipboard = "0.1"
 # Dragging files out of the window — see `drag_out.rs`. `system` because
 # a drag has to be started on winit's own connection, joined through the
 # `wl_display` pointer the window hands out, and only libwayland's
 # backend can adopt a display it did not open. winit already builds it,
 # so this adds nothing to the link.
 wayland-client = { version = "0.31", features = ["system"] }
-hyprforge-ui = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-look = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-appearance = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-paths = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-ui = "0.1"
+hyprforge-look = "0.1"
+hyprforge-appearance = "0.1"
+hyprforge-paths = "0.1"
 # `tokio` on top of the workspace base, the same addition
 # `hyprforge-settings` makes and for the same reason: it selects iced's
 # tokio executor, so the futures a `Task` runs are polled inside a tokio
@@ -110,7 +110,7 @@ zip = "8"
 # which this crate's tests drive the whole window against — the window
 # owns an `Arc<dyn FsBackend>`, so its update loop (stale generations,
 # tab routing, folder counts) can be exercised without a real disk.
-hyprforge-files-core = { git = "https://github.com/hyprforge-suite/hyprforge", features = ["mock"] }
+hyprforge-files-core = { version = "0.1", features = ["mock"] }
 # `MockFilesystem`, so undo's tests can trash into a temporary directory
 # rather than the real Trash of whoever runs them.
-hyprforge-fileops = { git = "https://github.com/hyprforge-suite/hyprforge", features = ["mock"] }
+hyprforge-fileops = { version = "0.1", features = ["mock"] }
