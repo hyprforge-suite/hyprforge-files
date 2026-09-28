@@ -30,43 +30,9 @@ jobs:
   tier-1:
     name: "Tier 1 (no compositor, no clipboard): build, clippy -D warnings, cargo test"
     runs-on: ubuntu-latest
-    env:
-      # Cargo fetches git dependencies with libgit2, which does not honour
-      # the `url.<..>.insteadOf` rewrite the step below installs, so the
-      # credential never reaches the clone and the build fails with
-      # "failed to authenticate" — which reads like a code problem and is
-      # not one. This is the setting cargo's own error names.
-      CARGO_NET_GIT_FETCH_WITH_CLI: true
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Let cargo fetch the suite while it is still a private repository
-        # This crate takes its hyprforge-* siblings as git dependencies on
-        # the suite repository. While that repository is PRIVATE the
-        # built-in GITHUB_TOKEN cannot read it — an Actions token is
-        # scoped to the repository its workflow runs in and grants
-        # nothing on another private repository in the same account.
-        #
-        # SUITE_READ is a fine-grained token with read-only Contents on
-        # the suite repository and nothing else. It has to be added to
-        # this repository's secrets before CI can pass; there is no way
-        # to copy one between repositories, so a new component's first
-        # run fails on authentication until someone sets it.
-        #
-        # An `extraheader` rather than a credential in the URL: the URL
-        # form is the shape of a GitHub App installation token, not a
-        # personal access token, and GitHub refuses it. The token arrives
-        # by environment variable so it is never on a command line a
-        # failing step would echo.
-        #
-        # Delete this step and the secret the day the suite repository
-        # becomes public.
-        env:
-          SUITE_READ: ${{ secrets.SUITE_READ }}
-        run: |
-          git config --global http."https://github.com/".extraheader \
-            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SUITE_READ" | base64 -w0)"
 
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         # `rustup show` is what makes rustup notice rust-toolchain.toml
