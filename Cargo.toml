@@ -67,7 +67,7 @@ hyprforge-paths = "0.1"
 # with no ambient runtime, and the free function
 # `tokio::task::spawn_blocking()` panics with "there is no reactor
 # running" — the same class of failure the root Cargo.toml's note about
-# zbus and the `notif/` workspace describes. Declaring it here rather
+# zbus and the `crates/hyprforge-notif` workspace describes. Declaring it here rather
 # than relying on Cargo unifying features from `hyprforge-settings`:
 # that unification only happens when something builds both, so
 # `cargo build -p hyprforge-files` alone would not get it.
