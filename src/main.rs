@@ -211,6 +211,8 @@ fn main() -> iced::Result {
         modifiers: keyboard::Modifiers::default(),
         clicks: ClickTracker::new(),
         drop_probe: (false, None),
+        drag_over: false,
+        from_drops: std::collections::HashSet::new(),
         config: config.clone(),
         #[cfg(debug_assertions)]
         debug_show: DebugShow::from_env(),
@@ -683,6 +685,14 @@ struct App {
     /// it was. One at a time, newest wins: a drag reports dozens of
     /// positions a second, and each only means "look again".
     drop_probe: (bool, Option<(f64, f64)>),
+    /// Whether a drag is over the window right now. A hover hit-test
+    /// still out when the drag leaves or is let go must not light a
+    /// folder after it has gone — found by review.
+    drag_over: bool,
+    /// Jobs a drop started rather than a paste. A move finishing empties
+    /// the clipboard only when the clipboard's own cut was what moved —
+    /// a drag never touched it, and found by review emptying it anyway.
+    from_drops: std::collections::HashSet<JobId>,
     /// Debug builds only: what to put on screen for a screenshot. See
     /// [`DebugShow`].
     #[cfg(debug_assertions)]
@@ -2257,7 +2267,8 @@ impl App {
                     );
                     return Task::batch([refresh, tidied]);
                 }
-                if finished.kind == JobKind::Move && summary.complete() {
+                let from_drop = self.from_drops.remove(&job);
+                if finished.kind == JobKind::Move && summary.complete() && !from_drop {
                     let clipboard = self.clipboard.clone();
                     let cleared = Task::perform(
                         async move {
@@ -2447,6 +2458,7 @@ impl App {
         use hyprforge_files::dnd::DropEvent;
         match event {
             DropEvent::Over { x, y } => {
+                self.drag_over = true;
                 if self.drop_probe.0 {
                     self.drop_probe.1 = Some((x, y));
                     return Task::none();
@@ -2454,11 +2466,13 @@ impl App {
                 self.probe_drop((x, y), None)
             }
             DropEvent::Left => {
+                self.drag_over = false;
                 self.drop_probe.1 = None;
                 let _ = self.active_tab_mut().browser.update(BrowserMessage::DropHover(None));
                 Task::none()
             }
             DropEvent::Dropped { x, y, from } => {
+                self.drag_over = false;
                 self.drop_probe.1 = None;
                 let _ = self.active_tab_mut().browser.update(BrowserMessage::DropHover(None));
                 self.probe_drop((x, y), Some(from))
@@ -2827,6 +2841,8 @@ impl App {
             Message::DropHit(hit, None) => {
                 tracing::debug!(?hit, "a drag is over");
                 self.drop_probe.0 = false;
+                // An answer for a drag that has since left or been let go.
+                let hit = hit.filter(|_| self.drag_over);
                 let _ = self.active_tab_mut().browser.update(BrowserMessage::DropHover(hit));
                 match self.drop_probe.1.take() {
                     Some(at) => self.probe_drop(at, None),
@@ -2840,8 +2856,17 @@ impl App {
             Message::DropHit(Some(into), Some(from)) => self.plan_drop(into, from),
             Message::DropPlanned(plan) => match plan {
                 hyprforge_files_core::drop::DropPlan::Nothing => Task::none(),
-                hyprforge_files_core::drop::DropPlan::Paste { clip, into } => self.paste_into(into, Some(clip)),
+                hyprforge_files_core::drop::DropPlan::Paste { clip, into } => {
+                    let first = self.next_job_id;
+                    let task = self.paste_into(into, Some(clip));
+                    self.from_drops.extend(first..self.next_job_id);
+                    task
+                }
                 hyprforge_files_core::drop::DropPlan::Trash(paths) => self.handle_outcome(self.active, Outcome::Trash(paths)),
+                hyprforge_files_core::drop::DropPlan::Refused(why) => {
+                    self.status = Some(why);
+                    Task::none()
+                }
             },
             Message::DragResult(Ok(())) => Task::none(),
             Message::DragResult(Err(why)) => {
@@ -4854,6 +4879,8 @@ mod tests {
             modifiers: keyboard::Modifiers::default(),
             clicks: ClickTracker::new(),
             drop_probe: (false, None),
+            drag_over: false,
+            from_drops: std::collections::HashSet::new(),
             config: Arc::new(hyprforge_files_core::config::Config::default()),
             #[cfg(debug_assertions)]
             debug_show: DebugShow::default(),
@@ -4879,6 +4906,37 @@ mod tests {
         assert!(app.drop_probe.0 && app.drop_probe.1.is_none(), "the waiting one went out");
         let _ = app.update(Message::DropHit(Some(PathBuf::from("/a/docs")), None));
         assert!(!app.drop_probe.0);
+    }
+
+    /// A move by drag and drop is not the clipboard's cut, so finishing it
+    /// must not empty the clipboard — found by review.
+    #[test]
+    fn a_move_by_drop_is_remembered_as_not_the_clipboards() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        std::fs::write(from.path().join("a.txt"), "x").unwrap();
+        let mut app = app_for_test(&["/a"]);
+        let clip = hyprforge_files_core::clipboard::FileClip {
+            paths: vec![from.path().join("a.txt")],
+            verb: ClipVerb::Cut,
+        };
+        let plan = hyprforge_files_core::drop::DropPlan::Paste { clip, into: to.path().to_path_buf() };
+        let _ = app.update(Message::DropPlanned(plan));
+        let id = app.jobs.first().map(|j| j.id).or_else(|| app.queued.front().map(|q| q.id)).expect("a job");
+        assert!(app.from_drops.contains(&id));
+        let _ = app.update(Message::Job(JobEvent::Finished { job: id, summary: JobSummary { done: 1, ..JobSummary::default() } }));
+        assert!(app.from_drops.is_empty(), "forgotten once it finishes");
+    }
+
+    #[test]
+    fn a_hover_answer_arriving_after_the_drag_left_lights_nothing() {
+        use hyprforge_files::dnd::DropEvent;
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(Message::Dnd(DropEvent::Over { x: 1.0, y: 1.0 }));
+        let _ = app.update(Message::Dnd(DropEvent::Left));
+        // The hit-test that went out on `Over` comes back late.
+        let _ = app.update(Message::DropHit(Some(PathBuf::from("/a/docs")), None));
+        assert!(!format!("{:?}", app.tabs[0].browser).contains("drop_hover: Some"));
     }
 
     #[test]

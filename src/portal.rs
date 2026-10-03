@@ -395,8 +395,9 @@ pub enum Accept {
     /// Go into this folder instead — a folder chosen in a dialog that
     /// wants files is somewhere to look, not an answer.
     Enter(PathBuf),
-    /// Saving over this file needs a yes first.
-    Overwrite(PathBuf),
+    /// Saving over `clash` needs a yes first; a yes answers with all of
+    /// `answer` — every file being saved, not only the one that clashed.
+    Overwrite { clash: PathBuf, answer: Vec<PathBuf> },
     /// Say why not, and stay open.
     Refuse(String),
     /// Nothing chosen yet; do nothing.
@@ -463,7 +464,7 @@ pub fn accept(kind: &Kind, screen: &OnScreen<'_>, exists: impl Fn(&Path) -> Opti
             let target = screen.folder.join(name);
             match exists(&target) {
                 Some(true) => Accept::Enter(target),
-                Some(false) => Accept::Overwrite(target),
+                Some(false) => Accept::Overwrite { clash: target.clone(), answer: vec![target] },
                 None => Accept::Answer(vec![target]),
             }
         }
@@ -477,8 +478,8 @@ pub fn accept(kind: &Kind, screen: &OnScreen<'_>, exists: impl Fn(&Path) -> Opti
             };
             let targets: Vec<PathBuf> =
                 files.iter().filter_map(|f| f.file_name()).map(|n| into.join(n)).collect();
-            match targets.iter().find(|t| exists(t).is_some()) {
-                Some(clash) => Accept::Overwrite(clash.clone()),
+            match targets.iter().find(|t| exists(t).is_some()).cloned() {
+                Some(clash) => Accept::Overwrite { clash, answer: targets },
                 None => Accept::Answer(targets),
             }
         }
@@ -808,10 +809,26 @@ mod tests {
             Some("/d/sub") => Some(true),
             _ => None,
         };
-        assert_eq!(accept(&kind, &screen(Path::new("/d"), &[], "taken.txt"), exists), Accept::Overwrite(PathBuf::from("/d/taken.txt")));
+        assert_eq!(
+            accept(&kind, &screen(Path::new("/d"), &[], "taken.txt"), exists),
+            Accept::Overwrite { clash: PathBuf::from("/d/taken.txt"), answer: vec![PathBuf::from("/d/taken.txt")] }
+        );
         assert_eq!(accept(&kind, &screen(Path::new("/d"), &[], "sub"), exists), Accept::Enter(PathBuf::from("/d/sub")));
         assert_eq!(accept(&kind, &screen(Path::new("/d"), &[], "new.txt"), exists), Accept::Answer(vec![PathBuf::from("/d/new.txt")]));
         assert_eq!(accept(&kind, &screen(Path::new("/d"), &[], "  "), exists), Accept::Nothing);
+    }
+
+    /// Found by review: a yes to replacing one of several files answered
+    /// with only that one, so the application never saved the others.
+    #[test]
+    fn replacing_one_of_several_files_still_answers_with_all_of_them() {
+        let kind = Kind::SaveFiles { files: vec![PathBuf::from("a.txt"), PathBuf::from("b.txt"), PathBuf::from("c.txt")] };
+        let exists = |p: &Path| (p == Path::new("/d/b.txt")).then_some(false);
+        let all = vec![PathBuf::from("/d/a.txt"), PathBuf::from("/d/b.txt"), PathBuf::from("/d/c.txt")];
+        assert_eq!(
+            accept(&kind, &screen(Path::new("/d"), &[], ""), exists),
+            Accept::Overwrite { clash: PathBuf::from("/d/b.txt"), answer: all }
+        );
     }
 
     #[test]

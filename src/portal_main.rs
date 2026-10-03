@@ -201,8 +201,9 @@ struct Dialog {
     /// `(choice id, value)` for each of the application's choices.
     choices: Vec<(String, String)>,
     status: Option<String>,
-    /// A file a Save would replace, waiting for a yes.
-    overwrite: Option<PathBuf>,
+    /// A file a Save would replace, waiting for a yes — and the whole
+    /// answer a yes gives.
+    overwrite: Option<(PathBuf, Vec<PathBuf>)>,
     /// One path-bar resolve out at a time, the newest waiting — the same
     /// coalescing the Files window does.
     resolving: bool,
@@ -338,7 +339,7 @@ impl Dialog {
             }
             Message::Cancel => self.finish(Answer::Cancelled),
             Message::OverwriteAnswered(yes) => match self.overwrite.take() {
-                Some(path) if yes => self.finish_with(vec![path]),
+                Some((_, answer)) if yes => self.finish_with(answer),
                 _ => Task::none(),
             },
             Message::FolderMade(path, result) | Message::Renamed(path, result) => {
@@ -540,8 +541,8 @@ impl Dialog {
                 let outcome = self.browser.update(BrowserMessage::Navigate(dir));
                 self.handle(outcome)
             }
-            Accept::Overwrite(path) => {
-                self.overwrite = Some(path);
+            Accept::Overwrite { clash, answer } => {
+                self.overwrite = Some((clash, answer));
                 Task::none()
             }
             Accept::Refuse(why) => {
@@ -560,12 +561,24 @@ impl Dialog {
     fn finish(&mut self, answer: Answer) -> Task<Message> {
         // Remembered only when something was chosen: a cancelled dialog
         // was not left anywhere on purpose.
-        if let (Answer::Chosen { .. }, Some(remembered)) = (&answer, self.remembered.as_mut()) {
+        //
+        // Read again here rather than written from the copy loaded when
+        // this dialog opened: two applications can each have a dialog up,
+        // and the one closing second would otherwise put back what the
+        // first had just changed. The file still is not written over if it
+        // cannot be read now.
+        if let (Answer::Chosen { .. }, Some(_)) = (&answer, self.remembered.as_ref()) {
             let folder = self.browser.current_dir().to_path_buf();
             if hyprforge_files_core::archive::split(&folder).is_none() {
-                remembered.remember(&self.request.app_id, &folder);
-                if let Err(e) = remembered.save(&portal::remembered_path()) {
-                    tracing::warn!(error = %e, "the dialog's last folder could not be saved");
+                let path = portal::remembered_path();
+                match portal::Remembered::load(&path) {
+                    Ok(mut fresh) => {
+                        fresh.remember(&self.request.app_id, &folder);
+                        if let Err(e) = fresh.save(&path) {
+                            tracing::warn!(error = %e, "the dialog's last folder could not be saved");
+                        }
+                    }
+                    Err(why) => tracing::warn!(%why, "the dialog's remembered folders could not be read; not saved over"),
                 }
             }
         }
@@ -655,7 +668,7 @@ impl Dialog {
         bar = bar.push(primary_button(accept_label).on_press(Message::Accept));
 
         let mut page = column![browser];
-        if let Some(path) = &self.overwrite {
+        if let Some((path, _)) = &self.overwrite {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             page = page.push(
                 container(
