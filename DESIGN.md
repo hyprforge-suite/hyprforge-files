@@ -391,10 +391,21 @@ Two things found on the way:
 - **A path that is not UTF-8 did not survive the JSON hand-off to the
   dialog**, so paths cross as their bytes (`portal::raw_path`).
 
+Since added:
+
+- **Right-click menus of its own** (`MenuConfig::dialog`), only what a
+  dialog does. The window's would have offered Trash, Cut and Extract,
+  every one declined; a test holds the list to what the host carries out.
+- **Each application's last folder** is remembered in `files-portal.toml`,
+  most recent first and capped at 64. A file that will not parse is
+  reported and never saved over.
+
+Both were checked in the nested compositor: the menu at the pointer, and
+a second dialog from the same application opening where the first was
+left.
+
 Not yet:
 
-- right-click menus in the dialog (their keys work)
-- each application's last folder
 - attaching to the window that asked (`parent_window` needs xdg-foreign,
   which winit cannot import)
 

@@ -72,7 +72,9 @@ thumbnail.
 `hyprforge-files-portal` serves xdg-desktop-portal's
 `org.freedesktop.impl.portal.FileChooser`. Each request starts one
 dialog window, which answers and exits; an application that gives up on
-its dialog takes the window with it.
+its dialog takes the window with it. Each application's dialog opens
+where it was last left, remembered in `files-portal.toml` beside Files'
+own settings.
 
 Installing it switches nothing. To make it every application's dialog,
 put this in `~/.config/xdg-desktop-portal/hyprland-portals.conf`:

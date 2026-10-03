@@ -109,6 +109,9 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "ti
 zbus = { version = "5.18", default-features = false, features = ["tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The open/save dialog's memory of each application's last folder,
+# `files-portal.toml` — see `portal::Remembered`.
+toml = "1.1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

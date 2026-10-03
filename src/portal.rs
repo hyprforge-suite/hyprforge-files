@@ -485,6 +485,70 @@ pub fn accept(kind: &Kind, screen: &OnScreen<'_>, exists: impl Fn(&Path) -> Opti
     }
 }
 
+/// The folder each application's dialog was last left in, so the next
+/// one opens there — what every desktop's file chooser does, and what
+/// makes a second "Open…" from the same program not start from home again.
+///
+/// Kept beside Files' own settings in `files-portal.toml`. Most recent
+/// first and capped, so it cannot grow with every program ever run. An
+/// application that sends no id (most that are not sandboxed) is
+/// remembered under the empty one, and they share it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Remembered {
+    #[serde(default)]
+    folders: Vec<RememberedFolder>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RememberedFolder {
+    app: String,
+    folder: String,
+}
+
+/// How many applications' folders are kept.
+const REMEMBERED_APPS: usize = 64;
+
+impl Remembered {
+    /// Reads the file. Missing is a first run: nothing remembered. A file
+    /// that exists and will not parse is `Err` — the caller says so and
+    /// must not save over it (CLAUDE.md: never collapse "could not be
+    /// read" into "nothing configured").
+    pub fn load(path: &Path) -> Result<Remembered, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text).map_err(|e| format!("{} could not be read: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Remembered::default()),
+            Err(e) => Err(format!("{} could not be read: {e}", path.display())),
+        }
+    }
+
+    pub fn folder_for(&self, app: &str) -> Option<PathBuf> {
+        self.folders.iter().find(|f| f.app == app).map(|f| PathBuf::from(&f.folder))
+    }
+
+    /// Records `folder` as `app`'s, most recent first. A folder whose
+    /// name is not UTF-8 is not recorded — TOML holds text — and the
+    /// dialog simply opens where it otherwise would next time.
+    pub fn remember(&mut self, app: &str, folder: &Path) {
+        let Some(text) = folder.to_str() else { return };
+        self.folders.retain(|f| f.app != app);
+        self.folders.insert(0, RememberedFolder { app: app.to_string(), folder: text.to_string() });
+        self.folders.truncate(REMEMBERED_APPS);
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let text = toml::to_string(self).map_err(std::io::Error::other)?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        hyprforge_paths::write_atomic(path, &text)
+    }
+}
+
+/// Where [`Remembered`] lives.
+pub fn remembered_path() -> PathBuf {
+    hyprforge_paths::hyprforge_config_dir().join("files-portal.toml")
+}
+
 /// How a dialog ended.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Answer {
@@ -765,6 +829,41 @@ mod tests {
             accept(&kind, &screen(Path::new("/d"), &[], ""), |_| None),
             Accept::Answer(vec![PathBuf::from("/d/a.txt"), PathBuf::from("/d/b.txt")])
         );
+    }
+
+    #[test]
+    fn a_missing_memory_is_a_first_run_and_a_broken_one_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files-portal.toml");
+        assert_eq!(Remembered::load(&path), Ok(Remembered::default()));
+        std::fs::write(&path, "folders = 3").unwrap();
+        assert!(Remembered::load(&path).is_err(), "never read as nothing remembered");
+    }
+
+    #[test]
+    fn each_application_gets_its_own_last_folder_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files-portal.toml");
+        let mut memory = Remembered::default();
+        memory.remember("org.gimp.GIMP", Path::new("/home/a/art"));
+        memory.remember("", Path::new("/home/a/docs"));
+        memory.remember("org.gimp.GIMP", Path::new("/home/a/art/new"));
+        memory.save(&path).unwrap();
+        let read = Remembered::load(&path).unwrap();
+        assert_eq!(read.folder_for("org.gimp.GIMP"), Some(PathBuf::from("/home/a/art/new")));
+        assert_eq!(read.folder_for(""), Some(PathBuf::from("/home/a/docs")));
+        assert_eq!(read.folder_for("org.other"), None);
+    }
+
+    #[test]
+    fn the_memory_does_not_grow_without_end() {
+        let mut memory = Remembered::default();
+        for i in 0..200 {
+            memory.remember(&format!("app{i}"), Path::new("/x"));
+        }
+        assert_eq!(memory.folders.len(), REMEMBERED_APPS);
+        assert!(memory.folder_for("app199").is_some(), "the most recent are the ones kept");
+        assert!(memory.folder_for("app0").is_none());
     }
 
     #[test]

@@ -94,8 +94,22 @@ fn run_dialog() -> Answer {
 
     let backend: Arc<dyn FsBackend> = Arc::new(RoutingBackend::default());
     let home = backend.home_dir();
-    let start = request.starting_folder(None, &home);
-    let (config, _problems) = hyprforge_files_core::config::load();
+    // Where this application's last dialog was left. A file that cannot
+    // be read is said and then left alone: `None` here means nothing is
+    // saved over it when this dialog closes.
+    let remembered = match portal::Remembered::load(&portal::remembered_path()) {
+        Ok(remembered) => Some(remembered),
+        Err(why) => {
+            tracing::warn!(%why, "the dialog's remembered folders could not be read; they will not be updated");
+            None
+        }
+    };
+    let last = remembered.as_ref().and_then(|r| r.folder_for(&request.app_id));
+    let start = request.starting_folder(last.as_deref(), &home);
+    let (mut config, _problems) = hyprforge_files_core::config::load();
+    // The dialog's own short menus — see `MenuConfig::dialog`. The key
+    // bindings stay the user's.
+    config.menus = hyprforge_files_core::menu::MenuConfig::dialog();
     // Read, never written: the dialog follows the view the user set up in
     // Files, and changing the view in a dialog is not a reason to rewrite
     // the window's settings file under it.
@@ -125,11 +139,13 @@ fn run_dialog() -> Answer {
         config: Arc::new(config),
         font_scale: FontScale(hyprforge_ui::theme::active().font_scale),
         width: DIALOG_SIZE.width,
+        height: DIALOG_SIZE.height,
         status: None,
         overwrite: None,
         resolving: false,
         resolve_next: None,
         answer: answer.clone(),
+        remembered,
         clicks: ClickTracker::new(),
         modifiers: keyboard::Modifiers::default(),
     };
@@ -177,6 +193,7 @@ struct Dialog {
     config: Arc<hyprforge_files_core::config::Config>,
     font_scale: FontScale,
     width: f32,
+    height: f32,
     /// The Save dialog's name field.
     name: String,
     /// Which of the request's filters applies, by index.
@@ -192,6 +209,9 @@ struct Dialog {
     resolve_next: Option<hyprforge_files_core::jump::Request>,
     /// Where the answer goes when the window closes.
     answer: Arc<std::sync::Mutex<Answer>>,
+    /// Each application's last folder — `None` when the file could not
+    /// be read, so it is not saved over.
+    remembered: Option<portal::Remembered>,
     /// A click arrives from the view bare — no modifiers, no notion of
     /// being the second of a pair — and the window supplies both, as the
     /// Files window does.
@@ -255,11 +275,12 @@ impl Dialog {
                             }
                         }
                     }
-                    // No context menus in the dialog yet: a right press
-                    // carries no position, and the pointer tracking the
-                    // window does for it is not built here. Its keys —
-                    // New Folder, Rename — still work.
-                    BrowserMessage::OpenContextMenu { .. } => return Task::none(),
+                    // A right press carries no position; the pointer
+                    // tracker has it.
+                    BrowserMessage::OpenContextMenu { spot, .. } => {
+                        self.clicks.reset();
+                        BrowserMessage::OpenContextMenu { spot, at: pointer::last() }
+                    }
                     other => other,
                 };
                 let outcome = self.browser.update(inner);
@@ -332,6 +353,7 @@ impl Dialog {
             }
             Message::Resized(size) => {
                 self.width = size.width;
+                self.height = size.height;
                 Task::none()
             }
             Message::Settle => window::latest().and_then(|id| {
@@ -408,7 +430,11 @@ impl Dialog {
             Outcome::Many(all) => Task::batch(all.into_iter().map(|o| self.handle(o)).collect::<Vec<_>>()),
             // The view's own settings follow Files' and are not written
             // from here — see `run_dialog`.
-            Outcome::PrefsChanged(_) | Outcome::Pins(_) | Outcome::Window(_) | Outcome::OpenContextMenuAtPointer(_) => Task::none(),
+            Outcome::OpenContextMenuAtPointer(spot) => {
+                let outcome = self.browser.update(BrowserMessage::OpenContextMenu { spot, at: pointer::last() });
+                self.handle(outcome)
+            }
+            Outcome::PrefsChanged(_) | Outcome::Pins(_) | Outcome::Window(_) => Task::none(),
             _ => {
                 self.status = Some("That isn't something this dialog does — open Files for it.".to_string());
                 Task::none()
@@ -532,6 +558,17 @@ impl Dialog {
     }
 
     fn finish(&mut self, answer: Answer) -> Task<Message> {
+        // Remembered only when something was chosen: a cancelled dialog
+        // was not left anywhere on purpose.
+        if let (Answer::Chosen { .. }, Some(remembered)) = (&answer, self.remembered.as_mut()) {
+            let folder = self.browser.current_dir().to_path_buf();
+            if hyprforge_files_core::archive::split(&folder).is_none() {
+                remembered.remember(&self.request.app_id, &folder);
+                if let Err(e) = remembered.save(&portal::remembered_path()) {
+                    tracing::warn!(error = %e, "the dialog's last folder could not be saved");
+                }
+            }
+        }
         *self.answer.lock().unwrap_or_else(|p| p.into_inner()) = answer;
         iced::exit()
     }
@@ -636,14 +673,18 @@ impl Dialog {
             page = page.push(container(text(status.clone()).color(hyprforge_ui::theme::text_dim())).padding([0, spacing::SM as u16]));
         }
         page = page.push(container(bar).padding(spacing::SM));
-        container(page)
+        let window: Element<'_, Message> = container(page)
             .width(Length::Fill)
             .height(Length::Fill)
             .style(|_t: &Theme| container::Style {
                 background: Some(iced::Background::Color(hyprforge_ui::theme::surface::root())),
                 ..container::Style::default()
             })
-            .into()
+            .into();
+        match self.browser.menu_overlay(scale, (self.width, self.height)) {
+            Some(overlay) => iced::widget::stack![window, overlay.map(Message::Browser)].into(),
+            None => window,
+        }
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -656,6 +697,7 @@ impl Dialog {
             }),
             iced::event::listen_with(field_escape),
             window::resize_events().map(|(_, size)| Message::Resized(size)),
+            pointer::track(),
         ])
     }
 }
@@ -669,5 +711,32 @@ fn field_escape(event: iced::Event, status: iced::event::Status, _window: window
             iced::event::Status::Captured,
         ) => Some(Message::EscapeInField),
         _ => None,
+    }
+}
+
+/// Where the pointer last was, recorded without a message per mouse move
+/// — the Files window's own arrangement, for the same reason: a context
+/// menu opens at the pointer and a right press carries no position, and
+/// a message per move would rebuild the dialog on every one. One dialog
+/// per process, so process-wide atomics are this window's.
+mod pointer {
+    use iced::{event, mouse, Event, Subscription};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static X: AtomicU32 = AtomicU32::new(0);
+    static Y: AtomicU32 = AtomicU32::new(0);
+
+    pub fn track<Message: 'static + Send>() -> Subscription<Message> {
+        event::listen_with(|event, _status, _window| {
+            if let Event::Mouse(mouse::Event::CursorMoved { position }) = event {
+                X.store(position.x.to_bits(), Ordering::Relaxed);
+                Y.store(position.y.to_bits(), Ordering::Relaxed);
+            }
+            None
+        })
+    }
+
+    pub fn last() -> (f32, f32) {
+        (f32::from_bits(X.load(Ordering::Relaxed)), f32::from_bits(Y.load(Ordering::Relaxed)))
     }
 }
