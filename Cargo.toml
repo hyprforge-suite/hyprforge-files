@@ -14,6 +14,7 @@ categories = ["os::linux-apis", "gui"]
 name = "hyprforge-files"
 path = "src/main.rs"
 
+
 [dependencies]
 # The browser view itself lives in hyprforge-files-core, because the
 # portal's open/save dialog has to render the same one. This crate is
@@ -50,7 +51,7 @@ hyprforge-image = "0.1"
 # theirs reach this one. The library only — this app never needs the
 # clipboard history daemon to be installed or running.
 hyprforge-clipboard = "0.1"
-# Dragging files out of the window — see `drag_out.rs`. `system` because
+# Dragging files out of the window — see `dnd.rs`. `system` because
 # a drag has to be started on winit's own connection, joined through the
 # `wl_display` pointer the window hands out, and only libwayland's
 # backend can adopt a display it did not open. winit already builds it,
@@ -89,6 +90,9 @@ iced = { version = "0.14", default-features = false, features = [
     "image",
     # The icon theme's file-type icons are SVG.
     "svg",
+    # A drop asks the layout which folder is under a point — see
+    # `hyprforge_files_core::drop::HitTest`, run as a widget operation.
+    "advanced",
 ] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }

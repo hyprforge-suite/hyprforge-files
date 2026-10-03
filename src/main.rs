@@ -184,7 +184,7 @@ fn main() -> iced::Result {
         last_window_size,
         resize_generation: 0,
         clipboard: Arc::new(hyprforge_files::system_clipboard::SystemClipboard::new()),
-        drag: Arc::new(hyprforge_files::drag_out::DragOut::new()),
+        drag: Arc::new(hyprforge_files::dnd::Dnd::new()),
         // A handful of small files, read once before the window opens —
         // the same budget the sidebar's `stat`s already spend here. It
         // is not the per-double-click cost it would be if a chooser
@@ -209,6 +209,7 @@ fn main() -> iced::Result {
         next_job_id: 1,
         modifiers: keyboard::Modifiers::default(),
         clicks: ClickTracker::new(),
+        drop_probe: (false, None),
         config: config.clone(),
         #[cfg(debug_assertions)]
         debug_show: DebugShow::from_env(),
@@ -485,8 +486,15 @@ enum Message {
     Job(JobEvent),
     /// A finished move emptied the clipboard.
     ClipboardCleared,
-    /// How starting a drag out of the window went — see `drag_out`.
+    /// How starting a drag out of the window went — see `dnd`.
     DragResult(Result<(), String>),
+    /// A drag over the window — see `dnd`.
+    Dnd(hyprforge_files::dnd::DropEvent),
+    /// Which folder a point is over, as the layout answered — and, for a
+    /// drop, what was dropped there.
+    DropHit(Option<PathBuf>, Option<hyprforge_files_core::drop::DropFrom>),
+    /// What a drop turned out to mean, once the filesystems were asked.
+    DropPlanned(hyprforge_files_core::drop::DropPlan),
     /// A finished restore removed the records of what it put back.
     TrashTidied,
     /// An undo finished: the folders it changed, and anything it could
@@ -630,9 +638,9 @@ struct App {
     /// Copied and cut files, shared by every tab.
     clipboard: Arc<dyn FileClipboard>,
     /// Dragging files out to another application. Attached once the
-    /// window exists — see `drag_out`'s module doc for why it cannot wait
+    /// window exists — see `dnd`'s module doc for why it cannot wait
     /// for the first drag.
-    drag: Arc<hyprforge_files::drag_out::DragOut>,
+    drag: Arc<hyprforge_files::dnd::Dnd>,
     /// Pastes in progress, oldest first.
     jobs: Vec<RunningJob>,
     /// A trash or delete waiting on the confirmation dialog.
@@ -736,6 +744,10 @@ struct App {
     /// `mouse_area` inside would break the single click that selects.
     /// See `hyprforge_files_core::click` for the whole argument.
     clicks: ClickTracker,
+    /// Whether a hover hit-test is out, and where the drag got to while
+    /// it was. One at a time, newest wins: a drag reports dozens of
+    /// positions a second, and each only means "look again".
+    drop_probe: (bool, Option<(f64, f64)>),
     /// Debug builds only: what to put on screen for a screenshot. See
     /// [`DebugShow`].
     #[cfg(debug_assertions)]
@@ -2485,13 +2497,77 @@ impl App {
 
     /// Joins the window's Wayland connection so files can be dragged out
     /// of it. At startup, because the drag source has to have seen the
-    /// button press a drag begins with — see `drag_out`.
+    /// button press a drag begins with — see `dnd`.
     fn attach_drag(&self) -> Task<Message> {
         let drag = self.drag.clone();
         window::latest().and_then(move |id| {
             let drag = drag.clone();
             window::run(id, move |w| drag.attach(w)).discard()
         })
+    }
+
+    /// What a drag over the window does: light the folder under it, or —
+    /// let go — work out where the files landed.
+    fn drop_event(&mut self, event: hyprforge_files::dnd::DropEvent) -> Task<Message> {
+        use hyprforge_files::dnd::DropEvent;
+        match event {
+            DropEvent::Over { x, y } => {
+                if self.drop_probe.0 {
+                    self.drop_probe.1 = Some((x, y));
+                    return Task::none();
+                }
+                self.probe_drop((x, y), None)
+            }
+            DropEvent::Left => {
+                self.drop_probe.1 = None;
+                let _ = self.active_tab_mut().browser.update(BrowserMessage::DropHover(None));
+                Task::none()
+            }
+            DropEvent::Dropped { x, y, from } => {
+                self.drop_probe.1 = None;
+                let _ = self.active_tab_mut().browser.update(BrowserMessage::DropHover(None));
+                self.probe_drop((x, y), Some(from))
+            }
+            DropEvent::Failed(why) => {
+                self.status = Some(why);
+                Task::none()
+            }
+        }
+    }
+
+    /// Asks the layout which drop target holds a point — see
+    /// `hyprforge_files_core::drop::HitTest`.
+    fn probe_drop(&mut self, (x, y): (f64, f64), dropped: Option<hyprforge_files_core::drop::DropFrom>) -> Task<Message> {
+        if dropped.is_none() {
+            self.drop_probe.0 = true;
+        }
+        let targets = self.active_tab().browser.drop_targets();
+        let point = iced::Point::new(x as f32, y as f32);
+        iced::advanced::widget::operate(hyprforge_files_core::drop::HitTest::new(point, targets))
+            .map(move |hit| Message::DropHit(hit, dropped.clone()))
+    }
+
+    /// Decides what a drop means, off the UI thread: which filesystem
+    /// each side is on, and whether the folder is inside an archive, are
+    /// both questions only a `stat` answers.
+    fn plan_drop(&mut self, into: PathBuf, from: hyprforge_files_core::drop::DropFrom) -> Task<Message> {
+        let held = hyprforge_files_core::drop::Held {
+            ctrl: self.modifiers.control(),
+            shift: self.modifiers.shift(),
+        };
+        let trash = hyprforge_files_core::trash_path();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let in_archive = hyprforge_files_core::archive::split(&into).is_some();
+                    let landing = hyprforge_files_core::drop::Landing { path: &into, in_archive };
+                    hyprforge_files_core::drop::plan(from, landing, &trash, held, same_filesystem)
+                })
+                .await
+                .unwrap_or(hyprforge_files_core::drop::DropPlan::Nothing)
+            },
+            Message::DropPlanned,
+        )
     }
 
     /// Hands `paths` to the compositor as a drag. On the event loop's
@@ -2504,8 +2580,8 @@ impl App {
         let drag = self.drag.clone();
         let offers = hyprforge_files_core::clipboard::drag_offers(&paths);
         window::latest().and_then(move |id| {
-            let (drag, offers) = (drag.clone(), offers.clone());
-            window::run(id, move |w| drag.start(w, offers)).map(Message::DragResult)
+            let (drag, paths, offers) = (drag.clone(), paths.clone(), offers.clone());
+            window::run(id, move |w| drag.start(w, paths, offers)).map(Message::DragResult)
         })
     }
 
@@ -2809,6 +2885,29 @@ impl App {
                 self.sync_can_paste();
                 Task::none()
             }
+            Message::Dnd(event) => {
+                tracing::debug!(?event, "drop event");
+                self.drop_event(event)
+            }
+            Message::DropHit(hit, None) => {
+                tracing::debug!(?hit, "a drag is over");
+                self.drop_probe.0 = false;
+                let _ = self.active_tab_mut().browser.update(BrowserMessage::DropHover(hit));
+                match self.drop_probe.1.take() {
+                    Some(at) => self.probe_drop(at, None),
+                    None => Task::none(),
+                }
+            }
+            Message::DropHit(None, Some(_)) => {
+                self.status = Some("Drop files onto a folder, or onto the listing.".to_string());
+                Task::none()
+            }
+            Message::DropHit(Some(into), Some(from)) => self.plan_drop(into, from),
+            Message::DropPlanned(plan) => match plan {
+                hyprforge_files_core::drop::DropPlan::Nothing => Task::none(),
+                hyprforge_files_core::drop::DropPlan::Paste { clip, into } => self.paste_into(into, Some(clip)),
+                hyprforge_files_core::drop::DropPlan::Trash(paths) => self.handle_outcome(self.active, Outcome::Trash(paths)),
+            },
             Message::DragResult(Ok(())) => Task::none(),
             Message::DragResult(Err(why)) => {
                 self.status = Some(why);
@@ -3452,6 +3551,7 @@ impl App {
             window::resize_events().map(|(_, size)| Message::WindowResized(size)),
             pointer::track(),
             iced::event::listen_with(field_escape),
+            Subscription::run(hyprforge_files::dnd::events).map(Message::Dnd),
         ])
     }
 }
@@ -4144,6 +4244,18 @@ fn dialog<'a>(
 
 /// How much of the window a dialog's dim layer hides.
 const SCRIM_ALPHA: f32 = 0.6;
+
+/// Whether `file` and the folder `into` are on one filesystem — what
+/// decides whether a drag between folders moves or copies. Anything that
+/// cannot be asked is "no", which makes the drop a copy: the answer that
+/// never loses the original.
+fn same_filesystem(file: &Path, into: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::symlink_metadata(file), std::fs::metadata(into)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev(),
+        _ => false,
+    }
+}
 
 /// Escape pressed in a text field that took it.
 ///
@@ -4919,7 +5031,7 @@ mod tests {
             resize_generation: 0,
             clipboard: Arc::new(MemoryClipboard::new()),
             // Never attached: no window, so every drag is refused.
-            drag: Arc::new(hyprforge_files::drag_out::DragOut::new()),
+            drag: Arc::new(hyprforge_files::dnd::Dnd::new()),
             // Empty, not the machine's own: these tests are about the
             // window's loop, and what happens to be installed here is
             // none of their business. Tests that need a database build
@@ -4949,10 +5061,49 @@ mod tests {
             next_job_id: 1,
             modifiers: keyboard::Modifiers::default(),
             clicks: ClickTracker::new(),
+            drop_probe: (false, None),
             config: Arc::new(hyprforge_files_core::config::Config::default()),
             #[cfg(debug_assertions)]
             debug_show: DebugShow::default(),
         }
+    }
+
+    // --- dropping onto the window -----------------------------------------
+
+    /// A drag reports dozens of positions a second; each only means "look
+    /// again". One hit-test is out at a time and only the newest position
+    /// waits behind it.
+    #[test]
+    fn a_drag_over_the_window_asks_the_layout_once_at_a_time() {
+        use hyprforge_files::dnd::DropEvent;
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(Message::Dnd(DropEvent::Over { x: 1.0, y: 1.0 }));
+        assert!(app.drop_probe.0, "the first position goes straight out");
+        let _ = app.update(Message::Dnd(DropEvent::Over { x: 2.0, y: 2.0 }));
+        let _ = app.update(Message::Dnd(DropEvent::Over { x: 3.0, y: 3.0 }));
+        assert_eq!(app.drop_probe.1, Some((3.0, 3.0)), "only the newest waits");
+
+        let _ = app.update(Message::DropHit(Some(PathBuf::from("/a/docs")), None));
+        assert!(app.drop_probe.0 && app.drop_probe.1.is_none(), "the waiting one went out");
+        let _ = app.update(Message::DropHit(Some(PathBuf::from("/a/docs")), None));
+        assert!(!app.drop_probe.0);
+    }
+
+    #[test]
+    fn a_drag_leaving_the_window_unlights_the_folder() {
+        use hyprforge_files::dnd::DropEvent;
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(Message::DropHit(Some(PathBuf::from("/a/docs")), None));
+        let _ = app.update(Message::Dnd(DropEvent::Left));
+        assert!(!format!("{:?}", app.tabs[0].browser).contains("drop_hover: Some"));
+    }
+
+    #[test]
+    fn a_drop_that_lands_on_nothing_says_where_to_drop_instead() {
+        let mut app = app_for_test(&["/a"]);
+        let from = hyprforge_files_core::drop::DropFrom::Outside(vec![PathBuf::from("/tmp/x")]);
+        let _ = app.update(Message::DropHit(None, Some(from)));
+        assert!(app.status.as_deref().is_some_and(|s| s.contains("folder")), "{:?}", app.status);
     }
 
     // --- the path bar ------------------------------------------------------

@@ -14,10 +14,10 @@
 //! runs a paste — and the parts that need the window's own connection
 //! or a disk: reading what the preview pane and the thumbnails show
 //! (`preview`), the Wayland clipboard (`system_clipboard`) and dragging
-//! files out to another application (`drag_out`).
+//! files out to other applications and taking drops from them (`dnd`).
 
 pub mod archive_jobs;
-pub mod drag_out;
+pub mod dnd;
 pub mod jobs;
 pub mod launch;
 pub mod preview;

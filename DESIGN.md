@@ -335,6 +335,40 @@ see each phase above.
 The portal open/save dialog is not a phase — it inherits every one of these for
 free, because it renders the same view. That is the payoff for the `Mode` seam.
 
+## Dropping onto Files — built, and blocked on Hyprland
+
+`hyprforge-files-core::drop` decides where a drop lands and what it does:
+
+- **Where.** A widget operation asks iced's layout which folder row,
+  sidebar place or listing background holds the point, through scrolling.
+- **What.** Another application's files are copied, never moved. A drag
+  between this window's folders moves on one filesystem and copies across
+  two, with Ctrl and Shift to say otherwise. The Trash trashes. Letting go
+  where the drag started does nothing.
+- **The receiving half** is `dnd.rs`, the device that already started
+  drags. A drop goes through the ordinary paste, so conflicts, progress,
+  undo and archives behave as a paste does.
+
+It never fires on Hyprland 0.56. Measured with `WAYLAND_DEBUG=client`,
+filtered to data-device lines:
+
+- The compositor sent the drag's `enter`, `motion` and `leave` to the
+  first `wl_data_device` this client created, which is iced's clipboard's
+  (smithay-clipboard). That device ignores every drag event, so letting
+  go became a `leave`.
+- Hyprland's `dataDeviceForClient` returns the first device a client
+  made, and its `updateDrag` sends to that one device. wlroots sends to
+  all of them.
+- iced connects its clipboard before any of this crate's code runs, so
+  this device can never be first.
+
+A drag that starts in Files and ends over it does reach the source:
+`cancelled`, then a pointer `enter` at the drop position. But no
+`dnd_drop_performed` comes first, so a release cannot be told from Escape.
+Moving files on that ambiguity was not built. It waits on Hyprland
+sending drags to every device a client has, or on iced's clipboard
+accepting them.
+
 ## What to verify, not assume
 
 - Screenshot the real window against the mockup at the same size, and compare

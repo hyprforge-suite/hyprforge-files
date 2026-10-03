@@ -41,8 +41,8 @@ branch on which host it is in.
 What this crate owns is the window around it, and the things a dialog
 deliberately does not have: launching what you double-click, file
 operations, the transfers panel, the archive jobs, reading what the
-preview pane and the thumbnails show, the system clipboard, and dragging
-files out to another application.
+preview pane and the thumbnails show, the system clipboard, and drag and
+drop with other applications.
 
 ## Installing
 
