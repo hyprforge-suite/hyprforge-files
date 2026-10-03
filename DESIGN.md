@@ -272,6 +272,73 @@ docked right with General/Permissions/Open-with tabs. Preferences is
 behaviour and keybinds only — appearance belongs to the Settings app, which
 the mockup says explicitly and which matches the suite's layering.
 
+*Built.* Both are window actions — Alt+Enter and Ctrl+, — because the
+open/save dialog ignores window actions, and that is how both stay out
+of a file chooser without the browser's view learning which host it is
+in (the `Mode` test is untouched).
+
+**Properties** (`hyprforge-files-core`'s `properties`, the host half in
+the app's `properties.rs`) is in every right-click menu but the
+sidebar's. With nothing selected it describes the folder in view.
+
+- **One docked panel at a time.** It takes the preview pane's slot.
+  Two panels would leave the listing a strip and show the same facts
+  twice. Closing it brings the pane back as it was, and asking for the
+  preview while it is open swaps them back. Unlike the pane it never
+  steps aside on a narrow window: it was asked for, so the listing
+  gives way down to its floor.
+- **General.** Where, kind (the MIME database's own words), type,
+  size and on-disk size, modified, accessed, created, owner:group,
+  inode, a link's target. A folder's size is walked off the UI thread.
+  The walk does not follow links, stays on one filesystem and counts
+  hard links once. It stops at a million entries or a minute and says
+  "at least". It is cancelled the moment the selection moves on.
+- **Several selected.** A total, the kinds ("3 Rust source · 1 TOML")
+  and Compress. Bulk rename is not built.
+- **Permissions.** Nine boxes, live for one file you own. A change goes
+  through the host and comes back as what `stat` says. Setuid, setgid
+  and sticky are shown, never offered, and an edit never touches them.
+- **Open with.** What opens the type, by name, as a double-click would.
+  The default is marked, and any other can be made the default. "Other
+  applications…" opens the window's chooser.
+- **The Trash and archives.** Inside an archive nothing is asked of the
+  disk and nothing changes. The Trash is described but read-only, and
+  opens nothing.
+
+Left out: the Git tab (Git is deferred), tags (deferred) and the
+checksum, which reads the whole file to answer a question nobody asked
+by opening Properties.
+
+**Preferences** is a sheet over the window (the app's `preferences.rs`,
+decisions in `hyprforge-files-core`'s `preferences`). It has two pages.
+
+- **Behaviour.** Hidden files, folders first, preview pane, view and
+  sidebar go to `files.toml` and reach every tab at once. Paste
+  conflicts and confirm-before-trash/delete go to `files-config.toml`.
+  The number-valued settings (progress delay, undo depth) stay in the
+  file. Single-click opening is not offered, because it does not exist.
+- **Key bindings.** Every action under a heading, with its keys as caps.
+  Change, Add, Clear, and Reset for a line the file holds. A key another
+  action holds is named and asked about first; taking it rewrites that
+  action's line without the key, so the file never holds a clash. A
+  bare letter is refused, because it types into search.
+
+`files-config.toml` is written through `toml_edit`, one entry at a time.
+Comments, order and untouched lines survive. A file that will not parse
+is reported and never written. A missing one is created with a line
+saying what wrote it.
+
+Checked in the nested compositor, with a virtual pointer for the clicks:
+
+- each tab of the inspector
+- a group-write tick reaching the disk (`754` to `774`) and the
+  listing's column
+- making Vim the default writing the scratch `mimeapps.list`
+- a folder walked
+- a three-item summary
+- a Behaviour switch written to the file
+- Ctrl+R taken from Refresh for the palette, and both reset
+
 **F — Search (`1e`).** Structured chips (`ext:rs`, `modified:<7d`), a scope
 rail, saved smart folders. Today's search is a substring match on one
 directory.
@@ -386,7 +453,7 @@ currently *wrong* rather than merely unfinished: it shows a stored filename
 where the user expects the name their file had. Everything else is honest
 about being incomplete.
 
-A, D, B, H and C have since been built;
+A, D, B, H, C and E have since been built;
 see each phase above.
 
 The portal open/save dialog is not a phase — it inherits every one of these for
