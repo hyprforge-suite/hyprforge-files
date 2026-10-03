@@ -6,7 +6,9 @@ Tabs in the titlebar, a sidebar of places and pins, list, grid and column views,
 a path bar that understands `~/do/pr/hyf` as `~/Documents/Projects/hyprforge`,
 a Ctrl+K palette of every command,
 a search that understands filters (`ext:rs`, `size:>10M`, `modified:<7d`)
-as chips, looks below the folder or across home, and saves to the
+as chips, reads what files say (`content:TODO`, with no index — bounded,
+and counting every file it did not read), looks below the folder or
+across home (Ctrl+Shift+F moves between them), and saves to the
 sidebar, multi-select and history — and the freedesktop trash done
 properly, including the part that bites: a file cannot be renamed across
 filesystems, so a file on another one needs a trash directory of its own,

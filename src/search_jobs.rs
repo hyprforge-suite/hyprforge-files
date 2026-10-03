@@ -25,6 +25,7 @@
 //! not entered at all ([`elsewhere`]), which is the commoner way to meet
 //! such a mount in the first place.
 
+use hyprforge_files_core::content::{self, Opened, Refused};
 use hyprforge_files_core::search::{walk, Ask, End, Request, Summary};
 use hyprforge_files_core::{Entry, FsBackend};
 use std::os::unix::fs::MetadataExt;
@@ -131,6 +132,19 @@ pub fn elsewhere(root: &Path) -> impl Fn(&Path) -> bool + Send + 'static {
     }
 }
 
+/// How a walk from `root` reads a file for `content:` — see
+/// [`hyprforge_files_core::content`]. A root that is a folder on disk
+/// reads files on disk; any other root is inside an archive (the same
+/// test [`elsewhere`] makes), where no member is a file to open, and
+/// every one is counted as such rather than reported unreadable.
+pub fn opener(root: &Path) -> fn(&Path) -> Result<Opened, Refused> {
+    if std::fs::metadata(root).is_ok_and(|m| m.is_dir()) {
+        content::open_regular
+    } else {
+        content::in_archive
+    }
+}
+
 /// Runs one search on a blocking worker and streams what it finds — see
 /// the module doc for how it ends.
 pub fn stream(
@@ -145,9 +159,10 @@ pub fn stream(
         use iced::futures::SinkExt;
         let (found, mut batches) = tokio::sync::mpsc::unbounded_channel::<Vec<Entry>>();
         let fence = elsewhere(&request.root);
+        let open = opener(&request.root);
         let worker_cancel = cancel.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            walk(backend.as_ref(), &request, &worker_cancel, &fence, &mut |batch| found.send(batch).is_ok())
+            walk(backend.as_ref(), &request, &worker_cancel, &fence, &open, &mut |batch| found.send(batch).is_ok())
         });
         let mut count = 0;
         loop {
@@ -252,6 +267,18 @@ mod tests {
         // `/proc` is its own filesystem on every Linux system this runs
         // on; a fence that cannot see that cannot see a network mount.
         assert!(elsewhere(Path::new("/"))(Path::new("/proc")));
+    }
+
+    /// A walk from a real folder reads real files; one from inside an
+    /// archive opens nothing, and says so.
+    #[test]
+    fn contents_are_read_on_disk_and_never_inside_an_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(opener(dir.path())(&file).is_ok());
+        let inside = dir.path().join("a.zip").join("inner");
+        assert_eq!(opener(&inside)(&file).err(), Some(Refused::InArchive));
     }
 
     #[tokio::test]

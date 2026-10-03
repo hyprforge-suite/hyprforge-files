@@ -425,16 +425,92 @@ compositor, a debug build searching all of `~` reported "0 matches in
 17,865 folders · 3 folders on other drives not searched" within eight
 seconds.
 
+*Built since* — the three pieces first left out:
+
+- **The grid says where a result is.** Among results, each cell carries
+  a line of meta text under the name: the list's Folder text, cut from
+  the front at whole folder names (`…/files/src`), because the folder a
+  result is *in* says more than the one every result shares. iced 0.14
+  has no text ellipsis and no measuring before layout, so the cut is by
+  characters — `density::GRID_FOLDER_CHARS`, the cell's inner width
+  over an average character — and the line is clipped besides. The cell
+  stays its fixed 132px: the icon shrinks from 56 to 48 among results
+  to make room, rather than the name losing its second line (the thing
+  a grid is for is recognising names) or the grid changing height when
+  a search starts. A test sums the cell's contents both ways.
+- **Ctrl+Shift+F moves the search to the rail's next scope** — This
+  folder, Subfolders, Home, and round, skipping what the rail is not
+  showing (Home when you are home; everything but This folder in the
+  Trash). An action like any other (`next-search-scope`), so it is in
+  the palette and rebindable in Preferences, and enabled only while
+  searching, when the rail is there to show where it went. Ctrl and a
+  letter, because iced's text field types an Alt+letter's text into
+  itself and never lets it reach the keymap; Ctrl+letter it leaves
+  alone, so the key works with the field focused.
+- **`content:` reads what files say, with no index**
+  (`hyprforge-files-core/src/content.rs`). It is a predicate the walk
+  answers *last*, for whatever the name, size and date filters let
+  through, so `ext:rs content:TODO` opens only Rust files. The listing
+  cannot answer it, so even This folder walks — one level deep. It
+  inherits every bound of the walk, whose clock and cancel flag are now
+  asked before each file read as well as each folder, and has its own:
+  only regular files (a link or a pipe is refused by `lstat` before any
+  open, and the open is non-blocking besides), never an archive (a zip
+  on the way is not opened; a walk inside one opens nothing and counts
+  every member), a NUL in the first 8 KiB is a binary, nothing over
+  4 MiB is opened or read past (a log that grows while being read is cut
+  there), and 1 GiB in all, after which the walk ends with its own
+  reason, "Stopped after reading 1.0 GiB". Matching streams 64 KiB at a
+  time through one buffer per walk, keeping a needle's length of
+  overlap so a match across two reads is found; `memchr2` finds the
+  first letter in either case, so ASCII case is ignored without a
+  lowercased copy. Non-ASCII is compared exactly — folding `ß` to `ss`
+  in a stream is a Unicode table and a change of length. A file it
+  could not read matches no content filter, negated or not:
+  `-content:TODO` is files that were read and do not say it. The rail
+  counts both halves: "6 files read · not read: 1 too large, 1 binary,
+  1 archive". The Trash, which the walk never enters, says content is
+  not searched there rather than quietly matching names.
+
+Measured (release build, through the real `RoutingBackend`, peak memory
+from the process's `VmHWM`; counts and times only — the measuring
+program printed no names or contents). "First run" is the first search
+of a tree after building, partly cold; the rest are warm:
+
+| Search | Folders | Files read | Bytes read | Time | Peak memory |
+|---|---|---|---|---|---|
+| this monorepo, `content:` (nothing matches) | 170 | 574 | 9 MiB | 15 ms | 4.4 MB (4.3 MB name-only) |
+| `~/Documents/Projects`, name only | 11,233 | — | — | 0.80 s | 7.3 MB |
+| `~/Documents/Projects`, `content:`, default budget | 5,824 | 42,623 | 1 GiB — the read limit | 4.9 s first run, 0.65 s warm | 7.4 MB |
+| `~/Documents/Projects`, `content:`, unbounded | 11,233 | 70,641 | 2.0 GiB | 4.9 s first run, 1.5 s warm | 7.4 MB |
+| `~/Documents/Projects`, `ext:rs content:unwrap` | 11,233 | 601 | 18 MiB | 0.52 s | 7.7 MB |
+| `~`, `content:`, default budget | 4,793 | 43,704 | 1 GiB — the read limit | 1.6 s first run, 0.63 s warm | 7.5 MB |
+| `~`, `content:`, unbounded | 17,867 | 105,690 | 2.6 GiB | 3.6 s | 7.6 MB |
+
+Content search costs no memory a name search does not (one 64 KiB
+buffer), and on a source tree it is the folder walk that costs, not
+the reading. The read limit is what bounds a search of everything: a
+whole home directory is 2.6 GiB of text under the size cap (and 50,603
+binaries, 2,615 files over 4 MiB). The instrument was checked against
+`grep -rli` on the monorepo (269 files say `unwrap`, both ways, and
+`ext:rs content:"fn main"` found the 23 grep finds). In the nested
+compositor, a debug build searching `~` for `content:todo` stopped at
+the read limit within fifteen seconds with 1,728 matches, saying so.
+
 Not built:
 
-- **Grid view shows no Folder.** A tile has no column; the result's
-  folder is one Show in Folder away.
 - **Folder sizes in results** stay blank: counting a few thousand
   folders scattered across a tree is the second pass the listing bounds
   at 400, and nobody sorts search results by item count.
-- **Keyboard scope switching.** The rail is clicked; a saved search
-  covers the scope you use every day.
-- **Content search** — an index, not a predicate; a different feature.
+- **An index.** `content:` reads on every search, and a search of all
+  of home reads until the 1 GiB limit — under two seconds here, but on a
+  spinning disk the time limit is what ends it. An index would answer
+  instantly and would be a daemon, a database and a staleness problem;
+  the bounded read is enough for "this project", which is what it is
+  for.
+- **Case folding beyond ASCII** and **text in UTF-16** (whose NULs make
+  it a binary to the sniff), both of which `grep` also leaves out by
+  default.
 
 **G — Transfers (`1f`).** `hyprforge-fileops::ops` already reports progress and
 cancels per chunk; this is the popover and the queue window over it.
