@@ -20,6 +20,7 @@
 //! window's, and the open/save dialog has neither.
 
 pub mod archive_jobs;
+pub mod bulk_rename;
 pub mod dnd;
 pub mod host;
 pub mod jobs;

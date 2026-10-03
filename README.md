@@ -43,6 +43,17 @@ with a key another command holds named before it is taken — and writes
 `files-config.toml` one line at a time, so anything written there by
 hand stays. Colours and fonts are the Settings app's.
 
+**Bulk rename** is F2 with several things selected: find and replace
+(optionally a regular expression), add text, number them in the order
+the folder is sorted (`Holiday {n:03}`), or change their case — with the
+extension left alone unless you ask. Every name is previewed before
+anything happens, and a clash, an empty name or one that would hide the
+file is flagged on its row and stops the rename. It happens all at once
+or not at all: two names swapped go through a temporary one, nothing is
+ever written over, and a failure halfway puts everything back and says
+exactly where anything it could not put back now is. One Ctrl+Z undoes
+the lot. Inside an archive it is a single rewrite.
+
 It can also be **every application's Open and Save dialog**, through
 xdg-desktop-portal — the same browser, path bar and previews, not a
 smaller copy. See "The open/save dialog" below.
