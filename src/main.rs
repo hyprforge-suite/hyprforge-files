@@ -192,6 +192,7 @@ fn main() -> iced::Result {
         // loaded it each time.
         mime: Arc::new(hyprforge_mime::MimeDb::load()),
         chooser: None,
+        preferences: None,
         compressing: None,
         unlocking: None,
         keyring,
@@ -462,6 +463,19 @@ enum Message {
     /// A click on a tab. The keyboard's tab actions go through
     /// [`App::perform_window`] instead.
     SwitchTab(usize),
+    /// An answer for the Properties inspector of the tab with this id —
+    /// see `hyprforge_files::properties`.
+    Properties(u64, hyprforge_files_core::properties::Message),
+    /// A default set from the inspector: the tab, the inspector's
+    /// generation, and the database as it now reads with what opens the
+    /// file — or why not.
+    PropertiesDefaultSet(
+        u64,
+        u64,
+        Result<(hyprforge_mime::MimeDb, hyprforge_files_core::properties::Apps), String>,
+    ),
+    /// The Preferences sheet — see `hyprforge_files::preferences`.
+    Preferences(hyprforge_files::preferences::Message),
 }
 
 /// One open directory tree view, with the state that makes it a tab
@@ -591,6 +605,8 @@ struct App {
     mime: Arc<hyprforge_mime::MimeDb>,
     /// An open "which application?" chooser.
     chooser: Option<Chooser>,
+    /// The Preferences sheet, when it is open.
+    preferences: Option<hyprforge_files::preferences::Preferences>,
     /// An open "Compress\u{2026}" dialog.
     compressing: Option<Compressing>,
     /// An open password prompt for an encrypted archive.
@@ -1780,6 +1796,109 @@ impl App {
                 self.handle_outcome(tab_index, outcome)
             }
             Outcome::Window(action) => self.perform_window(action),
+            Outcome::Properties(request) => self.inspect(tab_index, request),
+        }
+    }
+
+    /// Carries out what a tab's Properties inspector asked for, on
+    /// blocking workers — see `hyprforge_files::properties` — and routes
+    /// each answer back to the tab that asked, by its id, so an answer
+    /// arriving after a tab switch still lands where it belongs.
+    fn inspect(&mut self, tab_index: usize, request: hyprforge_files_core::properties::Request) -> Task<Message> {
+        use hyprforge_files::properties as host;
+        use hyprforge_files_core::properties::{Message as Inspector, Request};
+        let tab_id = self.tabs[tab_index].id;
+        let mime = self.mime.clone();
+        match request {
+            Request::Inspect { generation, facts, apps, measure, cancel } => {
+                let found = Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let facts = facts.map(|path| host::facts_of(&path, &mime));
+                            let apps = apps.map(|path| host::apps_of(&path, &mime));
+                            (facts, apps)
+                        })
+                        .await
+                        .unwrap_or_else(|e| (Some(Err(format!("Looking was interrupted: {e}"))), None))
+                    },
+                    move |(facts, apps)| Message::Properties(tab_id, Inspector::Found { generation, facts, apps }),
+                );
+                if measure.is_empty() {
+                    return found;
+                }
+                let tallies = Task::run(host::measure_stream(measure, cancel), move |tally| {
+                    Message::Properties(tab_id, Inspector::Tallied { generation, tally })
+                });
+                Task::batch([found, tallies])
+            }
+            Request::SetMode { generation, path, mode } => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || host::set_mode(&path, mode, &mime))
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Changing the permissions was interrupted: {e}")))
+                },
+                move |result| Message::Properties(tab_id, Inspector::ModeSet { generation, result }),
+            ),
+            Request::SetDefault { generation, path, mime: kind, app } => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || host::set_default(&path, &kind, &app))
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Saving that choice was interrupted: {e}")))
+                },
+                move |result| Message::PropertiesDefaultSet(tab_id, generation, result),
+            ),
+        }
+    }
+
+    /// Opens the Preferences sheet and reads `files-config.toml` for it.
+    fn open_preferences(&mut self) -> Task<Message> {
+        use hyprforge_files::preferences::{self as sheet, Message as Sheet, Page, Preferences};
+        if self.preferences.is_some() {
+            return Task::none();
+        }
+        let path = hyprforge_paths::files_config_toml_path();
+        self.preferences = Some(Preferences::new(path.clone(), Page::Behaviour));
+        Task::perform(
+            async move { tokio::task::spawn_blocking(move || sheet::read(&path)).await.unwrap_or_default() },
+            |(state, problems)| Message::Preferences(Sheet::Read(state, problems)),
+        )
+    }
+
+    fn preferences_effect(&mut self, effect: hyprforge_files::preferences::Effect) -> Task<Message> {
+        use hyprforge_files::preferences::{self as sheet, Effect, Message as Sheet};
+        match effect {
+            Effect::None => Task::none(),
+            Effect::Close => {
+                self.preferences = None;
+                Task::none()
+            }
+            Effect::Write(edits) => {
+                let path = hyprforge_paths::files_config_toml_path();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || sheet::write(&path, &edits)).await.unwrap_or_else(|e| {
+                            Err(hyprforge_files_core::config_edit::EditError::Write {
+                                path: "files-config.toml".to_string(),
+                                why: format!("interrupted: {e}"),
+                            })
+                        })
+                    },
+                    |result| Message::Preferences(Sheet::Saved(Box::new(result))),
+                )
+            }
+            // One of the listing's own settings: every tab takes it, so
+            // the window agrees with itself, and `files.toml` is written
+            // once rather than once per tab.
+            Effect::Adopt(setting) => {
+                let mut tasks = Vec::new();
+                for index in 0..self.tabs.len() {
+                    let outcome = self.tabs[index].browser.update(BrowserMessage::Adopt(setting));
+                    tasks.push(self.handle_outcome(index, outcome));
+                }
+                setting.apply(&mut self.last_prefs);
+                tasks.push(Task::perform(save_prefs(move |p: &mut Prefs| setting.apply(p)), Message::PrefsSaved));
+                Task::batch(tasks)
+            }
         }
     }
 
@@ -2428,6 +2547,14 @@ impl App {
                 self.jump_to_tab(usize::from(n).saturating_sub(1));
                 Task::none()
             }
+            // Drawn by the browser, in the preview pane's place, but
+            // opened from here: window scope is what keeps it out of the
+            // open/save dialog — see `Action::Properties`.
+            Action::Properties => {
+                let outcome = self.active_tab_mut().browser.update(BrowserMessage::ToggleProperties);
+                self.handle_outcome(self.active, outcome)
+            }
+            Action::Preferences => self.open_preferences(),
             // A browser action has no business here; `Browser::perform`
             // never hands one back. Doing nothing is the safe reading.
             _ => Task::none(),
@@ -2670,6 +2797,60 @@ impl App {
                 }
                 self.handle_outcome(self.active, outcome)
             }
+            // The Preferences sheet has the keyboard while it is up.
+            // Capturing a binding, the next key is the binding — Escape
+            // alone backs out of the capture, so Escape itself cannot be
+            // bound from here (it stays bindable in the file). Otherwise
+            // Escape closes the sheet and every other key is swallowed,
+            // as the chooser swallows them, so nothing acts on the
+            // listing hidden behind it.
+            Message::KeyPressed(press) if self.preferences.is_some() => {
+                use hyprforge_files::preferences::Message as Sheet;
+                let capturing = self.preferences.as_ref().is_some_and(|p| p.capturing());
+                let message = match (capturing, press.key) {
+                    (true, keymap::Key::Escape) => Sheet::CancelCapture,
+                    (true, _) => Sheet::Captured(keymap::Combo { key: press.key, mods: press.mods }),
+                    (false, keymap::Key::Escape) => Sheet::Close,
+                    (false, _) => return Task::none(),
+                };
+                self.update(Message::Preferences(message))
+            }
+            Message::Preferences(message) => {
+                let Some(sheet) = &mut self.preferences else { return Task::none() };
+                let saved = match &message {
+                    hyprforge_files::preferences::Message::Saved(saved) => {
+                        saved.as_ref().as_ref().ok().map(|(config, _, _)| config.clone())
+                    }
+                    _ => None,
+                };
+                let effect = sheet.update(message, &self.config);
+                // What was written is what every tab now binds and
+                // shows — the menus' key hints included.
+                if let Some(config) = saved {
+                    let config = Arc::new(config);
+                    for tab in &mut self.tabs {
+                        tab.browser.set_config(config.clone());
+                    }
+                    self.config = config;
+                }
+                self.preferences_effect(effect)
+            }
+            Message::Properties(tab_id, message) => {
+                let Some(index) = self.tab_index(tab_id) else { return Task::none() };
+                let outcome = self.tabs[index].browser.update(BrowserMessage::Properties(Box::new(message)));
+                self.handle_outcome(index, outcome)
+            }
+            Message::PropertiesDefaultSet(tab_id, generation, result) => {
+                use hyprforge_files_core::properties::Message as Inspector;
+                let result = result.map(|(db, apps)| {
+                    // The window's copy of the database is a snapshot;
+                    // the chooser and every later double-click have to
+                    // see the default that was just set.
+                    self.mime = Arc::new(db);
+                    apps
+                });
+                self.update(Message::Properties(tab_id, Inspector::DefaultSet { generation, result }))
+            }
             // The chooser has the keyboard while it is up. Escape
             // closes it; everything else is swallowed rather than
             // reaching the listing behind it, where a stray letter
@@ -2905,6 +3086,11 @@ impl App {
             }
             // Whichever field took it: at most one of a rename and the
             // path bar is open, and cancelling the other does nothing.
+            // The sheet's own field is the only one showing while it is
+            // up, so an Escape there backs out of the sheet.
+            Message::EscapeInField if self.preferences.is_some() => {
+                self.update(Message::Preferences(hyprforge_files::preferences::Message::Close))
+            }
             Message::EscapeInField => {
                 let browser = &mut self.active_tab_mut().browser;
                 let renamed = browser.update(BrowserMessage::RenameCancel);
@@ -3454,6 +3640,11 @@ impl App {
         // listing alike — so it is stacked over the whole window rather
         // than drawn inside the browser's own area.
         let size = (self.last_window_size.0 as f32, self.last_window_size.1 as f32);
+        if let Some(sheet) = &self.preferences {
+            let prefs = self.active_tab().browser.prefs();
+            let over = sheet.view(&self.config, prefs, scale).map(Message::Preferences);
+            return iced::widget::stack![window, over].into();
+        }
         if let Some(pending) = &self.confirm {
             return iced::widget::stack![window, confirm_dialog(pending, scale)].into();
         }
@@ -4320,6 +4511,11 @@ struct DebugShow {
     open_with: bool,
     /// The path bar, opened with this typed into it — `jump=~/do/pr`.
     jump: Option<String>,
+    /// Properties for the first row, on this tab — `properties=permissions`.
+    /// A tab is a click away, and the rig has no pointer to click with.
+    properties: Option<String>,
+    /// The Preferences sheet, on this page — `preferences=keys`.
+    preferences: Option<String>,
 }
 
 #[cfg(debug_assertions)]
@@ -4348,6 +4544,10 @@ impl DebugShow {
                 show.open_with = true;
             } else if let Some(text) = item.strip_prefix("jump=") {
                 show.jump = Some(text.to_string());
+            } else if let Some(tab) = item.strip_prefix("properties=") {
+                show.properties = Some(tab.to_string());
+            } else if let Some(page) = item.strip_prefix("preferences=") {
+                show.preferences = Some(page.to_string());
             }
         }
         show
@@ -4408,6 +4608,26 @@ impl DebugShow {
             browser.update(BrowserMessage::EntryClicked { index: 0, ctrl: false, shift: false });
             let outcome = browser.perform(Action::Open);
             return app.handle_outcome(index, outcome);
+        }
+        if let Some(tab) = self.properties.take() {
+            use hyprforge_files_core::properties::{Message as Inspector, Tab};
+            browser.update(BrowserMessage::EntryClicked { index: 0, ctrl: false, shift: false });
+            let opened = browser.update(BrowserMessage::ToggleProperties);
+            let tab = match tab.as_str() {
+                "permissions" => Tab::Permissions,
+                "open-with" => Tab::OpenWith,
+                _ => Tab::General,
+            };
+            browser.update(BrowserMessage::Properties(Box::new(Inspector::ShowTab(tab))));
+            return app.handle_outcome(index, opened);
+        }
+        if let Some(page) = self.preferences.take() {
+            use hyprforge_files::preferences::{Message as Sheet, Page};
+            let opened = app.open_preferences();
+            if page == "keys" {
+                let _ = app.update(Message::Preferences(Sheet::Show(Page::Keys)));
+            }
+            return opened;
         }
         if let Some(text) = self.jump.take() {
             let opened = browser.update(BrowserMessage::EditPath);
@@ -4868,6 +5088,7 @@ mod tests {
             // one.
             mime: Arc::default(),
             chooser: None,
+            preferences: None,
             compressing: None,
             unlocking: None,
             keyring: Arc::new(hyprforge_archive::Keyring::new()),
@@ -5126,6 +5347,81 @@ mod tests {
         };
         let _ = app.update(Message::KeyPressed(escape));
         assert_eq!(app.chooser, None);
+    }
+
+    /// Alt+Enter is a window action the window carries out by asking
+    /// the active tab's browser — the inspector opens there, and the
+    /// same key closes it.
+    #[test]
+    fn alt_enter_opens_and_closes_properties_in_the_active_tab() {
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(key("Alt+Enter"));
+        assert!(app.tabs[0].browser.properties_open());
+        let _ = app.update(key("Alt+Enter"));
+        assert!(!app.tabs[0].browser.properties_open());
+    }
+
+    /// An answer is routed by tab id, so one arriving after a switch
+    /// still reaches the inspector that asked.
+    #[test]
+    fn an_inspector_answer_lands_in_the_tab_that_asked() {
+        use hyprforge_files_core::properties::{Message as Inspector, Tally, TallyState};
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(key("Alt+Enter"));
+        let asked = app.tabs[0].id;
+        let generation = app.tabs[0].browser.inspector().unwrap().generation();
+        let _ = app.update(key("Ctrl+T"));
+        assert_ne!(app.active, 0);
+        let tally = Tally { bytes: 7, state: TallyState::Done, ..Tally::default() };
+        let _ = app.update(Message::Properties(asked, Inspector::Tallied { generation, tally }));
+        assert_eq!(app.tabs[0].browser.inspector().unwrap().tally(), Some(tally));
+    }
+
+    #[test]
+    fn ctrl_comma_opens_preferences_and_escape_closes_it() {
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(key("Ctrl+,"));
+        assert!(app.preferences.is_some());
+        let _ = app.update(typed('n'));
+        assert_eq!(app.tabs[0].browser.search_query(), "", "nothing reaches the listing behind the sheet");
+        let _ = app.update(key("Escape"));
+        assert!(app.preferences.is_none());
+    }
+
+    /// While a binding is being captured the next key is the binding,
+    /// never an action — pressing Delete there must not trash anything.
+    #[test]
+    fn a_key_pressed_while_capturing_is_the_binding_not_an_action() {
+        use hyprforge_files::preferences::Message as Sheet;
+        use hyprforge_files_core::preferences::Capture;
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(key("Ctrl+,"));
+        let _ = app.update(Message::Preferences(Sheet::Read(Default::default(), Vec::new())));
+        let _ = app.update(Message::Preferences(Sheet::Capture(Action::Properties, Capture::Replace)));
+        assert!(app.preferences.as_ref().unwrap().capturing());
+        let _ = app.update(key("Escape"));
+        assert!(app.preferences.as_ref().is_some_and(|p| !p.capturing()), "Escape backs out of the capture only");
+    }
+
+    /// What a write reloads is what the window binds from then on.
+    #[test]
+    fn a_saved_binding_is_what_the_window_binds_from_then_on() {
+        use hyprforge_files::preferences::Message as Sheet;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files-config.toml");
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(key("Ctrl+T"));
+        let _ = app.update(key("Ctrl+,"));
+        let _ = app.update(Message::Preferences(Sheet::Read(Default::default(), Vec::new())));
+        let written = hyprforge_files::preferences::write(
+            &path,
+            &[hyprforge_files_core::preferences::clear(Action::Refresh)],
+        );
+        let _ = app.update(Message::Preferences(Sheet::Saved(Box::new(written))));
+        assert!(app.config.keymap.combos_for(Action::Refresh).is_empty());
+        // The sheet stays open to keep editing; what it now knows the
+        // file says came back with the write.
+        assert!(app.preferences.is_some());
     }
 
     /// Picking an application closes the chooser, whatever happened
