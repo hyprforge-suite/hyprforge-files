@@ -313,7 +313,8 @@ impl Dialog {
             Message::EscapeInField => {
                 let renamed = self.browser.update(BrowserMessage::RenameCancel);
                 let pathed = self.browser.update(BrowserMessage::PathCancel);
-                self.handle(Outcome::Many(vec![renamed, pathed]))
+                let paletted = self.browser.update(BrowserMessage::PaletteCancel);
+                self.handle(Outcome::Many(vec![renamed, pathed, paletted]))
             }
             Message::NameChanged(name) => {
                 self.name = name;

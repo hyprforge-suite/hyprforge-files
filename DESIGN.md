@@ -280,6 +280,30 @@ a time, and a blocked job does not hold up an unrelated one behind it.
 
 **H — the command palette.** `1l`'s idea, inside `1b`.
 
+*Built.* Ctrl+K opens a field near the top of the window with every
+command under it, narrowed as you type (`hyprforge-files-core/src/palette.rs`).
+
+- **Ranking:** a command's initials first (`nf` is New Folder), then the
+  path bar's matcher against its name.
+- **What is offered:** only what would do something there and then.
+  Keystroke-only actions such as focus moves are left out.
+- **Running a command:** it goes through the same `perform` a key or a menu
+  does, so the palette is one more way of asking, not a second
+  implementation.
+- **Drawing:** the shared `suggestions` panel hung from the field, so it
+  reads as the path bar's sibling. Hosts draw it through `menu_overlay`, as
+  they draw menus.
+- **The dialog:** it has the palette too, limited to
+  `menu::DIALOG_ACTIONS`, the one list its menus also come from.
+
+Checked in the nested compositor:
+
+- the card sits below the window's chrome rather than over the path bar
+  (the first screenshot had it covering the path bar)
+- the selected row's key hint is legible on the accent (the first
+  screenshot had it dim on purple; the fix is in the shared widget)
+- Enter runs the command and closes the palette
+
 **I — Devices, mounts, archives (`1j`)** and the terminal drawer (`1i`).
 Archives and network shares were already phases 6 and 7 of the original plan;
 the drawer is new and is the most cuttable thing here.
@@ -329,7 +353,7 @@ currently *wrong* rather than merely unfinished: it shows a stored filename
 where the user expects the name their file had. Everything else is honest
 about being incomplete.
 
-A, D, B and the thumbnail and preview half of C have since been built;
+A, D, B, H and the thumbnail and preview half of C have since been built;
 see each phase above.
 
 The portal open/save dialog is not a phase — it inherits every one of these for

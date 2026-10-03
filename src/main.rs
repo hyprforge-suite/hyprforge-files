@@ -2897,7 +2897,8 @@ impl App {
                 let browser = &mut self.active_tab_mut().browser;
                 let renamed = browser.update(BrowserMessage::RenameCancel);
                 let pathed = browser.update(BrowserMessage::PathCancel);
-                self.handle_outcome(self.active, Outcome::Many(vec![renamed, pathed]))
+                let paletted = browser.update(BrowserMessage::PaletteCancel);
+                self.handle_outcome(self.active, Outcome::Many(vec![renamed, pathed, paletted]))
             }
             Message::AnswerConflict(id, policy) => {
                 self.answer_conflict(id, policy);
