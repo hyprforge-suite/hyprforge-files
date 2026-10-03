@@ -37,10 +37,31 @@ pub type JobId = u64;
 /// What a job reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobEvent {
-    Progress { job: JobId, progress: Progress },
+    /// `progress` is the *current item's*: `fileops` runs one
+    /// operation per pasted item, and each starts its counts at zero.
+    /// `items` says where that item is in the job, which is what lets a
+    /// job of several items draw one bar that does not fall back to
+    /// empty each time it moves on to the next — see
+    /// `crate::transfers::job_fraction`.
+    Progress { job: JobId, progress: Progress, items: Items },
     /// Paused: something is in the way. Answer with [`JobControl::answer`].
     Collision { job: JobId, collision: Collision },
     Finished { job: JobId, summary: JobSummary },
+}
+
+/// Which of a job's items a progress report is about: `done` items are
+/// finished, of `of` in all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Items {
+    pub done: usize,
+    pub of: usize,
+}
+
+impl Default for Items {
+    /// A job of one item that has not finished it.
+    fn default() -> Self {
+        Items { done: 0, of: 1 }
+    }
 }
 
 /// How a job went, item by item.
@@ -68,6 +89,26 @@ pub struct JobSummary {
     /// allowed to do. Always `None` for a paste; see
     /// `crate::archive_jobs`.
     pub needs_password: Option<std::path::PathBuf>,
+    /// The items that failed *whole* — nothing of them landed — and so
+    /// can be run again exactly as they were asked for.
+    ///
+    /// Only those. An item that partly landed (a folder with 998 of its
+    /// 1000 files across) cannot be retried by running it again: its
+    /// first collision is with its own half-copy, and `fileops` has no
+    /// "merge into the folder, skip what is already there" answer —
+    /// Skip on a folder skips the whole subtree, and Replace deletes
+    /// what did arrive. An item that landed nothing has neither problem:
+    /// a failed file's partial copy is removed by `fileops` before it
+    /// reports, and a move whose copy failed keeps its source whole, so
+    /// running the step again is the original request, and anything
+    /// that appeared at the destination meanwhile is asked about as it
+    /// would have been the first time. Always empty for an archive job.
+    pub retry: Vec<PasteStep>,
+    /// Items that failed after part of them had landed — the ones
+    /// `retry` leaves out, counted so the window can say why they are
+    /// not offered again rather than leave them silently missing from
+    /// the Retry button's count.
+    pub partly: usize,
 }
 
 impl JobSummary {
@@ -155,7 +196,8 @@ fn run(
     };
     let mut last_progress: Option<Instant> = None;
 
-    'items: for step in steps {
+    let of = steps.len();
+    'items: for (done, step) in steps.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
             break;
@@ -169,7 +211,7 @@ fn run(
                 StepOutcome::Progress(progress) => {
                     if last_progress.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
                         last_progress = Some(Instant::now());
-                        let _ = events.unbounded_send(JobEvent::Progress { job, progress });
+                        let _ = events.unbounded_send(JobEvent::Progress { job, progress, items: Items { done, of } });
                     }
                 }
                 StepOutcome::Collision(collision) => {
@@ -193,6 +235,18 @@ fn run(
                     op.resolve(CollisionDecision { policy, apply_to_rest: false });
                 }
                 StepOutcome::Done(report) => {
+                    // Before `failed` is drained: whether this item can be
+                    // run again is decided by what it left behind. See
+                    // `JobSummary::retry`.
+                    if !report.cancelled
+                        && report.succeeded.is_empty()
+                        && !report.failed.is_empty()
+                        && report.source_removal_failed.is_none()
+                    {
+                        summary.retry.push(step.clone());
+                    } else if !report.failed.is_empty() && !report.cancelled {
+                        summary.partly += 1;
+                    }
                     summary.failed.extend(report.failed.into_iter().map(|(_, message)| message));
                     if let Some(message) = report.source_removal_failed {
                         summary.failed.push(message);
@@ -690,6 +744,89 @@ mod tests {
         create_folder(&path).unwrap();
         assert!(path.is_dir());
         assert!(create_folder(&path).unwrap_err().contains("already exists"));
+    }
+
+    /// The item that failed whole is offered again; the one that landed
+    /// is not — running it again would only collide with itself.
+    #[test]
+    fn only_an_item_that_landed_nothing_is_offered_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.txt");
+        let a = dir.path().join("a.txt");
+        fs::write(&a, "x").unwrap();
+        let failing = step(&missing, &dir.path().join("x.txt"), OpKind::Copy);
+        let steps = vec![failing.clone(), step(&a, &dir.path().join("b.txt"), OpKind::Copy)];
+        let (control, events) = start(1, steps, OnConflict::Ask);
+        let (summary, _) = drive(&control, events, never);
+        assert_eq!(summary.retry, [failing]);
+    }
+
+    /// A folder that got partway across is a failure with no retry: its
+    /// half-copy is in the way of running it again, and neither answer
+    /// fileops has for a folder (skip all of it, or delete what arrived)
+    /// finishes the job. The landed half stays, and nothing offers to
+    /// touch it.
+    #[test]
+    fn a_folder_that_partly_landed_is_not_offered_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("fine.txt"), "x").unwrap();
+        let locked = src.join("locked.txt");
+        fs::write(&locked, "secret").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads anything, and then there is nothing to fail.
+        if fs::read(&locked).is_ok() {
+            eprintln!("HYPRFORGE-SKIP: running as a user that can read a mode-000 file");
+            return;
+        }
+        let (control, events) =
+            start(1, vec![step(&src, &dir.path().join("dest"), OpKind::Copy)], OnConflict::Ask);
+        let (summary, _) = drive(&control, events, never);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(summary.failed.len(), 1, "{summary:?}");
+        assert!(summary.retry.is_empty(), "{summary:?}");
+        assert_eq!(summary.partly, 1);
+        assert!(dir.path().join("dest").join("fine.txt").exists());
+    }
+
+    /// Thousands of small files make thousands of steps a second, and
+    /// each progress report is a message the window rebuilds itself for.
+    /// The worker coalesces them to one per `PROGRESS_EVERY`, so the
+    /// count is bounded by how long the job ran, not by how many files
+    /// it had. Measured as a count of messages because that is the
+    /// resource: a redraw per file is what this prevents.
+    #[test]
+    fn a_copy_of_thousands_of_small_files_reports_at_a_bounded_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("many");
+        fs::create_dir(&src).unwrap();
+        for n in 0..3000 {
+            fs::write(src.join(format!("{n}.txt")), "x").unwrap();
+        }
+        let started = Instant::now();
+        let (_control, mut events) =
+            start(1, vec![step(&src, &dir.path().join("copy"), OpKind::Copy)], OnConflict::Ask);
+        let mut reports = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < deadline, "the copy did not finish");
+            match events.try_recv() {
+                Ok(JobEvent::Progress { .. }) => reports += 1,
+                Ok(JobEvent::Finished { summary, .. }) => {
+                    assert!(summary.complete(), "{summary:?}");
+                    break;
+                }
+                Ok(JobEvent::Collision { .. }) => panic!("nothing was in the way"),
+                Err(TryRecvError::Closed) => panic!("ended without finishing"),
+                Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(2)),
+            }
+        }
+        let ran = started.elapsed();
+        let bound = (ran.as_millis() / PROGRESS_EVERY.as_millis()) as usize + 2;
+        assert!(reports <= bound, "{reports} reports in {ran:?} — more than one per {PROGRESS_EVERY:?}");
+        assert!(reports < 3000, "a report per file is the thing this prevents");
     }
 
     #[test]

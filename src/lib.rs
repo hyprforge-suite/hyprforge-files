@@ -26,3 +26,4 @@ pub mod portal_service;
 pub mod preview;
 pub mod system_clipboard;
 pub mod tabstrip;
+pub mod transfers;

@@ -242,6 +242,8 @@ struct Reporter<'a> {
     /// archives counts up across all of them rather than restarting at
     /// each.
     offset: u64,
+    /// Which archive of several this is — see `JobEvent::Progress`.
+    items: crate::jobs::Items,
 }
 
 impl ArchiveProgress for Reporter<'_> {
@@ -253,6 +255,7 @@ impl ArchiveProgress for Reporter<'_> {
             self.last = Some(Instant::now());
             let _ = self.events.unbounded_send(JobEvent::Progress {
                 job: self.job,
+                items: self.items,
                 progress: Progress {
                     bytes_done: advance.bytes_done,
                     // `None` when the archive never stated its members'
@@ -286,13 +289,16 @@ fn run(
         events,
         last: None,
         offset: 0,
+        items: crate::jobs::Items::default(),
     };
     let backend = StdArchives;
     let collision = collision_for(on_conflict);
 
     match work {
         Work::Extract { archives, into } => {
-            for archive in archives {
+            let of = archives.len();
+            for (done, archive) in archives.into_iter().enumerate() {
+                reporter.items = crate::jobs::Items { done, of };
                 if cancel.load(Ordering::Relaxed) {
                     summary.cancelled = true;
                     break;

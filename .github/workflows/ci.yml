@@ -6,7 +6,7 @@
 # is a build failure in Hyprforge), and the tests that need nothing but
 # this process. That is a real amount for this crate — the browser model,
 # the archive round trips against real zip/tar/7z files built in a
-# tempdir, the job queue and the transfers panel all run here.
+# tempdir, the job queue and the transfers views all run here.
 #
 # What it deliberately does NOT check:
 #   - `tests/nested_clipboard.rs` is `#[ignore]`d: it writes a real

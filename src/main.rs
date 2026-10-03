@@ -45,6 +45,7 @@
 //! a fresh one). See [`tests::a_stale_dir_loaded_result_is_ignored`].
 
 use hyprforge_files::archive_jobs;
+use hyprforge_files::transfers;
 use hyprforge_files::host::{build_preview, count_folders, read_dir_task, resolve_icons, thumbnail_stream};
 use hyprforge_files::jobs::{self, JobControl, JobEvent, JobId, JobSummary};
 use hyprforge_files::launch::{self, Opened};
@@ -197,7 +198,7 @@ fn main() -> iced::Result {
         keyring,
         opened_members: Vec::new(),
         queued: std::collections::VecDeque::new(),
-        failures: Vec::new(),
+        transfers: Transfers::default(),
         cut_from_archive: None,
         writeback: None,
         scratch: Arc::new(Scratch::default()),
@@ -366,8 +367,10 @@ enum Message {
     },
     /// Stop every job that is running.
     CancelAllJobs,
-    /// Clear the list of what went wrong.
+    /// Mark what went wrong as read. It stays in the queue view.
     DismissFailures,
+    /// The transfers popover and queue view — see `transfers_view`.
+    Transfers(TransfersMessage),
     /// Time to look at whether any file opened out of an archive has
     /// been edited since.
     CheckOpenedMembers,
@@ -605,8 +608,9 @@ struct App {
     opened_members: Vec<OpenedMember>,
     /// Work asked for but not started — see [`Queued`].
     queued: std::collections::VecDeque<Queued>,
-    /// What went wrong in jobs that have finished — see [`Failures`].
-    failures: Vec<Failures>,
+    /// What finished this session, the overall bar, and whether the
+    /// popover or the queue view is open — see `transfers_view`.
+    transfers: Transfers,
     /// Members cut out of an archive, waiting for the paste that
     /// finishes the move — see [`CutFromArchive`].
     cut_from_archive: Option<CutFromArchive>,
@@ -1160,6 +1164,18 @@ struct RunningJob {
     /// The conflict the job is paused on, if any.
     conflict: Option<Collision>,
     apply_to_rest: bool,
+    /// Which of its items `progress` is about — see `JobEvent::Progress`.
+    items: jobs::Items,
+    /// Where a paste puts each item — what [`App::may_start`] keeps a
+    /// second job from writing to at the same time.
+    lands_at: Vec<PathBuf>,
+    /// "3 items to Downloads" — what the transfers popover calls it.
+    subject: String,
+    /// The work again, for an archive job whose failure leaves nothing
+    /// behind, so it can be offered as a retry — see
+    /// `transfers_view::retryable`. `None` for a paste, whose retry is
+    /// the items its summary names.
+    retry: Option<archive_jobs::Work>,
 }
 
 /// Work that has been asked for and has not started yet.
@@ -1207,41 +1223,25 @@ impl Queued {
             QueuedWork::Archive { work, .. } => work.archive(),
         }
     }
-}
 
-/// What went wrong in one finished job, kept until it is read.
-///
-/// Mockup `1f` gives failures a tab of their own, and the reason is
-/// visible in what this replaces: they were joined into one sentence in
-/// the status bar, which the *next* job's report then overwrote. A
-/// paste of four hundred files that could not write three of them said
-/// so for as long as it took to start anything else, and the three
-/// names were gone.
-///
-/// Kept until dismissed, therefore — a failure is the one outcome that
-/// has to outlast the thing that produced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Failures {
-    /// "copied", "extracted" — what was being attempted.
-    doing: &'static str,
-    items: Vec<String>,
-}
+    /// Every path a paste puts something at. Empty for archive work,
+    /// which [`Queued::archive`] covers.
+    fn lands_at(&self) -> impl Iterator<Item = &Path> {
+        let steps: &[hyprforge_files_core::clipboard::PasteStep] = match &self.what {
+            QueuedWork::Paste { steps } => steps,
+            QueuedWork::Archive { .. } => &[],
+        };
+        steps.iter().map(|step| step.dest.as_path())
+    }
 
-impl Failures {
-    /// How many are listed before the rest become a count.
-    ///
-    /// A permission-denied sweep over a mounted share can fail on every
-    /// one of ten thousand files, and a panel that grows to ten
-    /// thousand rows is not a report — it is the listing again, in the
-    /// wrong place, pushing the browser off screen.
-    const SHOWN: usize = 8;
-
-    fn headline(&self) -> String {
-        format!(
-            "{} couldn't be {}",
-            plural(self.items.len(), "item", "items"),
-            self.doing
-        )
+    /// "3 items to Downloads", "\u{201C}notes.zip\u{201D}" — what the
+    /// popover calls this work, without its verb.
+    fn subject(&self) -> String {
+        match (&self.what, &self.kind) {
+            (QueuedWork::Paste { steps }, JobKind::Restore { .. }) => transfers::restore_subject(steps),
+            (QueuedWork::Paste { steps }, _) => transfers::paste_subject(steps),
+            (QueuedWork::Archive { work, .. }, _) => transfers::archive_subject(work),
+        }
     }
 }
 
@@ -1253,13 +1253,12 @@ impl RunningJob {
     /// large file reports no entry progress until it finishes, and a
     /// bar that sits at zero for a minute and jumps to full reads as a
     /// hung job.
+    ///
+    /// Across all of its items, not only the current one — see
+    /// `transfers::job_fraction`, which the tab strip's overall bar
+    /// also weighs each job by.
     fn fraction(&self) -> Option<f32> {
-        let progress = self.progress.as_ref()?;
-        if let Some(total) = progress.bytes_total.filter(|t| *t > 0) {
-            return Some((progress.bytes_done as f64 / total as f64).clamp(0.0, 1.0) as f32);
-        }
-        let total = progress.entries_total.filter(|t| *t > 0)?;
-        Some((progress.entries_done as f64 / total as f64).clamp(0.0, 1.0) as f32)
+        self.progress.as_ref().and_then(|p| transfers::job_fraction(p, self.items))
     }
 }
 
@@ -2076,21 +2075,40 @@ impl App {
 
     /// Takes work on, and starts whatever can start.
     fn enqueue(&mut self, queued: Queued) -> Task<Message> {
+        self.transfers.batch.join(queued.id);
         self.queued.push_back(queued);
         self.pump()
     }
 
     /// Whether `queued` can start right now.
     ///
-    /// Two rules. Nothing may run alongside another job that rewrites
-    /// the same archive — that is the correctness one, and it holds
+    /// Three rules. Nothing may run alongside another job that
+    /// rewrites the same archive, nor alongside one putting something
+    /// at the same path — those are the correctness ones, and they hold
     /// even when there is room. And no more than [`Self::AT_ONCE`] at a
     /// time, which is only about throughput and legibility.
+    ///
+    /// The second rule was found live, pasting the same folder twice
+    /// in quick succession: each duplicate's Keep Both picks the first
+    /// free `name.N`, and a name is only free until the *other* job
+    /// takes it, so both picked `big.2` and the later one failed with
+    /// "File exists" partway through. Two pastes of one name into one
+    /// folder are the same race without the renaming. Run one after the
+    /// other, the second sees the first's result and is asked about it
+    /// — or numbered past it — as it would have been had it been pasted
+    /// a minute later. Only the same *path* waits: two pastes of
+    /// different things into one folder still run together.
     fn may_start(&self, queued: &Queued) -> bool {
         if let Some(archive) = queued.archive() {
             if self.jobs.iter().any(|running| running.archive.as_deref() == Some(archive)) {
                 return false;
             }
+        }
+        if queued
+            .lands_at()
+            .any(|dest| self.jobs.iter().any(|running| running.lands_at.iter().any(|d| d == dest)))
+        {
+            return false;
         }
         self.jobs.len() < Self::AT_ONCE
     }
@@ -2116,11 +2134,18 @@ impl App {
 
     /// Actually starts one job.
     fn begin(&mut self, queued: Queued) -> Task<Message> {
+        let subject = queued.subject();
+        let lands_at = queued.lands_at().map(Path::to_path_buf).collect();
         let Queued { id, kind, dirs, what } = queued;
         let archive = match &what {
             QueuedWork::Archive { work, .. } => work.archive().map(Path::to_path_buf),
             QueuedWork::Paste { .. } => None,
         };
+        let retry = match &what {
+            QueuedWork::Archive { work, .. } => transfers_view::retryable(work).then(|| work.clone()),
+            QueuedWork::Paste { .. } => None,
+        };
+        self.transfers.batch.started(id);
         let on_conflict = self.config.behaviour.on_conflict;
         let (control, events) = match what {
             QueuedWork::Paste { steps } => jobs::start(id, steps, on_conflict),
@@ -2139,6 +2164,10 @@ impl App {
             rate: Rate::default(),
             conflict: None,
             apply_to_rest: false,
+            subject,
+            retry,
+            items: jobs::Items::default(),
+            lands_at,
         });
         Task::run(events, Message::Job)
     }
@@ -2177,10 +2206,12 @@ impl App {
     /// Updates the window for something a job reported.
     fn job_event(&mut self, event: JobEvent) -> Task<Message> {
         match event {
-            JobEvent::Progress { job, progress } => {
+            JobEvent::Progress { job, progress, items } => {
                 if let Some(running) = self.jobs.iter_mut().find(|j| j.id == job) {
                     running.rate.sample(Instant::now(), progress.bytes_done);
+                    self.transfers.batch.progress(job, &progress, items);
                     running.progress = Some(progress);
+                    running.items = items;
                 }
                 Task::none()
             }
@@ -2195,6 +2226,10 @@ impl App {
                     return Task::none();
                 };
                 let finished = self.jobs.remove(at);
+                self.transfers.batch.finish(job);
+                if self.jobs.is_empty() && self.queued.is_empty() {
+                    self.transfers.batch.clear();
+                }
                 // Before the report: this is not a failure to describe,
                 // it is a question to ask, and a status line saying the
                 // extraction went wrong would sit there contradicting
@@ -2205,12 +2240,12 @@ impl App {
                 if let Some(message) = job_report(&finished.kind, &summary) {
                     self.status = Some(message);
                 }
-                if !summary.failed.is_empty() {
-                    self.failures.push(Failures {
-                        doing: finished.kind.done(),
-                        items: summary.failed.clone(),
-                    });
-                }
+                // Into the session's history — failures included, which
+                // the window's failure panel reads from until they are
+                // dismissed. See `transfers_view::record`.
+                let shown_after = std::time::Duration::from_millis(self.config.behaviour.progress_after_ms);
+                let from_drop = self.from_drops.contains(&job);
+                transfers_view::record(&mut self.transfers, &finished, &summary, from_drop, shown_after);
 
                 // The second half of a cut out of an archive: the paste
                 // has landed, so the members it came from can go. Only
@@ -2714,6 +2749,25 @@ impl App {
                     Task::none()
                 }
             }
+            // The popover and the queue view close on Escape, like a menu.
+            // The queue view is a card over the window and has the
+            // keyboard, as the other cards do; the popover is a glance,
+            // and any other key means the person is back at the listing
+            // — it closes and the key does what it would have. Found
+            // live: Ctrl+K opened the palette *under* the popover, and
+            // the letters typed for it went to the search box instead.
+            Message::KeyPressed(press) if self.transfers.is_open() => {
+                let popover = self.transfers.open == transfers_view::Panel::Popover;
+                let closed = if press.key == keymap::Key::Escape || popover {
+                    self.transfers_update(TransfersMessage::Close)
+                } else {
+                    Task::none()
+                };
+                if popover && press.key != keymap::Key::Escape {
+                    return Task::batch([closed, self.update(Message::KeyPressed(press))]);
+                }
+                closed
+            }
             // Tab in the path bar completes to the highlighted answer. A
             // text field does not take Tab, so it arrives here; nowhere
             // else in the window is it bound.
@@ -2930,7 +2984,13 @@ impl App {
                 // It may not have started. Dropping it from the queue
                 // is the whole of cancelling it — there is no thread to
                 // stop and nothing has been written.
+                if self.queued.iter().any(|q| q.id == id) {
+                    self.transfers.batch.leave(id);
+                }
                 self.queued.retain(|q| q.id != id);
+                if self.jobs.is_empty() && self.queued.is_empty() {
+                    self.transfers.batch.clear();
+                }
                 Task::none()
             }
             Message::TrashDone(tab_id, dir, trashed, errors) => {
@@ -3066,13 +3126,17 @@ impl App {
                 // Including what has not begun — otherwise "cancel all"
                 // stops two jobs and then starts the next one from the
                 // queue, which is the opposite of what the button says.
+                for waiting in &self.queued {
+                    self.transfers.batch.leave(waiting.id);
+                }
                 self.queued.clear();
                 Task::none()
             }
             Message::DismissFailures => {
-                self.failures.clear();
+                self.transfers.history.acknowledge();
                 Task::none()
             }
+            Message::Transfers(message) => self.transfers_update(message),
             Message::CheckOpenedMembers => {
                 // A question already on screen is not replaced by
                 // another: the person is being asked about one file, and
@@ -3350,6 +3414,14 @@ impl App {
             }),
         );
 
+        // The transfers control, at the strip's far end — window chrome,
+        // like the tabs, because the work it reports belongs to the
+        // window and not to whichever tab is showing. See
+        // `transfers_view::indicator`.
+        if let Some(indicator) = transfers_view::indicator(self, scale) {
+            bar = bar.push(iced::widget::Space::new().width(Length::Fill)).push(indicator);
+        }
+
         container(bar)
             .width(Length::Fill)
             .height(Length::Fixed(scale.apply(tabstrip::STRIP_HEIGHT)))
@@ -3403,21 +3475,12 @@ impl App {
         let viewport_width = self.last_window_size.0 as f32;
         content = content.push(tab.browser.view(scale, viewport_width).map(Message::Browser));
 
-        // Only once a job has run long enough to notice. A paste of three
-        // small files finishes before the bar could be read, and a bar
-        // that flashes up and vanishes reads as something going wrong.
-        let after = std::time::Duration::from_millis(self.config.behaviour.progress_after_ms);
-        let showing: Vec<&RunningJob> = self
-            .jobs
-            .iter()
-            .filter(|j| j.conflict.is_none() && j.started.elapsed() >= after)
-            .collect();
-        if !showing.is_empty() || !self.queued.is_empty() {
-            content = content.push(transfers_panel(&showing, &self.queued, scale));
-        }
-
-        if !self.failures.is_empty() {
-            content = content.push(failures_panel(&self.failures, scale));
+        // Running work is in the tab strip's transfers control now, not
+        // a panel here — see `transfers_view`. What stays below the
+        // listing is what went wrong, until it is read: a failure is the
+        // one outcome that has to be in the way.
+        if let Some(panel) = transfers_view::failures_panel(&self.transfers, scale) {
+            content = content.push(panel);
         }
 
         if let Some((_, text)) = &self.notice {
@@ -3475,6 +3538,11 @@ impl App {
             self.jobs.iter().find_map(|j| j.conflict.as_ref().map(|c| (j, c)))
         {
             return iced::widget::stack![window, conflict_dialog(job, conflict, scale)].into();
+        }
+        // Below the dialogs above, which are questions; above the
+        // context menu, which this replaces while it is open.
+        if let Some(layer) = transfers_view::overlay(self, scale) {
+            return iced::widget::stack![window, layer].into();
         }
         match tab.browser.menu_overlay(scale, size) {
             Some(overlay) => iced::widget::stack![window, overlay.map(Message::Browser)].into(),
@@ -3542,8 +3610,8 @@ fn job_report(kind: &JobKind, summary: &JobSummary) -> Option<String> {
         parts.push(format!("{} skipped.", plural(summary.skipped, "item", "items")));
     }
     // Failures are deliberately *not* here any more: they go to the
-    // transfers panel, where they stay until they are read. See
-    // `Failures`.
+    // panel under the listing, where they stay until they are read. See
+    // `transfers_view::failures_panel`.
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
@@ -3569,186 +3637,6 @@ fn undo_notice<'a>(text: &str, scale: FontScale) -> Element<'a, Message> {
     .align_y(iced::Alignment::Center)
     .padding([spacing::XS as u16, spacing::MD as u16])
     .into()
-}
-
-/// One line under the listing while a paste runs: what it is doing, how
-/// far it has got, and a way to stop it.
-/// The transfers panel: every job that has been running long enough to
-/// be worth showing, and what each is doing.
-///
-/// Every one, which is the change mockup `1f` is really about. The
-/// window has always kept a `Vec` of jobs and always drawn the first —
-/// fine when a second paste was rare, and wrong now that extracting,
-/// compressing and rewriting an archive are jobs too: starting two and
-/// seeing one is the app quietly under-reporting its own work.
-fn transfers_panel<'a>(
-    jobs: &[&RunningJob],
-    queued: &std::collections::VecDeque<Queued>,
-    scale: FontScale,
-) -> Element<'a, Message> {
-    let mut panel = column![].spacing(spacing::XS);
-
-    // Only worth a heading when there is more than one thing under it;
-    // a single transfer with nothing behind it says what it is on its
-    // own row.
-    if jobs.len() > 1 || !queued.is_empty() {
-        let mut counts = vec![format!("{} active", jobs.len())];
-        if !queued.is_empty() {
-            counts.push(format!("{} queued", queued.len()));
-        }
-        panel = panel.push(
-            row![
-                hyprforge_ui::widgets::meta_text(
-                    format!("Transfers \u{00B7} {}", counts.join(" \u{00B7} ")),
-                    BASE_TEXT_SIZE,
-                    scale,
-                )
-                .width(Length::Fill),
-                secondary_button("Cancel all").on_press(Message::CancelAllJobs),
-            ]
-            .spacing(spacing::SM)
-            .align_y(iced::Alignment::Center)
-            .padding([0, spacing::MD as u16]),
-        );
-    }
-
-    for job in jobs {
-        panel = panel.push(job_progress_bar(job, scale));
-    }
-
-    // Waiting work, in the order it will run. No Start button, unlike
-    // mockup `1f`: a job is queued either because the machine is busy,
-    // where starting it early gains nothing, or because it would
-    // rewrite an archive another job is already rewriting — where
-    // starting it early is the data loss the queue exists to prevent.
-    // A button that is sometimes safe is worse than no button.
-    for waiting in queued {
-        panel = panel.push(queued_row(waiting, scale));
-    }
-
-    container(panel).width(Length::Fill).padding([spacing::XS as u16, 0]).into()
-}
-
-/// One waiting job: what it will do, and a way to call it off.
-fn queued_row<'a>(queued: &Queued, scale: FontScale) -> Element<'a, Message> {
-    let what = match queued.archive().and_then(|a| a.file_name()) {
-        Some(name) => format!("{} {} \u{00B7} queued", queued.kind.doing(), name.to_string_lossy()),
-        None => format!("{} \u{00B7} queued", queued.kind.doing()),
-    };
-    container(
-        row![
-            hyprforge_ui::widgets::meta_text(what, BASE_TEXT_SIZE, scale).width(Length::Fill),
-            secondary_button("Cancel").on_press(Message::CancelJob(queued.id)),
-        ]
-        .spacing(spacing::SM)
-        .align_y(iced::Alignment::Center),
-    )
-    .padding([spacing::XS as u16, spacing::MD as u16])
-    .into()
-}
-
-/// What went wrong, and did not get to say so before now.
-fn failures_panel<'a>(failures: &[Failures], scale: FontScale) -> Element<'a, Message> {
-    let total: usize = failures.iter().map(|f| f.items.len()).sum();
-    let mut panel = column![row![
-        scaled_text(
-            match failures {
-                [only] => only.headline(),
-                _ => format!("{} couldn't be finished", plural(total, "item", "items")),
-            },
-            BASE_TEXT_SIZE,
-            scale,
-        )
-        .width(Length::Fill),
-        secondary_button("Dismiss").on_press(Message::DismissFailures),
-    ]
-    .spacing(spacing::SM)
-    .align_y(iced::Alignment::Center)]
-    .spacing(spacing::XS);
-
-    // Each reason once. A permission failure over a whole tree produces
-    // the same sentence per file, and forty identical lines say no more
-    // than one does — what is worth showing is how many there were,
-    // which the headline already carries.
-    let mut seen: Vec<&str> = Vec::new();
-    for reason in failures.iter().flat_map(|f| f.items.iter()) {
-        if !seen.contains(&reason.as_str()) {
-            seen.push(reason);
-        }
-    }
-    for reason in seen.iter().take(Failures::SHOWN) {
-        panel = panel.push(hyprforge_ui::widgets::meta_text(
-            (*reason).to_string(),
-            BASE_TEXT_SIZE,
-            scale,
-        ));
-    }
-    if seen.len() > Failures::SHOWN {
-        panel = panel.push(hyprforge_ui::widgets::meta_text(
-            format!("and {} more", seen.len() - Failures::SHOWN),
-            BASE_TEXT_SIZE,
-            scale,
-        ));
-    }
-
-    container(panel)
-        .width(Length::Fill)
-        .padding([spacing::XS as u16, spacing::MD as u16])
-        .into()
-}
-
-/// One job's row: what it is doing, how far along, how fast, and how
-/// much longer.
-fn job_progress_bar<'a>(job: &RunningJob, scale: FontScale) -> Element<'a, Message> {
-    let doing = job.kind.doing();
-    let detail = match &job.progress {
-        // Totals are unknown while the source tree is still being
-        // walked — `Progress` says so rather than guessing.
-        Some(Progress { entries_done, entries_total: Some(total), bytes_done, bytes_total, .. }) => {
-            let mut text = format!("{entries_done} of {total}");
-            if let Some(bytes_total) = bytes_total {
-                text.push_str(&format!(
-                    " \u{00B7} {} of {}",
-                    hyprforge_files_core::human_readable_size(*bytes_done),
-                    hyprforge_files_core::human_readable_size(*bytes_total)
-                ));
-            }
-            text
-        }
-        _ => "counting\u{2026}".to_string(),
-    };
-
-    // Rate and estimate, when there is anything honest to say — see
-    // `Rate`. Appended rather than given their own column so a job that
-    // cannot report them simply has a shorter line, instead of two
-    // empty cells.
-    let mut line = format!("{doing} \u{00B7} {detail}");
-    if let Some(rate) = job.rate.per_second() {
-        line.push_str(&format!(" \u{00B7} {rate}"));
-    }
-    if let Some(left) = job.progress.as_ref().and_then(|p| job.rate.remaining(p)) {
-        line.push_str(&format!(" \u{00B7} {left}"));
-    }
-
-    let mut rows = column![row![
-        scaled_text(line, BASE_TEXT_SIZE, scale).width(Length::Fill),
-        secondary_button("Cancel").on_press(Message::CancelJob(job.id)),
-    ]
-    .spacing(spacing::SM)
-    .align_y(iced::Alignment::Center)]
-    .spacing(spacing::XS);
-
-    // A bar only where there is a fraction to draw. An indeterminate
-    // bar that fills at a fixed rate is a lie about progress, and while
-    // the tree is still being walked there is genuinely no fraction —
-    // the "counting…" above is the honest report of that.
-    if let Some(fraction) = job.fraction() {
-        rows = rows.push(
-            iced::widget::progress_bar(0.0..=1.0, fraction).girth(scale.apply(4.0)),
-        );
-    }
-
-    container(rows).padding([spacing::XS as u16, spacing::MD as u16]).into()
 }
 
 /// The question a paused paste is asking.
@@ -4264,6 +4152,9 @@ fn field_escape(event: iced::Event, status: iced::event::Status, _window: window
 /// nothing is rebuilt. `update` reads the atomics when a menu is asked
 /// for. It is process-wide state, and that is fine for exactly one
 /// reason: this process has one window — closing its last tab exits.
+mod transfers_view;
+use transfers_view::{Transfers, TransfersMessage};
+
 mod pointer {
     use iced::{event, mouse, Event, Subscription};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -4299,6 +4190,8 @@ mod pointer {
 /// - `rename` — the first row, being renamed
 /// - `delete` — the permanent-delete question, for the first row
 /// - `notice` — the undo notice, as a trash of three items leaves it
+/// - `transfers` / `queue` — the transfers popover, or the queue view,
+///   open from the start (paste something to give them jobs)
 ///
 /// This machine cannot synthesise a click or a key press into a window,
 /// and how a menu, a dialog or an edit field *looks* is only checkable
@@ -4320,6 +4213,8 @@ struct DebugShow {
     open_with: bool,
     /// The path bar, opened with this typed into it — `jump=~/do/pr`.
     jump: Option<String>,
+    /// The transfers popover, or the queue view, open from the start.
+    transfers: Option<transfers_view::Panel>,
 }
 
 #[cfg(debug_assertions)]
@@ -4346,6 +4241,10 @@ impl DebugShow {
                 show.open = true;
             } else if item == "open-with" {
                 show.open_with = true;
+            } else if item == "transfers" {
+                show.transfers = Some(transfers_view::Panel::Popover);
+            } else if item == "queue" {
+                show.transfers = Some(transfers_view::Panel::Queue);
             } else if let Some(text) = item.strip_prefix("jump=") {
                 show.jump = Some(text.to_string());
             }
@@ -4358,6 +4257,9 @@ impl DebugShow {
         if self.notice {
             // No timer: it stays up for the screenshot.
             app.notice = Some((0, "Moved 3 items to the Trash".to_string()));
+        }
+        if let Some(panel) = self.transfers {
+            app.transfers.open = panel;
         }
         if !self.conflict {
             return;
@@ -4378,6 +4280,10 @@ impl DebugShow {
                 dest: app.home_dir.join("Documents").join("quarterly report.pdf"),
             }),
             apply_to_rest: false,
+            subject: String::new(),
+            retry: None,
+            items: jobs::Items::default(),
+            lands_at: Vec::new(),
         });
     }
 
@@ -4873,7 +4779,7 @@ mod tests {
             keyring: Arc::new(hyprforge_archive::Keyring::new()),
             opened_members: Vec::new(),
             queued: std::collections::VecDeque::new(),
-            failures: Vec::new(),
+            transfers: Transfers::default(),
             cut_from_archive: None,
             writeback: None,
             scratch: Arc::new(Scratch::default()),
@@ -5946,16 +5852,24 @@ mod tests {
             rate: Rate::default(),
             conflict: None,
             apply_to_rest: false,
+            subject: String::new(),
+            retry: None,
+            items: jobs::Items::default(),
+            lands_at: Vec::new(),
         });
         let _ = app.update(Message::Job(JobEvent::Finished {
             job: 9,
             summary: JobSummary { done: 1, failed: vec!["disk full".into()], ..JobSummary::default() },
         }));
         assert!(app.clipboard.get().is_some());
-        // The failure is kept where failures are kept now — see
-        // `Failures` — rather than in a status line the next job
-        // overwrites.
-        assert!(app.failures.iter().any(|f| f.items.iter().any(|i| i.contains("disk full"))));
+        // The failure is kept where failures are kept now — the
+        // transfers history, read by the failure panel — rather than in
+        // a status line the next job overwrites.
+        assert!(app
+            .transfers
+            .history
+            .unseen_failures()
+            .any(|f| f.reasons.shown(8).0.iter().any(|r| r.contains("disk full"))));
     }
 
     #[test]
@@ -5973,6 +5887,10 @@ mod tests {
             rate: Rate::default(),
             conflict: Some(Collision { source: "/a/x".into(), dest: "/dir/x".into() }),
             apply_to_rest: false,
+            subject: String::new(),
+            retry: None,
+            items: jobs::Items::default(),
+            lands_at: Vec::new(),
         });
         let _ = app.update(key("Escape"));
         assert!(app.jobs[0].conflict.is_none(), "the dialog is gone");
@@ -6007,8 +5925,8 @@ mod tests {
         assert!(text.contains("2 items skipped"), "{text}");
         // Not here any more, deliberately. A failure joined into the
         // status line is overwritten by the next job's report, and the
-        // names go with it — so failures live in the transfers panel
-        // until they are dismissed. See `Failures`.
+        // names go with it — so failures live in the failure panel
+        // until they are dismissed. See `transfers_view::failures_panel`.
         assert!(
             !text.contains("permission denied"),
             "a failure in the status line is a failure with a lifespan: {text}"
@@ -6033,6 +5951,10 @@ mod tests {
             rate: Rate::default(),
             conflict: None,
             apply_to_rest: false,
+            subject: String::new(),
+            retry: None,
+            items: jobs::Items::default(),
+            lands_at: Vec::new(),
         });
         let _ = app.update(Message::Job(JobEvent::Finished {
             job: 4,
@@ -6042,16 +5964,22 @@ mod tests {
             },
         }));
 
-        assert_eq!(app.failures.len(), 1);
-        assert_eq!(app.failures[0].items, ["x.txt: permission denied"]);
-        assert_eq!(app.failures[0].doing, "copied");
+        let unseen: Vec<_> = app.transfers.history.unseen_failures().collect();
+        assert_eq!(unseen.len(), 1);
+        assert_eq!(unseen[0].reasons.shown(8).0, ["x.txt: permission denied"]);
+        assert_eq!(unseen[0].headline(), "1 item couldn't be copied");
 
         // And a later job's report does not erase it.
         app.status = Some("something else entirely".to_string());
-        assert_eq!(app.failures.len(), 1, "a status line is not where a failure lives");
+        assert_eq!(
+            app.transfers.history.unseen_failures().count(),
+            1,
+            "a status line is not where a failure lives"
+        );
 
         let _ = app.update(Message::DismissFailures);
-        assert!(app.failures.is_empty(), "and it goes when it has been read");
+        assert_eq!(app.transfers.history.unseen_failures().count(), 0, "it stops asking once read");
+        assert_eq!(app.transfers.history.len(), 1, "and the queue view still has it");
     }
 
     /// F2, type, Enter — and the file is renamed on disk, then selected
@@ -6260,7 +6188,7 @@ mod tests {
     #[test]
     fn a_restore_report_says_restored() {
         // Through the cancelled wording, which is where the past tense
-        // now appears — failures moved to the transfers panel.
+        // now appears — failures moved to the failure panel.
         let text = job_report(
             &JobKind::Restore { records: vec![] },
             &JobSummary { done: 2, cancelled: true, ..JobSummary::default() },
@@ -6285,6 +6213,10 @@ mod tests {
             rate: Rate::default(),
             conflict: None,
             apply_to_rest: false,
+            subject: String::new(),
+            retry: None,
+            items: jobs::Items::default(),
+            lands_at: Vec::new(),
         }
     }
 
@@ -6709,6 +6641,10 @@ mod tests {
             rate: Rate::default(),
             conflict: None,
             apply_to_rest: false,
+            subject: String::new(),
+            retry: None,
+            items: jobs::Items::default(),
+            lands_at: Vec::new(),
         });
         let placed = vec![(PathBuf::from("/a/x"), PathBuf::from("/b/x.2"))];
         let _ = app.update(Message::Job(JobEvent::Finished {
@@ -7168,6 +7104,10 @@ mod archive_tests {
             rate: Rate::default(),
             conflict: None,
             apply_to_rest: false,
+            subject: String::new(),
+            retry: None,
+            items: jobs::Items::default(),
+            lands_at: Vec::new(),
         });
 
         let _ = app.update(Message::Job(JobEvent::Finished {
