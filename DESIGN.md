@@ -250,9 +250,13 @@ it, so going one level deeper reads one folder; F5 reads them all again.
 Going up now selects the folder you came out of in every view, which
 column view needed for Left and the others were missing anyway.
 
-Not yet: the listing does not scroll to keep the keyboard's row in sight
-in any view, so a long folder can leave the selection Left lands on off
-screen. The panes do scroll to their trail.
+Every view now keeps the keyboard's row in sight, which column view made
+pressing — Left lands on a folder that can be anywhere in a long
+listing. The view tags the one focused row, and a widget operation
+(`hyprforge-files-core`'s `reveal`) finds it in its scrollable and
+scrolls only as far as it takes, so walking down a screenful never moves
+the list. The browser cannot do this itself: it knows which row, and only
+the layout knows where.
 
 **D — Trash, properly (`1k`).** Arguably the highest value-per-line here: the
 data is already parsed and the current view is knowingly wrong to a user. Origin-location column, per-item age, restore
