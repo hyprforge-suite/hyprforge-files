@@ -2,7 +2,7 @@
 
 A file manager for Hyprland.
 
-Tabs in the titlebar, a sidebar of places and pins, list and grid views,
+Tabs in the titlebar, a sidebar of places and pins, list, grid and column views,
 a path bar that understands `~/do/pr/hyf` as `~/Documents/Projects/hyprforge`,
 a Ctrl+K palette of every command,
 search, multi-select and history — and the freedesktop trash done

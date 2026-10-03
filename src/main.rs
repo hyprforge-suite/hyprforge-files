@@ -1524,6 +1524,17 @@ impl App {
                     Message::Browser(BrowserMessage::CountsLoaded(counts))
                 })
             }
+            // Column view's panes: each its own read, so the nearest folder
+            // fills in without waiting on the others. The browser drops an
+            // answer for a pane it no longer shows.
+            Outcome::ReadColumns(dirs) => Task::batch(dirs.into_iter().map(|dir| {
+                Task::perform(read_dir_task(self.backend.clone(), dir.clone()), move |result| {
+                    Message::Browser(BrowserMessage::ColumnLoaded(dir.clone(), result))
+                })
+            })),
+            Outcome::SnapTo { id, y } => {
+                iced::widget::operation::snap_to(id, iced::widget::operation::RelativeOffset { x: None, y: Some(y) })
+            }
             // Inside an archive these three are not filesystem
             // operations at all — they are edits to one file, applied by
             // rewriting it. The browser already decided they were
@@ -2653,7 +2664,7 @@ impl App {
                 // under the pointer is a different file now, and pairing
                 // the next press with the one that got us here would open
                 // whatever happens to be in that position.
-                if matches!(outcome, Outcome::ReadDir(_)) {
+                if outcome.navigates() {
                     self.clicks.reset();
                 }
                 self.handle_outcome(self.active, outcome)

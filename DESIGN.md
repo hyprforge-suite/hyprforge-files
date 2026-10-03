@@ -219,11 +219,40 @@ under the home directory needed it.
 thumbnails, which is the preview crate from the original plan. Column view
 (`1c`) is new: cascading panes plus a metadata rail.
 
-*Partly built.* The grid and the list draw real thumbnails — pictures and
+*Built.* The grid and the list draw real thumbnails — pictures and
 SVGs in both, PDFs and videos in the grid — through the shared freedesktop
 cache, and a preview pane shows the selected file (`hyprforge-files-core`'s
-`preview`, read by the app's `preview.rs`). Column view is not built: its
-segment in the view toggle is drawn disabled.
+`preview`, read by the app's `preview.rs`).
+
+Column view (`hyprforge-files-core`'s `columns`) puts a pane for each
+folder on the way here to the left of the folder in view, from home when
+you are under it and from `/` otherwise, as many as the window has room
+for — the path bar still names every level, so a pane that does not fit
+is never the only way back. Three choices worth knowing:
+
+- **The folder in view is still the one listing.** Selection, rename,
+  drag, the menus and the preview pane all act on it exactly as in the
+  list; the panes to its left are the way here, drawn like the listing's
+  rows but not selectable. A click in one goes there. That makes column
+  view a way of *drawing* the browser rather than a second browser with
+  its own idea of where you are, and the open/save dialog gets it free.
+- **The metadata rail is the preview pane.** The mockup's rail and the
+  pane show the same things about the same selection; two would compete.
+- **The trail is not the accent.** The folder you went into from each
+  pane sits on the raised row surface. The accent means *selected*, and a
+  highlighted folder that Delete would not touch would be a lie about what
+  the next key does.
+
+Left and Right move between levels — out with the folder you left
+selected, in with the first row selected — and Up and Down stay in the
+folder in view. A pane already read is kept as the folders change around
+it, so going one level deeper reads one folder; F5 reads them all again.
+Going up now selects the folder you came out of in every view, which
+column view needed for Left and the others were missing anyway.
+
+Not yet: the listing does not scroll to keep the keyboard's row in sight
+in any view, so a long folder can leave the selection Left lands on off
+screen. The panes do scroll to their trail.
 
 **D — Trash, properly (`1k`).** Arguably the highest value-per-line here: the
 data is already parsed and the current view is knowingly wrong to a user. Origin-location column, per-item age, restore
@@ -353,7 +382,7 @@ currently *wrong* rather than merely unfinished: it shows a stored filename
 where the user expects the name their file had. Everything else is honest
 about being incomplete.
 
-A, D, B, H and the thumbnail and preview half of C have since been built;
+A, D, B, H and C have since been built;
 see each phase above.
 
 The portal open/save dialog is not a phase — it inherits every one of these for
