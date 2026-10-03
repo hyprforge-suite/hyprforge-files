@@ -24,5 +24,6 @@ pub mod launch;
 pub mod portal;
 pub mod portal_service;
 pub mod preview;
+pub mod search_jobs;
 pub mod system_clipboard;
 pub mod tabstrip;

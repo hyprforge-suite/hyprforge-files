@@ -144,6 +144,7 @@ fn run_dialog() -> Answer {
         overwrite: None,
         resolving: false,
         resolve_next: None,
+        searcher: Default::default(),
         answer: answer.clone(),
         remembered,
         clicks: ClickTracker::new(),
@@ -208,6 +209,9 @@ struct Dialog {
     /// coalescing the Files window does.
     resolving: bool,
     resolve_next: Option<hyprforge_files_core::jump::Request>,
+    /// Searches below a folder, one walk at a time — the Files window's
+    /// arrangement (`hyprforge_files::search_jobs`).
+    searcher: hyprforge_files::search_jobs::Searcher,
     /// Where the answer goes when the window closes.
     answer: Arc<std::sync::Mutex<Answer>>,
     /// Each application's last folder — `None` when the file could not
@@ -225,6 +229,9 @@ enum Message {
     Browser(BrowserMessage),
     DirLoaded(PathBuf, Result<Vec<Entry>, DirError>),
     PathResolved(String, Vec<hyprforge_files_core::jump::Candidate>),
+    Searched(hyprforge_files::search_jobs::Event),
+    /// A saved search was written, or could not be.
+    SearchesSaved(Result<(), String>),
     KeyPressed(hyprforge_files_core::keymap::KeyPress),
     ModifiersChanged(keyboard::Modifiers),
     EscapeInField,
@@ -309,12 +316,36 @@ impl Dialog {
                 };
                 Task::batch([self.handle(outcome), next])
             }
+            Message::Searched(event) => {
+                use hyprforge_files::search_jobs::Event;
+                use hyprforge_files_core::search::SearchMessage;
+                let (message, ended) = match event {
+                    Event::Found(run, entries) => (SearchMessage::Found { run, entries }, None),
+                    Event::Finished(run, summary) => (SearchMessage::Finished { run, summary }, Some(run)),
+                };
+                let outcome = self.browser.update(BrowserMessage::Search(message));
+                let task = self.handle(outcome);
+                let next = match ended.and_then(|run| self.searcher.finished(run)) {
+                    Some(start) => self.spawn_search(start),
+                    None => Task::none(),
+                };
+                Task::batch([task, next])
+            }
+            Message::SearchesSaved(result) => {
+                if let Err(why) = result {
+                    self.status = Some(why);
+                }
+                Task::none()
+            }
             Message::KeyPressed(press) => self.key(press),
             Message::EscapeInField => {
                 let renamed = self.browser.update(BrowserMessage::RenameCancel);
                 let pathed = self.browser.update(BrowserMessage::PathCancel);
                 let paletted = self.browser.update(BrowserMessage::PaletteCancel);
-                self.handle(Outcome::Many(vec![renamed, pathed, paletted]))
+                let unsaved = self.browser.update(BrowserMessage::Search(
+                    hyprforge_files_core::search::SearchMessage::SaveCancel,
+                ));
+                self.handle(Outcome::Many(vec![renamed, pathed, paletted, unsaved]))
             }
             Message::NameChanged(name) => {
                 self.name = name;
@@ -449,11 +480,39 @@ impl Dialog {
                 self.handle(outcome)
             }
             Outcome::PrefsChanged(_) | Outcome::Pins(_) | Outcome::Window(_) => Task::none(),
+            // A search somebody chose to save is saved from here too, by
+            // the same read-modify-write the window uses, so a search
+            // saved in a file chooser is in Files' sidebar next time.
+            Outcome::Search(hyprforge_files_core::search::Ask::Smart(change)) => {
+                // The browser has already applied it to its own list.
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            hyprforge_files_core::prefs::update(|p| {
+                                p.searches = hyprforge_files_core::search::apply_smart_change(&p.searches, &change)
+                            })
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Saving the search was interrupted: {e}")))
+                    },
+                    Message::SearchesSaved,
+                )
+            }
+            Outcome::Search(ask) => match self.searcher.ask(ask) {
+                Some(start) => self.spawn_search(start),
+                None => Task::none(),
+            },
             _ => {
                 self.status = Some("That isn't something this dialog does — open Files for it.".to_string());
                 Task::none()
             }
         }
+    }
+
+    fn spawn_search(&self, (request, cancel): hyprforge_files::search_jobs::Start) -> Task<Message> {
+        Task::run(hyprforge_files::search_jobs::stream(self.backend.clone(), request, cancel), Message::Searched)
     }
 
     fn read(&self, path: PathBuf) -> Task<Message> {
