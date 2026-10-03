@@ -279,36 +279,121 @@ directory.
 **G — Transfers (`1f`).** `hyprforge-fileops::ops` already reports progress and
 cancels per chunk; this is the popover and the queue window over it.
 
-*Partly built.* The panel shows every running job — the window had always kept
-a `Vec` and drawn the first, which only started to matter once extracting,
-compressing and rewriting an archive became jobs too. Each row has a bar, a
-rate and an estimate, and failures now live in a panel that keeps them rather
-than a status line the next job overwrites.
+*Built.* A control at the far end of the tab strip, the popover it opens,
+and a queue view behind the popover's "Show all"
+(`src/transfers_view.rs`, over `hyprforge_files::transfers`). Archive jobs
+report the same `JobEvent` as a paste, so extracting, compressing and
+rewriting appear in all three beside copies.
 
-Not built, and each for a reason rather than for lack of time:
+- **The control** says what is going on in as few words as hold it —
+  `Copying · 42%`, `3 transfers · 18%`, a short bar beside it — and only
+  once work has run for `progress-after-ms`, as the old panel did. Idle,
+  it stays as a quiet `Transfers` while the session has history, or
+  `2 transfers failed` in the error colour while failures are unread.
+- **The popover** lists every running job (title, percentage, bar, then
+  `item 2 of 4 · 1.6 GiB of 2.0 GiB · 18.2 MB/s · 4s left · preview.png`)
+  and every waiting one, each saying *why* it waits: a slot,
+  "the other change to “notes.zip”", or "the other job putting “big”
+  there". Cancel per row, Cancel all, Show all. It closes on any click
+  outside it, a right click included, and on any key — Escape just
+  closes; any other key closes it and still does what it does, because
+  Ctrl+K's palette opened *under* the popover the first time and the
+  letters typed for it went to the search box.
+- **The queue view** is a card over the window, not a second window:
+  running, waiting, and every job this session that was on screen or did
+  not simply work, each with Show (go to what it put down) and, where it
+  is safe, Retry. Failed rows list their reasons once each and say what
+  cannot be retried and why. Clear finished; Close; Escape. It keeps the
+  keyboard, as the other cards do.
+- **Failures** still sit under the listing until dismissed, now with
+  Details beside Dismiss; dismissing marks them read and the queue view
+  keeps them. Closing the popover or the view never hides one.
+- **The overall bar never goes back for no reason.** A job stays in the
+  batch, counted whole, until the window is idle, so one finishing does
+  not drop the bar; bytes weigh the batch when every job knows its size,
+  jobs otherwise, and the number is held at its high-water mark while
+  the batch is unchanged. More work joining is the one time it resets.
+- **A job's own bar no longer empties between items.** Found live:
+  `fileops` runs one operation per pasted item and each counts from
+  zero, so copying a big folder and then a small one filled, emptied and
+  refilled the bar — the old panel did this too. Each item is now an
+  equal share, filled by its own fraction (`JobEvent::Progress` carries
+  `Items`), and the estimate is shown only on the last item.
+- **Progress is coalesced at the source**, one report per 100ms per job
+  however many files go by; `jobs.rs` has a test that copies 3,000 small
+  files and bounds the report count by elapsed time.
+- **History is bounded**: 50 jobs, the oldest that has nothing left to
+  say going first, and each job's reasons held as 64 distinct sentences
+  and a count.
+
+Decisions, and what changed since "partly built":
+
+- **Retry is offered where running the work again is the original
+  request** — and only there. A paste or restore item that landed
+  *nothing* (`fileops` removes a failed file's partial copy, and a move
+  whose copy failed keeps its source whole) is retried exactly, through
+  the queue, with conflicts asked as usual. An item that *partly* landed
+  is not: its first collision would be with its own half-copy, and
+  `fileops` has no "merge, skip what is there" answer — Skip on a folder
+  skips the subtree, Replace deletes what arrived — so the row says so
+  and points at pasting again. An archive edit or compression writes a
+  whole new file and renames it into place, so a failed one changed
+  nothing and is retried; a retried compression refuses if something now
+  sits at its name. A failed extraction is not retried: it unpacks member
+  by member, and a retry would make a second folder beside the half-full
+  first. DESIGN.md said a retry *policy* needed a queue; the queue made
+  a retry *button* safe, and an automatic policy is still not built — a
+  failure here is usually a permission or a full disk, which a second
+  attempt a second later meets again.
+- **The queue serialises on the same destination path too**, not only
+  the same archive. Found live, pasting one folder twice quickly: both
+  duplicates ran at once, each Keep Both picked the first free `big.2`,
+  and the later one failed with "File exists" partway through. Only the
+  same *path* waits; different things into one folder still run
+  together.
+- **The control is in the tab strip, not the status bar** `1b` draws.
+  The status bar is `hyprforge-files-core`'s and the open/save dialog
+  renders it, and a dialog has no jobs.
+- **A card, not the mockup's "full queue window".** On Hyprland a second
+  toplevel is tiled, and opening a list would rearrange the person's
+  layout. The jobs are threads of this window, so a window that outlived
+  it would have nothing to show.
+- **Shared pieces** went to `hyprforge-ui`: `progress_line` (the bar, in
+  the foreground colour — iced's default fills with the accent, which
+  means selected) and `popover_card`.
+
+Still not built, each for its reason:
 
 - **Pause.** `JobControl` can cancel but not pause, and pausing a job that is
   midway through rewriting an archive is not a state worth being able to sit
   in — the rewrite holds a temporary file beside the original until it
   finishes.
-- ~~**A queue.**~~ Built, and it turned out to be a correctness fix rather
-  than a scheduling preference — see below.
-- **Completed/Failed tabs, retry policy, "Retry as root".** The failures panel
-  covers what the Failed tab is for. A retry policy needs a queue; "as root"
-  needs privilege escalation this suite does not do.
+- **Completed/Failed tabs.** The queue view's one list, newest first,
+  with a coloured outcome per row, is short enough for a session; tabs
+  would hide a failure behind a click.
+- **"Retry as root".** Privilege escalation is not something this suite
+  does.
 - **"Queue survives window close · resumes on reconnect".** Jobs are threads
   in this process, and the remote transfers that line is really about need
   phase I's mounts.
 - **A Start button on a queued row.** `1f` has one. A job here is queued
-  either because the machine is busy, where starting it early gains nothing,
-  or because it would rewrite an archive another job is already rewriting —
-  where starting it early is the data loss the queue exists to prevent. A
-  button that is only sometimes safe is worse than no button.
+  because the machine is busy, where starting it early gains nothing, or
+  because it would write what another job is writing — where starting it
+  early is the data loss the queue exists to prevent. A button that is
+  only sometimes safe is worse than no button.
+- **A keybinding for the popover.** It would be a new `Action`, and the
+  action list is shared with the dialog and the palette; the control is a
+  click away and the failure panel's Details opens the view.
+
+Found and left alone, because it is `hyprforge-fileops`' and published:
+a file that cannot be *read* is reported as "you don't have permission to
+write to" its source path.
 
 The queue serialises on *conflict* first and a count second. Two jobs that
 rewrite the same archive never run together, whatever else is going on,
 because each reads the whole archive and writes a whole new one: the later
-rename wins and the earlier edit is silently lost. Everything else runs two at
+rename wins and the earlier edit is silently lost. Two that put something at
+the same path never run together either (above). Everything else runs two at
 a time, and a blocked job does not hold up an unrelated one behind it.
 
 **H — the command palette.** `1l`'s idea, inside `1b`.
@@ -362,8 +447,9 @@ what was owed:
   `zstd · 3 entries · 20.3 MB → 7.0 MB`.
 
 `1f` draws an extraction sitting in the transfers queue beside a copy, and
-that already works the way it has to: archive jobs report the same `JobEvent`
-as a paste, so when phase G builds the popover they appear in it for free.
+that works the way it has to: archive jobs report the same `JobEvent` as a
+paste, so they appear in phase G's popover and queue view with no code of
+their own.
 
 ## Deferred, and what that costs
 
@@ -386,7 +472,7 @@ currently *wrong* rather than merely unfinished: it shows a stored filename
 where the user expects the name their file had. Everything else is honest
 about being incomplete.
 
-A, D, B, H and C have since been built;
+A, D, B, H, C and G have since been built;
 see each phase above.
 
 The portal open/save dialog is not a phase — it inherits every one of these for

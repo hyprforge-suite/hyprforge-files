@@ -26,6 +26,12 @@ the costly ones kept in the freedesktop thumbnail cache every other
 file manager and viewer already shares. Files can be copied and pasted with other
 applications, and dragged out of the window into them.
 
+Copies, moves and archive work run in the background through a
+**queue**: a control in the tab strip shows overall progress, its
+popover lists each job with its rate and estimate and why a waiting one
+waits, and a queue view keeps the session's finished jobs, their
+failures, and a Retry wherever running the work again is safe.
+
 It can also be **every application's Open and Save dialog**, through
 xdg-desktop-portal — the same browser, path bar and previews, not a
 smaller copy. See "The open/save dialog" below.
@@ -45,7 +51,7 @@ branch on which host it is in.
 
 What this crate owns is the window around it, and the things a dialog
 deliberately does not have: launching what you double-click, file
-operations, the transfers panel, the archive jobs, the system clipboard,
+operations, the transfers popover and queue view, the archive jobs, the system clipboard,
 and drag and drop with other applications. Reading what the listing,
 the preview pane and the thumbnails show is `host.rs`, shared with the
 dialog — the second binary here, `hyprforge-files-portal`.
