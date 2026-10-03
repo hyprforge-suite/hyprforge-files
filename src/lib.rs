@@ -29,6 +29,7 @@ pub mod portal_service;
 pub mod preferences;
 pub mod preview;
 pub mod properties;
+pub mod search_jobs;
 pub mod system_clipboard;
 pub mod tabstrip;
 pub mod transfers;

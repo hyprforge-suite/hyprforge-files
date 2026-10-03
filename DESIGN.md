@@ -343,6 +343,99 @@ Checked in the nested compositor, with a virtual pointer for the clicks:
 rail, saved smart folders. Today's search is a substring match on one
 directory.
 
+*Built.* The search box understands filters, looks below the folder, and
+saves to the sidebar. A bare word in this folder is still exactly the old
+substring match — `query.rs` keeps the text as typed until a filter
+appears, and a test holds it there.
+
+- **The query** (`hyprforge-files-core/src/query.rs`, pure): free text
+  plus `ext:`, `kind:` (the listing's own `EntryKind`, plus `file` and
+  `folder`), `size:` (binary units, as the Size column prints them),
+  `modified:` (`<7d`, `>1y`, `today`, `yesterday`), `name:` (a substring
+  or a glob) and `is:hidden`/`is:link`, any of them negated with `-`.
+  Relative times are pinned once per pass (`Matcher`), so `today` cannot
+  draw its line between two rows.
+- **What it does not understand is said.** An unknown key is reported
+  beside the field *and* searched as literal text — a file can be called
+  `colour:red`. A known key with a bad value (`size:huge`) is reported
+  and not applied. Only letters-colon-something is a filter, so `12:30`
+  and `Re:` stay text. No `git:` chip: git is deferred, and `git:` is an
+  unknown key until it is not.
+- **Chips.** A finished filter (one followed by a space) leaves the
+  field and becomes a removable chip inside it — `hyprforge-ui`'s
+  `token_field` and `removable_chip`, neutral rather than tinted,
+  because a chip there is something the person typed, not a state.
+- **The scope rail**, a strip under the header only while searching:
+  *This folder* (instant, the loaded listing), *Subfolders* and *Home*.
+  The mockup's rail runs down the side; a column a sidebar wide for
+  three buttons and a status line costs the results too much, so it lies
+  flat. The Trash offers only *This folder*: a trashed folder's contents
+  are stored names nothing can restore one at a time.
+- **The walk** (`hyprforge-files-core/src/search.rs`) goes through the
+  `FsBackend`, breadth first so the nearest results come first, and is
+  bounded four ways — 15 s, 100,000 folders, 5,000 results, 48 levels —
+  each its own ending the rail names, with a suggestion. It never opens
+  an archive met on the way (listing one means decompressing it, and the
+  archive index cache holds four), skips dotfolders unless dotfiles are
+  showing or the query says `is:hidden`, symlinked folders, the Trash's
+  storage, and other filesystems (by device, like `find -xdev`). Folders
+  it could not read and folders on other drives are counted aloud. A
+  search *started* inside an archive walks its members through the
+  archive backend, whose index is already read.
+- **The host** (`hyprforge-files/src/search_jobs.rs`, shared by the
+  window and the open/save dialog): one walk per tab, the newest
+  winning — a keystroke cancels the running walk and waits for it to
+  stop, so a burst of typing costs two walks. Results come back in
+  batches (at most every 120 ms or 250 results). The stream has its own
+  deadline two seconds past the walk's, because a `read_dir` stuck on a
+  dead mount cannot be cancelled; past it the window is told and the
+  worker is abandoned. Closing a tab cancels its walk.
+- **Results are the listing while shown**, so selection, Trash, Copy,
+  drag and the menus act on each result's own path. They take the
+  Trash's Origin column as *Folder*, written from where the search
+  started (`tree/proj/src` rather than its full path). *Show in Folder* (Ctrl+Alt+O, and at the head
+  of a result's menu) goes there with it selected. A re-read of the
+  folder (a paste, a rename, F5) runs the search again rather than
+  leaving stale results; Escape or going anywhere ends it.
+- **Saved searches** keep the query as text, the folder and whether it
+  looks below, in `files.toml`'s `searches` (older files parse). They are
+  a *Saved Searches* sidebar section after Pinned, run when clicked, and
+  light instead of the folder they search. The rail offers *Save
+  search…* with a suggested name, or *Saved as "…" · Remove* when the
+  search on screen is one.
+
+Found on the way: a rename went to `current_dir.join(name)`, which for a
+result from below would have *moved* it into the folder in view. It
+renames in place now, with a test.
+
+Measured on this machine (release build, warm cache, through the real
+`RoutingBackend`; counts only):
+
+| Walk from `~` | Folders | Found | Time | Peak memory |
+|---|---|---|---|---|
+| no dotfolders, nothing matches | 17,865 | 0 | 0.80–0.83 s (1.4 s cold) | 8 MB |
+| no dotfolders, `ext:rs` | 17,865 | 588 | 0.80 s, first batch at 72 ms | |
+| dotfolders too, unbounded | 109,892 | 1,175,818 | 22.7 s | 29 MB |
+| dotfolders, default budget | 100,000 | 0 | 10.4 s — stops at the folder limit | 19 MB |
+| everything matches, default budget | 592 | 5,000 | 61 ms — stops at the result limit | 5 MB |
+
+Three folders under `~` were on other filesystems (btrfs subvolumes:
+build directories) and were counted rather than entered. In the nested
+compositor, a debug build searching all of `~` reported "0 matches in
+17,865 folders · 3 folders on other drives not searched" within eight
+seconds.
+
+Not built:
+
+- **Grid view shows no Folder.** A tile has no column; the result's
+  folder is one Show in Folder away.
+- **Folder sizes in results** stay blank: counting a few thousand
+  folders scattered across a tree is the second pass the listing bounds
+  at 400, and nobody sorts search results by item count.
+- **Keyboard scope switching.** The rail is clicked; a saved search
+  covers the scope you use every day.
+- **Content search** — an index, not a predicate; a different feature.
+
 **G — Transfers (`1f`).** `hyprforge-fileops::ops` already reports progress and
 cancels per chunk; this is the popover and the queue window over it.
 
@@ -539,7 +632,7 @@ currently *wrong* rather than merely unfinished: it shows a stored filename
 where the user expects the name their file had. Everything else is honest
 about being incomplete.
 
-A, D, B, H, C, E and G have since been built;
+A, D, B, H, C, E, F and G have since been built;
 see each phase above.
 
 The portal open/save dialog is not a phase — it inherits every one of these for

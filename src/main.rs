@@ -339,6 +339,8 @@ enum Message {
     /// Where a tab's path bar text could go: the tab, the text it
     /// answers, and the answers.
     PathResolved(u64, String, Vec<hyprforge_files_core::jump::Candidate>),
+    /// What a tab's search below a folder found, or how it ended.
+    Searched(u64, hyprforge_files::search_jobs::Event),
     /// The tab a trash operation was started from, the directory to
     /// refresh, and what (if anything) failed.
     /// The tab, the folder to refresh, each item that went to the Trash
@@ -509,11 +511,14 @@ struct Tab {
     /// draws from the video player's queue, which grew for as long as a
     /// video played because it did work per signal.
     resolve_next: Option<hyprforge_files_core::jump::Request>,
+    /// This tab's search below a folder — one walk at a time, the newest
+    /// winning. See `hyprforge_files::search_jobs`.
+    searcher: hyprforge_files::search_jobs::Searcher,
 }
 
 impl Tab {
     fn new(id: u64, browser: Browser) -> Tab {
-        Tab { id, browser, read_generation: 0, resolving: false, resolve_next: None }
+        Tab { id, browser, read_generation: 0, resolving: false, resolve_next: None, searcher: Default::default() }
     }
 }
 
@@ -1437,6 +1442,37 @@ impl App {
         )
     }
 
+    /// Hands a tab's search to its `Searcher`, starting a walk if one is
+    /// to start now, and changes the saved searches for every tab.
+    fn search(&mut self, tab_index: usize, ask: hyprforge_files_core::search::Ask) -> Task<Message> {
+        if let hyprforge_files_core::search::Ask::Smart(change) = &ask {
+            return self.change_searches(change);
+        }
+        let tab = &mut self.tabs[tab_index];
+        match tab.searcher.ask(ask) {
+            Some(start) => self.spawn_search(tab_index, start),
+            None => Task::none(),
+        }
+    }
+
+    fn spawn_search(&self, tab_index: usize, (request, cancel): hyprforge_files::search_jobs::Start) -> Task<Message> {
+        let tab_id = self.tabs[tab_index].id;
+        Task::run(hyprforge_files::search_jobs::stream(self.backend.clone(), request, cancel), move |event| {
+            Message::Searched(tab_id, event)
+        })
+    }
+
+    /// Saves, replaces or forgets a saved search — for every tab, and on
+    /// disk. The same shape as `change_pins`.
+    fn change_searches(&mut self, change: &hyprforge_files_core::search::SmartChange) -> Task<Message> {
+        let searches = hyprforge_files_core::search::apply_smart_change(&self.last_prefs.searches, change);
+        self.last_prefs.searches = searches.clone();
+        for tab in &mut self.tabs {
+            tab.browser.set_smart_folders(searches.clone());
+        }
+        Task::perform(save_prefs(move |p: &mut Prefs| p.searches = searches), Message::PrefsSaved)
+    }
+
     /// Carries out everything `Browser::update`/`perform` handed back
     /// but could not do itself — see `hyprforge_files_core::browser::Outcome`'s
     /// own doc for why each of these belongs to the host. `tab_index` is
@@ -1524,6 +1560,7 @@ impl App {
                 Message::PrefsSaved,
             ),
             Outcome::Pins(change) => self.change_pins(&change),
+            Outcome::Search(ask) => self.search(tab_index, ask),
             Outcome::LoadThumbnails(paths) => Task::run(thumbnail_stream(paths), |(path, handle)| {
                 Message::Browser(BrowserMessage::ThumbnailLoaded(path, handle))
             }),
@@ -2993,6 +3030,23 @@ impl App {
                 };
                 Task::batch([task, next])
             }
+            Message::Searched(tab_id, event) => {
+                use hyprforge_files::search_jobs::Event;
+                use hyprforge_files_core::search::SearchMessage;
+                let Some(index) = self.tab_index(tab_id) else { return Task::none() };
+                let (message, ended) = match event {
+                    Event::Found(run, entries) => (SearchMessage::Found { run, entries }, None),
+                    Event::Finished(run, summary) => (SearchMessage::Finished { run, summary }, Some(run)),
+                };
+                let outcome = self.tabs[index].browser.update(BrowserMessage::Search(message));
+                let task = self.handle_outcome(index, outcome);
+                // The walk that was waiting for this one, if any.
+                let next = match ended.and_then(|run| self.tabs[index].searcher.finished(run)) {
+                    Some(start) => self.spawn_search(index, start),
+                    None => Task::none(),
+                };
+                Task::batch([task, next])
+            }
             Message::DirLoaded(tab_id, generation, path, result) => {
                 let Some(index) = self.tab_index(tab_id) else {
                     // The tab that asked for this closed before the read
@@ -3150,7 +3204,10 @@ impl App {
                 let renamed = browser.update(BrowserMessage::RenameCancel);
                 let pathed = browser.update(BrowserMessage::PathCancel);
                 let paletted = browser.update(BrowserMessage::PaletteCancel);
-                self.handle_outcome(self.active, Outcome::Many(vec![renamed, pathed, paletted]))
+                let unsaved = browser.update(BrowserMessage::Search(
+                    hyprforge_files_core::search::SearchMessage::SaveCancel,
+                ));
+                self.handle_outcome(self.active, Outcome::Many(vec![renamed, pathed, paletted, unsaved]))
             }
             Message::AnswerConflict(id, policy) => {
                 self.answer_conflict(id, policy);
@@ -4815,6 +4872,9 @@ const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn merge_tab_prefs(on_disk: &Prefs, mut from_tab: Prefs) -> Prefs {
     from_tab.pinned = on_disk.pinned.clone();
+    // The window's list, like the pins: a tab's copy is never the one
+    // written.
+    from_tab.searches = on_disk.searches.clone();
     from_tab.window_width = on_disk.window_width;
     from_tab.window_height = on_disk.window_height;
     from_tab
