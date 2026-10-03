@@ -169,6 +169,52 @@ as you type. The single best idea in the document and the thing neither Finder
 nor Explorer has. Needs a matcher (`hyprforge-emoji` already has a search
 function worth looking at for prior art) and a resolution preview.
 
+*Built.* Ctrl+L, or a click on the field's empty space, turns the crumbs into
+text in place. Each segment is matched against the folder the one before it
+landed on (`hyprforge-files-core/src/jump.rs`). The tiers are modelled on the
+emoji search: exact, prefix, a later word's start, substring, then letters
+in order but only from the name's start, so `hy` never finds `why`. Ties go,
+in order, to:
+
+1. somewhere you have been or the sidebar offers
+2. a folder over a file
+3. the shorter path
+
+The answers hang under the field, the top one heading the list as
+`~/pr/hy → ~/projects/hyprsuite`. Up/Down move through them, Tab completes
+to one and Enter goes there. A file means its folder, with it selected.
+
+Three rules a typist would otherwise trip on:
+
+- **A path that exists as typed is always the first answer.** That is also
+  how `~/x.zip/bin` still works: matching never descends into an archive,
+  because listing one means decompressing it.
+- **Enter before the answer arrives** goes where that answer says, not
+  where the previous text's answer pointed.
+- **A burst of typing costs two resolves**, the one running and the
+  newest, never one per letter.
+
+The panel is not Files' own. `hyprforge-ui`'s `anchored` and `suggestions`
+draw it, so Settings' search can share it. See
+`crates/hyprforge-ui/DESIGN-SYSTEM.md`.
+
+Measured on this machine, warm cache, through the real `RoutingBackend`:
+
+| Query | Time |
+|---|---|
+| `~/do/pr/hyf` | 11ms |
+| `~/d/p/h/t/d` (five levels) | 4.5ms |
+| `~/.c/hy` | 15ms |
+| `~/Documents/Projects/hyprforge/crates/` (literal) | 0.4ms |
+| `/u/s/ic` | **53ms** |
+
+`/u/s/ic` is the outlier because `FsBackend::read_dir` stats every entry of
+`/usr/bin` to answer "is it a folder". That runs off the UI thread with one
+resolve per tab in flight, so it costs latency, not jank. The fix, if it is
+ever wanted, is a `d_type`-only name listing on the backend trait. It was
+not made here, because that trait lives in a published crate and nothing
+under the home directory needed it.
+
 **C — grid and column views.** Grid exists but draws badges; it needs real
 thumbnails, which is the preview crate from the original plan. Column view
 (`1c`) is new: cascading panes plus a metadata rail.
@@ -283,7 +329,7 @@ currently *wrong* rather than merely unfinished: it shows a stored filename
 where the user expects the name their file had. Everything else is honest
 about being incomplete.
 
-A, D and the thumbnail and preview half of C have since been built;
+A, D, B and the thumbnail and preview half of C have since been built;
 see each phase above.
 
 The portal open/save dialog is not a phase — it inherits every one of these for

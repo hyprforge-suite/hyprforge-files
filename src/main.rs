@@ -396,6 +396,9 @@ enum Message {
     /// for why the guard is per-tab rather than per-window now that a
     /// window can have several reads in flight at once, one per tab.
     DirLoaded(u64, u64, PathBuf, Result<Vec<Entry>, DirError>),
+    /// Where a tab's path bar text could go: the tab, the text it
+    /// answers, and the answers.
+    PathResolved(u64, String, Vec<hyprforge_files_core::jump::Candidate>),
     /// The tab a trash operation was started from, the directory to
     /// refresh, and what (if anything) failed.
     /// The tab, the folder to refresh, each item that went to the Trash
@@ -535,11 +538,20 @@ struct Tab {
     /// cannot land in tab 1, or vice versa: each tab's counter only ever
     /// advances for reads *that tab* asked for.
     read_generation: u64,
+    /// Whether a path bar resolve is out for this tab.
+    resolving: bool,
+    /// The newest resolve asked for while one was out. Only the newest:
+    /// each keystroke is "look again", not a job of its own, so a burst
+    /// of typing costs the resolve that was running and the one for
+    /// where the typing ended — never one per letter. The rule CLAUDE.md
+    /// draws from the video player's queue, which grew for as long as a
+    /// video played because it did work per signal.
+    resolve_next: Option<hyprforge_files_core::jump::Request>,
 }
 
 impl Tab {
     fn new(id: u64, browser: Browser) -> Tab {
-        Tab { id, browser, read_generation: 0 }
+        Tab { id, browser, read_generation: 0, resolving: false, resolve_next: None }
     }
 }
 
@@ -1426,6 +1438,33 @@ impl App {
         })
     }
 
+    /// Works out where a tab's path bar text could go, off the UI thread
+    /// and through the same backend as its listings — so a typed path
+    /// into an archive or the Trash resolves the way the listing would.
+    /// One at a time per tab; see `Tab::resolve_next`.
+    fn spawn_resolve(&mut self, tab_index: usize, request: hyprforge_files_core::jump::Request) -> Task<Message> {
+        let tab = &mut self.tabs[tab_index];
+        if tab.resolving {
+            tab.resolve_next = Some(request);
+            return Task::none();
+        }
+        tab.resolving = true;
+        let tab_id = tab.id;
+        let backend = self.backend.clone();
+        let text = request.text.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || request.run(backend.as_ref()))
+                    .await
+                    // A resolve that panicked answers "nothing", which
+                    // the field shows as nothing matching — not a reason
+                    // to leave it waiting forever.
+                    .unwrap_or_default()
+            },
+            move |candidates| Message::PathResolved(tab_id, text.clone(), candidates),
+        )
+    }
+
     /// Carries out everything `Browser::update`/`perform` handed back
     /// but could not do itself — see `hyprforge_files_core::browser::Outcome`'s
     /// own doc for why each of these belongs to the host. `tab_index` is
@@ -1704,6 +1743,15 @@ impl App {
             Outcome::CopyText(text) => iced::clipboard::write(text),
             Outcome::DragOut(paths) => self.start_drag(paths),
             Outcome::Paste(into) => self.read_clipboard_for(into),
+            Outcome::ResolvePath(request) => self.spawn_resolve(tab_index, request),
+            Outcome::FocusPath { id, select_all } => Task::batch([
+                iced::widget::operation::focus(id.clone()),
+                if select_all {
+                    iced::widget::operation::select_all(id)
+                } else {
+                    iced::widget::operation::move_cursor_to_end(id)
+                },
+            ]),
             Outcome::FocusRename { id, select } => Task::batch([
                 iced::widget::operation::focus(id.clone()),
                 iced::widget::operation::select_range(id, 0, select),
@@ -2629,6 +2677,15 @@ impl App {
                     Task::none()
                 }
             }
+            // Tab in the path bar completes to the highlighted answer. A
+            // text field does not take Tab, so it arrives here; nowhere
+            // else in the window is it bound.
+            Message::KeyPressed(press)
+                if press.key == keymap::Key::Tab && self.active_tab().browser.editing_path() =>
+            {
+                let outcome = self.active_tab_mut().browser.update(BrowserMessage::PathComplete);
+                self.handle_outcome(self.active, outcome)
+            }
             Message::KeyPressed(press) => match self.config.keymap.resolve(&press) {
                 // Window actions never reach the browser, which the
                 // dialog host also renders and which has no tabs.
@@ -2647,6 +2704,23 @@ impl App {
                 }
                 None => Task::none(),
             },
+            Message::PathResolved(tab_id, text, candidates) => {
+                let Some(index) = self.tab_index(tab_id) else {
+                    return Task::none();
+                };
+                self.tabs[index].resolving = false;
+                let outcome = self.tabs[index]
+                    .browser
+                    .update(BrowserMessage::PathResolved { text: text.clone(), candidates });
+                let task = self.handle_outcome(index, outcome);
+                // What was typed while this one ran. Not when it is the
+                // same text: that answer just arrived.
+                let next = match self.tabs[index].resolve_next.take() {
+                    Some(next) if next.text != text => self.spawn_resolve(index, next),
+                    _ => Task::none(),
+                };
+                Task::batch([task, next])
+            }
             Message::DirLoaded(tab_id, generation, path, result) => {
                 let Some(index) = self.tab_index(tab_id) else {
                     // The tab that asked for this closed before the read
@@ -2758,9 +2832,13 @@ impl App {
                 self.confirm = None;
                 Task::none()
             }
+            // Whichever field took it: at most one of a rename and the
+            // path bar is open, and cancelling the other does nothing.
             Message::EscapeInField => {
-                let outcome = self.active_tab_mut().browser.update(BrowserMessage::RenameCancel);
-                self.handle_outcome(self.active, outcome)
+                let browser = &mut self.active_tab_mut().browser;
+                let renamed = browser.update(BrowserMessage::RenameCancel);
+                let pathed = browser.update(BrowserMessage::PathCancel);
+                self.handle_outcome(self.active, Outcome::Many(vec![renamed, pathed]))
             }
             Message::AnswerConflict(id, policy) => {
                 self.answer_conflict(id, policy);
@@ -4155,6 +4233,8 @@ struct DebugShow {
     open: bool,
     /// The application chooser for the first row.
     open_with: bool,
+    /// The path bar, opened with this typed into it — `jump=~/do/pr`.
+    jump: Option<String>,
 }
 
 #[cfg(debug_assertions)]
@@ -4181,6 +4261,8 @@ impl DebugShow {
                 show.open = true;
             } else if item == "open-with" {
                 show.open_with = true;
+            } else if let Some(text) = item.strip_prefix("jump=") {
+                show.jump = Some(text.to_string());
             }
         }
         show
@@ -4241,6 +4323,11 @@ impl DebugShow {
             browser.update(BrowserMessage::EntryClicked { index: 0, ctrl: false, shift: false });
             let outcome = browser.perform(Action::Open);
             return app.handle_outcome(index, outcome);
+        }
+        if let Some(text) = self.jump.take() {
+            let opened = browser.update(BrowserMessage::EditPath);
+            let typed = browser.update(BrowserMessage::PathInput(text));
+            return app.handle_outcome(index, Outcome::Many(vec![opened, typed]));
         }
         Task::none()
     }
@@ -4866,6 +4953,49 @@ mod tests {
             #[cfg(debug_assertions)]
             debug_show: DebugShow::default(),
         }
+    }
+
+    // --- the path bar ------------------------------------------------------
+
+    fn type_path(app: &mut App, text: &str) {
+        let _ = app.update(Message::Browser(BrowserMessage::PathInput(text.to_string())));
+    }
+
+    /// A burst of typing costs the resolve already running and one for
+    /// where the typing ended — never one per letter. See
+    /// `Tab::resolve_next`.
+    #[test]
+    fn only_the_newest_query_is_resolved_after_a_burst_of_typing() {
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(Message::Browser(BrowserMessage::EditPath));
+        type_path(&mut app, "~/p");
+        assert!(app.tabs[0].resolving);
+        type_path(&mut app, "~/pr");
+        type_path(&mut app, "~/pro");
+        type_path(&mut app, "~/proj");
+        let waiting = app.tabs[0].resolve_next.as_ref().map(|r| r.text.as_str());
+        assert_eq!(waiting, Some("~/proj"), "the letters in between are never resolved");
+
+        let _ = app.update(Message::PathResolved(0, "~/p".to_string(), vec![]));
+        assert!(app.tabs[0].resolving, "the newest went out as the old one came back");
+        assert!(app.tabs[0].resolve_next.is_none());
+
+        let _ = app.update(Message::PathResolved(0, "~/proj".to_string(), vec![]));
+        assert!(!app.tabs[0].resolving, "and nothing after it");
+    }
+
+    #[test]
+    fn tab_in_the_path_bar_completes_rather_than_reaching_the_keymap() {
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(Message::Browser(BrowserMessage::EditPath));
+        type_path(&mut app, "/u");
+        let answer = hyprforge_files_core::jump::Candidate { path: "/usr".into(), is_dir: true, exact: false };
+        let _ = app.update(Message::PathResolved(0, "/u".to_string(), vec![answer]));
+        let tab = keymap::KeyPress { key: keymap::Key::Tab, mods: Default::default(), text: None };
+        let _ = app.update(Message::KeyPressed(tab));
+        // Through the browser's own state: what the field now holds.
+        let shown = format!("{:?}", app.tabs[0].browser);
+        assert!(shown.contains("text: \"/usr/\""), "{shown}");
     }
 
     // --- open with --------------------------------------------------------

@@ -3,6 +3,7 @@
 A file manager for Hyprland.
 
 Tabs in the titlebar, a sidebar of places and pins, list and grid views,
+a path bar that understands `~/do/pr/hyf` as `~/Documents/Projects/hyprforge`,
 search, multi-select and history — and the freedesktop trash done
 properly, including the part that bites: a file cannot be renamed across
 filesystems, so a file on another one needs a trash directory of its own,
