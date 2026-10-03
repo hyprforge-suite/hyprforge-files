@@ -25,6 +25,10 @@ the costly ones kept in the freedesktop thumbnail cache every other
 file manager and viewer already shares. Files can be copied and pasted with other
 applications, and dragged out of the window into them.
 
+It can also be **every application's Open and Save dialog**, through
+xdg-desktop-portal — the same browser, path bar and previews, not a
+smaller copy. See "The open/save dialog" below.
+
 Part of [Hyprforge](https://github.com/hyprforge-suite/hyprforge), a suite of
 native Hyprland desktop applications. This repository is a split of the
 `crates/hyprforge-files` directory there; development happens in the
@@ -40,9 +44,10 @@ branch on which host it is in.
 
 What this crate owns is the window around it, and the things a dialog
 deliberately does not have: launching what you double-click, file
-operations, the transfers panel, the archive jobs, reading what the
-preview pane and the thumbnails show, the system clipboard, and drag and
-drop with other applications.
+operations, the transfers panel, the archive jobs, the system clipboard,
+and drag and drop with other applications. Reading what the listing,
+the preview pane and the thumbnails show is `host.rs`, shared with the
+dialog — the second binary here, `hyprforge-files-portal`.
 
 ## Installing
 
@@ -61,6 +66,31 @@ where the Settings app has never been installed.
 a video or a song previews as the details the listing already knows and
 a sentence naming what to install, and a PDF or a video gets no
 thumbnail.
+
+## The open/save dialog
+
+`hyprforge-files-portal` serves xdg-desktop-portal's
+`org.freedesktop.impl.portal.FileChooser`. Each request starts one
+dialog window, which answers and exits; an application that gives up on
+its dialog takes the window with it.
+
+Installing it switches nothing. To make it every application's dialog,
+put this in `~/.config/xdg-desktop-portal/hyprland-portals.conf`:
+
+```
+[preferred]
+default=hyprland;gtk
+org.freedesktop.impl.portal.FileChooser=hyprforge
+```
+
+and run `systemctl --user restart xdg-desktop-portal`. Keep the
+`default=` line: the portal reads only the first `portals.conf` it finds.
+Removing the last line puts the previous dialog back.
+
+The package installs the `.portal` descriptor where xdg-desktop-portal
+looks for one (`/usr/share/xdg-desktop-portal/portals`, the only place
+it does) and a D-Bus activation file, so the service starts when an
+application asks and at no other time.
 
 ## Licence
 

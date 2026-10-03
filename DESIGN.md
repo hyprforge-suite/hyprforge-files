@@ -335,6 +335,69 @@ see each phase above.
 The portal open/save dialog is not a phase — it inherits every one of these for
 free, because it renders the same view. That is the payoff for the `Mode` seam.
 
+## The open/save dialog — built
+
+`hyprforge-files-portal`, a second binary of this crate, is the desktop's
+file chooser:
+
+- **The D-Bus half.** `portal_service.rs` serves
+  `org.freedesktop.impl.portal.FileChooser`. Each `OpenFile`, `SaveFile`
+  or `SaveFiles` starts one `hyprforge-files-portal dialog` process, hands
+  it the request as JSON and answers with what it writes back.
+  - **Close.** A `Request` object at the call's handle takes the window
+    away on `Close`.
+  - **Failures.** A dialog that dies answers "other", never "cancelled".
+- **The request model.** `portal.rs` decodes requests from the signatures
+  read off the GTK backend installed here, and from the interface XML
+  xdg-desktop-portal ships. It covers filters (globs, MIME types and their
+  subclasses), choices and the starting folder, and encodes the answer as
+  `file://` URIs.
+- **The dialog window** is `Browser` in `Mode::Dialog`, untouched.
+  - **Around it, never inside it:** a name field, the application's
+    filters and choices, and the two buttons.
+  - **Filters are a listing input** (`EntryFilter`) like the search box,
+    not a mode, so the `Mode` test still holds.
+  - **The accept decision is one tested function** (`portal::accept`):
+    which files Open returns, when Save asks before overwriting, what
+    Enter on a folder does.
+- **Shared reading.** The listing, counts, thumbnails, previews and icons
+  moved from the window into `host.rs`, so the dialog shows a folder
+  exactly as Files does.
+- **Floating.** It maps at a fixed size, which Hyprland floats as a
+  dialog, then becomes resizable — the arrangement `hyprforge-media`
+  arrived at.
+- **Opt-in.** Installing it chooses it for nothing. The `.portal` file
+  has no `UseIn` line, which would have made it the default on a system
+  without a `hyprland-portals.conf`. The user names it in their own
+  config; see the README.
+
+Checked:
+
+- End to end in a nested Hyprland, over a private session bus driven by
+  `busctl`:
+  - An Open call returned the picture's URI and the filter in use.
+  - A Save onto an existing name asked before replacing.
+  - `Close` took the window away and answered "cancelled".
+- `check.sh` has a tier that serves the interface on a bus of its own and
+  compares it, method by method, with the installed XML. It was made to
+  fail once on purpose.
+
+Two things found on the way:
+
+- **`gdbus call` sends garbage for a `b'…'` byte-string argument.**
+  `dbus-monitor` showed 9 bytes of what looks like a pointer where
+  `/tmp/xyz` should be, so it is the wrong tool for testing anything that
+  takes a path; use `busctl`.
+- **A path that is not UTF-8 did not survive the JSON hand-off to the
+  dialog**, so paths cross as their bytes (`portal::raw_path`).
+
+Not yet:
+
+- right-click menus in the dialog (their keys work)
+- each application's last folder
+- attaching to the window that asked (`parent_window` needs xdg-foreign,
+  which winit cannot import)
+
 ## Dropping onto Files — built, and blocked on Hyprland
 
 `hyprforge-files-core::drop` decides where a drop lands and what it does:

@@ -1,0 +1,10 @@
+# Files as the desktop's open/save dialog. Installing this registers the
+# backend and chooses it for nothing: an application's dialogs change
+# only for someone who adds, to ~/.config/xdg-desktop-portal/hyprland-portals.conf,
+#     org.freedesktop.impl.portal.FileChooser=hyprforge
+# No UseIn line, deliberately. UseIn is the old way of saying "use me by
+# default on this desktop", and on a system without a hyprland-portals.conf
+# it would make this every application's dialog without anyone asking.
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.hyprforge
+Interfaces=org.freedesktop.impl.portal.FileChooser;

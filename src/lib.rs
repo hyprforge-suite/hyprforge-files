@@ -18,8 +18,11 @@
 
 pub mod archive_jobs;
 pub mod dnd;
+pub mod host;
 pub mod jobs;
 pub mod launch;
+pub mod portal;
+pub mod portal_service;
 pub mod preview;
 pub mod system_clipboard;
 pub mod tabstrip;
