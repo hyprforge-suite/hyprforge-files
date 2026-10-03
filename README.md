@@ -32,6 +32,15 @@ popover lists each job with its rate and estimate and why a waiting one
 waits, and a queue view keeps the session's finished jobs, their
 failures, and a Retry wherever running the work again is safe.
 
+**Properties** (Alt+Enter, or the bottom of any right-click menu) docks
+in the preview pane's place: General, with a folder's size walked in the
+background; Permissions, editable for a file you own; and Open with,
+where any application for the type can be made its default. **Preferences**
+(Ctrl+,) covers behaviour and every key binding — rebind, clear or reset,
+with a key another command holds named before it is taken — and writes
+`files-config.toml` one line at a time, so anything written there by
+hand stays. Colours and fonts are the Settings app's.
+
 It can also be **every application's Open and Save dialog**, through
 xdg-desktop-portal — the same browser, path bar and previews, not a
 smaller copy. See "The open/save dialog" below.

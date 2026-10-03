@@ -15,6 +15,9 @@
 //! or a disk: reading what the preview pane and the thumbnails show
 //! (`preview`), the Wayland clipboard (`system_clipboard`) and dragging
 //! files out to other applications and taking drops from them (`dnd`).
+//! The Properties inspector's looking and changing (`properties`) and
+//! the Preferences sheet (`preferences`) are here too: both are the
+//! window's, and the open/save dialog has neither.
 
 pub mod archive_jobs;
 pub mod dnd;
@@ -23,7 +26,9 @@ pub mod jobs;
 pub mod launch;
 pub mod portal;
 pub mod portal_service;
+pub mod preferences;
 pub mod preview;
+pub mod properties;
 pub mod system_clipboard;
 pub mod tabstrip;
 pub mod transfers;
