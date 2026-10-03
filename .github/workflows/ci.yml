@@ -1,6 +1,6 @@
-# CI for the standalone hyprforge-files repository (this file only takes
-# effect at `.github/workflows/ci.yml` — the path `./split.sh` produces
-# once `crates/hyprforge-files` becomes a repository root).
+# CI for the hyprforge-files repository. In the Hyprforge monorepo this directory
+# is a submodule at `crates/hyprforge-files`; this file takes effect only here, at
+# the repository's root.
 #
 # What this checks: the crate builds, clippy is silent (a clippy warning
 # is a build failure in Hyprforge), and the tests that need nothing but
