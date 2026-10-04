@@ -377,6 +377,20 @@ pub fn undo(done: hyprforge_files_core::undo::Undoable) -> (Vec<std::path::PathB
             }
         }
         Undoable::Renamed { from, to } => put_back(&mut dirs, &mut errors, &from, &to),
+        // Back as one batch, never one by one: a bulk rename that swapped
+        // two names is undone by swapping them again, and the batch's
+        // check refuses — before touching anything — when the folder
+        // has moved on since (a name gone, or taken again).
+        Undoable::RenamedAll(items) => {
+            let back: Vec<(PathBuf, PathBuf)> = items.iter().map(|(was, now)| (now.clone(), was.clone())).collect();
+            for (now, was) in &back {
+                touched(&mut dirs, now);
+                touched(&mut dirs, was);
+            }
+            if let Err(failure) = hyprforge_fileops::batch::apply(&back) {
+                errors.push(crate::bulk_rename::describe_failure(&failure));
+            }
+        }
         Undoable::Moved(items) => {
             for (was, now) in items {
                 put_back(&mut dirs, &mut errors, &was, &now);

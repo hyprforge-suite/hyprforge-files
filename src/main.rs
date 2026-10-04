@@ -195,6 +195,7 @@ fn main() -> iced::Result {
         chooser: None,
         preferences: None,
         compressing: None,
+        bulk_rename: None,
         unlocking: None,
         keyring,
         opened_members: Vec::new(),
@@ -481,6 +482,11 @@ enum Message {
     ),
     /// The Preferences sheet — see `hyprforge_files::preferences`.
     Preferences(hyprforge_files::preferences::Message),
+    /// The bulk rename sheet — see `bulk_rename_window`.
+    BulkRename(hyprforge_files::bulk_rename::Message),
+    /// A bulk rename finished: the tab it was asked from, and what was
+    /// renamed — or where a failure left everything.
+    BulkRenamed(u64, Result<Vec<(PathBuf, PathBuf)>, Box<hyprforge_fileops::batch::Failure>>),
 }
 
 /// One open directory tree view, with the state that makes it a tab
@@ -617,6 +623,8 @@ struct App {
     preferences: Option<hyprforge_files::preferences::Preferences>,
     /// An open "Compress\u{2026}" dialog.
     compressing: Option<Compressing>,
+    /// The bulk rename sheet, and the id of the tab it renames in.
+    bulk_rename: Option<(u64, hyprforge_files::bulk_rename::BulkRename)>,
     /// An open password prompt for an encrypted archive.
     unlocking: Option<Unlocking>,
     /// Passwords typed into that prompt, shared with the backend that
@@ -1805,6 +1813,7 @@ impl App {
                     move |(from, to, result)| Message::Renamed(tab_id, from, to, result),
                 )
             }
+            Outcome::BulkRename(request) => self.open_bulk_rename(tab_index, request),
             Outcome::CreateFolder(path) => {
                 let tab_id = self.tabs[tab_index].id;
                 Task::perform(
@@ -2869,6 +2878,15 @@ impl App {
                 }
                 self.handle_outcome(self.active, outcome)
             }
+            // The bulk rename sheet has the keyboard while it is up —
+            // see `bulk_rename_window::sheet_key` for which keys mean
+            // something to it. Nothing reaches the listing behind it.
+            Message::KeyPressed(press) if self.bulk_rename.is_some() => match bulk_rename_window::sheet_key(&press) {
+                Some(message) => self.update(Message::BulkRename(message)),
+                None => Task::none(),
+            },
+            Message::BulkRename(message) => self.bulk_rename_message(message),
+            Message::BulkRenamed(tab_id, result) => self.bulk_renamed(tab_id, result),
             // The Preferences sheet has the keyboard while it is up.
             // Capturing a binding, the next key is the binding — Escape
             // alone backs out of the capture, so Escape itself cannot be
@@ -3196,6 +3214,9 @@ impl App {
             // path bar is open, and cancelling the other does nothing.
             // The sheet's own field is the only one showing while it is
             // up, so an Escape there backs out of the sheet.
+            Message::EscapeInField if self.bulk_rename.is_some() => {
+                self.update(Message::BulkRename(hyprforge_files::bulk_rename::Message::Cancel))
+            }
             Message::EscapeInField if self.preferences.is_some() => {
                 self.update(Message::Preferences(hyprforge_files::preferences::Message::Close))
             }
@@ -3760,6 +3781,9 @@ impl App {
         // listing alike — so it is stacked over the whole window rather
         // than drawn inside the browser's own area.
         let size = (self.last_window_size.0 as f32, self.last_window_size.1 as f32);
+        if let Some((_, sheet)) = &self.bulk_rename {
+            return iced::widget::stack![window, sheet.view(scale).map(Message::BulkRename)].into();
+        }
         if let Some(sheet) = &self.preferences {
             let prefs = self.active_tab().browser.prefs();
             let over = sheet.view(&self.config, prefs, scale).map(Message::Preferences);
@@ -4400,6 +4424,7 @@ fn field_escape(event: iced::Event, status: iced::event::Status, _window: window
 /// nothing is rebuilt. `update` reads the atomics when a menu is asked
 /// for. It is process-wide state, and that is fine for exactly one
 /// reason: this process has one window — closing its last tab exits.
+mod bulk_rename_window;
 mod transfers_view;
 use transfers_view::{Transfers, TransfersMessage};
 
@@ -5056,6 +5081,7 @@ mod tests {
             chooser: None,
             preferences: None,
             compressing: None,
+            bulk_rename: None,
             unlocking: None,
             keyring: Arc::new(hyprforge_archive::Keyring::new()),
             opened_members: Vec::new(),
@@ -6912,6 +6938,95 @@ mod tests {
     }
 
     // --- undo -------------------------------------------------------------------
+
+    /// F2 with two selected opens the bulk sheet rather than doing
+    /// nothing. Numbering `1.txt` and `2.txt` in the reversed order the
+    /// listing shows is a swap — the case no sequence of single renames
+    /// can do — and it lands on disk, leaves both selected under their
+    /// new names, and is one Ctrl+Z to swap back.
+    #[test]
+    fn a_bulk_rename_that_swaps_two_names_lands_and_undoes_as_one_step() {
+        use hyprforge_files::bulk_rename::Message as Sheet;
+        use hyprforge_files_core::bulk_rename::Mode;
+        let dir = tempfile::tempdir().unwrap();
+        let (one, two) = (dir.path().join("1.txt"), dir.path().join("2.txt"));
+        std::fs::write(&one, "was one").unwrap();
+        std::fs::write(&two, "was two").unwrap();
+        let mut app = app_on(dir.path());
+        let _ = app.update(Message::Browser(BrowserMessage::SortBy(hyprforge_files_core::sort::SortColumn::Name)));
+        let _ = app.update(key("Ctrl+A"));
+        let _ = app.update(key("F2"));
+        assert!(app.bulk_rename.is_some(), "the sheet opened");
+
+        let _ = app.update(Message::BulkRename(Sheet::Mode(Mode::Number)));
+        let _ = app.update(Message::BulkRename(Sheet::Template("{n}".into())));
+        let renames = app.bulk_rename.as_ref().unwrap().1.preview().renames().expect("no problems with a swap");
+        let _ = app.update(Message::BulkRename(Sheet::Apply));
+        assert!(app.bulk_rename.as_ref().unwrap().1.applying());
+
+        // The batch runs on a task iced would deliver; stand in for it.
+        let result = hyprforge_files::bulk_rename::run(renames);
+        let _ = app.update(Message::BulkRenamed(app.tabs[0].id, result));
+        let entries = RoutingBackend::default().read_dir(dir.path()).unwrap();
+        let _ = app.update(Message::Browser(BrowserMessage::DirLoaded(dir.path().to_path_buf(), Ok(entries))));
+
+        assert!(app.bulk_rename.is_none(), "the sheet closes on success");
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), "was two");
+        assert_eq!(std::fs::read_to_string(&two).unwrap(), "was one");
+        assert_eq!(app.active_tab().browser.selected_shown().len(), 2, "both stay selected");
+        assert_eq!(app.notice.as_ref().map(|(_, t)| t.as_str()), Some("Renamed 2 items"));
+
+        let _ = app.update(key("Ctrl+Z"));
+        let (dirs, errors) = jobs::undo(hyprforge_files_core::undo::Undoable::RenamedAll(vec![
+            (two.clone(), one.clone()),
+            (one.clone(), two.clone()),
+        ]));
+        let _ = app.update(Message::Undone(dirs, errors));
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), "was one");
+        assert_eq!(std::fs::read_to_string(&two).unwrap(), "was two");
+    }
+
+    /// A batch refused before anything moved keeps the sheet open, with
+    /// the reason in it, so the rules can be changed and tried again.
+    #[test]
+    fn a_bulk_rename_refused_before_starting_keeps_the_sheet_open() {
+        use hyprforge_files::bulk_rename::Message as Sheet;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "").unwrap();
+        std::fs::write(dir.path().join("b"), "").unwrap();
+        let mut app = app_on(dir.path());
+        let _ = app.update(key("Ctrl+A"));
+        let _ = app.update(key("F2"));
+        let _ = app.update(Message::BulkRename(Sheet::Find("a".into())));
+        let _ = app.update(Message::BulkRename(Sheet::ReplaceWith("c".into())));
+        let renames = app.bulk_rename.as_ref().unwrap().1.preview().renames().unwrap();
+        let _ = app.update(Message::BulkRename(Sheet::Apply));
+        // Something called "c" appears between the preview and the rename.
+        std::fs::write(dir.path().join("c"), "someone else's").unwrap();
+        let result = hyprforge_files::bulk_rename::run(renames);
+        let _ = app.update(Message::BulkRenamed(app.tabs[0].id, result));
+
+        let (_, sheet) = app.bulk_rename.as_ref().expect("still open");
+        assert!(!sheet.applying(), "and usable again");
+        assert_eq!(std::fs::read_to_string(dir.path().join("c")).unwrap(), "someone else's");
+        assert!(dir.path().join("a").exists());
+    }
+
+    #[test]
+    fn escape_closes_the_bulk_rename_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "").unwrap();
+        std::fs::write(dir.path().join("b"), "").unwrap();
+        let mut app = app_on(dir.path());
+        let _ = app.update(key("Ctrl+A"));
+        let _ = app.update(key("F2"));
+        assert!(app.bulk_rename.is_some());
+        let _ = app.update(key("Delete"));
+        assert!(dir.path().join("a").exists(), "a key meant for the listing does not reach it");
+        let _ = app.update(Message::EscapeInField);
+        assert!(app.bulk_rename.is_none());
+    }
 
     /// A rename is remembered and offered straight away, and Ctrl+Z takes
     /// it back — on disk.

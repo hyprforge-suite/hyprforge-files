@@ -294,7 +294,8 @@ sidebar's. With nothing selected it describes the folder in view.
   hard links once. It stops at a million entries or a minute and says
   "at least". It is cancelled the moment the selection moves on.
 - **Several selected.** A total, the kinds ("3 Rust source · 1 TOML")
-  and Compress. Bulk rename is not built.
+  and Compress. Bulk rename is F2 with them selected — see "Bulk
+  rename" below; the inspector does not offer a button for it.
 - **Permissions.** Nine boxes, live for one file you own. A change goes
   through the host and comes back as what `stat` says. Setuid, setgid
   and sticky are shown, never offered, and an edit never touches them.
@@ -686,6 +687,101 @@ what was owed:
 that works the way it has to: archive jobs report the same `JobEvent` as a
 paste, so they appear in phase G's popover and queue view with no code of
 their own.
+
+## Bulk rename — built
+
+F2 with more than one thing selected used to do nothing; it opens a
+sheet over the window now, as Preferences does. Three layers, each
+tested on its own:
+
+- **The rules** — `hyprforge-files-core/src/bulk_rename.rs`, pure. Four
+  modes: find & replace (literal by default, case-insensitive unless
+  Match case is on, or a regular expression whose replacement can name
+  its groups), add text (before the name, or at its end — before the
+  extension, or after it when the extension is included), numbering
+  from a template (`{n}`, `{n:3}` zero-padded, `{name}`, `{{`/`}}`) with
+  a start and a step, counted in the order the listing is drawn, and
+  change case (lower, UPPER, Title, Sentence). The extension is "the
+  last dot", the same split the single rename's selection uses, and is
+  left alone unless Include the extension is on. Each row is flagged
+  when its new name is empty, has a `/` or NUL, is `.`/`..`, is over
+  255 bytes, would newly start with a dot, lands on something in the
+  folder that is not moving, or is what another row gets too. Apply is
+  refused while any row is flagged or the rules themselves do not read
+  (a bad pattern or template, a start that is not a number) — said in
+  words, never a panic. A pattern's compiled size is capped at 1 MB and
+  the `regex` crate matches in linear time, so nothing typed can hang a
+  preview that is rebuilt on every keystroke; 10,000 rows rebuild well
+  inside a frame (a test bounds it).
+- **The batch** — `hyprforge-fileops/src/batch.rs`. `plan` orders the
+  renames so none lands on a name still taken, and breaks a swap or a
+  longer cycle by stepping one member aside to a hidden temporary name
+  in the same folder (`.<name>.renaming`). `apply` checks the whole set
+  against the disk first — every source there, every target free or
+  about to be freed — so the usual failure moves nothing; then every
+  rename is `renameat2(RENAME_NOREPLACE)`, so something appearing
+  between the check and the rename is refused by the kernel rather than
+  overwritten. If one fails anyway, the ones already done are put back
+  newest first, and the failure names everything that could not be put
+  back with where it is now — a thing left under a temporary name is
+  never silent. A filesystem without the flag gets a check and a plain
+  rename; a change of case alone on one that ignores case is let
+  through as the same file.
+- **The sheet** — `src/bulk_rename.rs` (state, view) and
+  `src/bulk_rename_window.rs` (what the window does with it). A live
+  table of old → new for every item, drawn with `hyprforge-ui`'s new
+  shared `change_row`; unchanged rows dimmed rather than hidden; past
+  300 rows it says how many more there are and how many of those have
+  problems. It has the keyboard: Escape backs out, Tab and Shift+Tab go
+  round its own fields, Ctrl+1–4 pick the mode, Enter applies.
+
+What happens on Apply:
+
+- **On a disk**, the batch runs on a blocking thread and the sheet
+  waits, frozen. Done: the sheet closes, the new names are selected
+  when the listing comes back, and one undo record (`RenamedAll`)
+  offers Ctrl+Z, which runs the reverse as a batch of its own — a swap
+  is undone by swapping again, and the undo refuses before touching
+  anything if the folder has moved on. Refused before anything moved:
+  the sheet stays open with the reason. Anything else: the sheet closes
+  and the status bar says exactly what was and was not renamed.
+- **Inside an archive**, the same plan becomes the edits of *one*
+  rewrite, queued like every archive edit so nothing else rewriting the
+  same archive runs beside it. The temporary-name step matters there
+  too: `hyprforge-archive` applies renames to its table one after
+  another, and a swap applied naively puts both members under one name.
+  Only items in the folder in view can be renamed this way — a search's
+  results from deeper in an archive have neighbours the listing never
+  read, and an archive's table, unlike a disk, would accept two members
+  of one name. No undo, as for every archive edit (see `undo.rs`).
+
+Departures from the brief, each for its reason:
+
+- **A disk batch is not a queued job.** Measured: 5,000 renames in a
+  rotation — the worst shape, every one through the cycle — took 185 ms
+  on this machine's btrfs home in a debug build, the check included. A
+  progress bar for a fifth of a second is noise, and Cancel halfway would
+  have to put everything back, which is what a failure already does.
+  Nothing a paste is placing at the same moment can be written over:
+  every rename refuses to replace. A slow network mount is where this
+  would change; Files has none yet (phase I).
+- **"Would become hidden" stops the rename** rather than warning. It is
+  almost always a stray `.` in Add text, and the one file someone really
+  means to hide can be renamed by hand.
+- **No Rename button in the Properties inspector** for several items, nor
+  in the open/save dialog: the dialog says F2 on several "isn't
+  something this dialog does", as for every window-only command.
+- **No regex toggles from the keyboard.** iced's toggles and segmented
+  buttons take no focus; the modes have Ctrl+1–4, the switches need the
+  pointer.
+
+Checked in the nested compositor (headless output, scratch folder):
+numbering six files `Holiday {n:03}` in the listing's order, the same
+template cut to `Holiday` flagging all six rows as duplicates with Apply
+off, the batch landing with all six selected under their new names and
+"Renamed 6 items · Undo", Ctrl+Z restoring every name with its
+contents, and inside a zip a find & replace of two members as one
+rewrite, both left selected.
 
 ## Deferred, and what that costs
 
