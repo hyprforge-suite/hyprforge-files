@@ -397,6 +397,9 @@ enum Message {
     /// the keyboard first — clicking a pane is how one is chosen — then
     /// goes where [`Message::Browser`] would.
     Pane(u64, BrowserMessage),
+    /// A press anywhere in a split pane that nothing in it took — its
+    /// empty space, its bars. Focuses that pane and does nothing else.
+    FocusPane(u64),
     /// An answer for the pane with this id, worked out off the UI thread
     /// — thumbnails, icons, folder counts, Recent and Starred, Quick
     /// Look. Never moves the keyboard: an answer arriving is not the
@@ -3567,6 +3570,12 @@ impl App {
                 self.focus_pane(at.pane);
                 self.browser_message(at, msg)
             }
+            Message::FocusPane(id) => {
+                if let Some(at) = self.locate(id).filter(|at| at.tab == self.active) {
+                    self.focus_pane(at.pane);
+                }
+                Task::none()
+            }
             Message::OtherPane => {
                 let other = 1 - self.active_tab().focused.min(1);
                 self.focus_pane(other);
@@ -4661,6 +4670,11 @@ impl App {
             let chrome = if index == 0 { Chrome::Full } else { Chrome::Bare };
             let id = pane.id;
             let view = pane.browser.view_as(scale, half, chrome).map(move |m| Message::Pane(id, m));
+            // A click on a pane's empty space chooses it too, the way it
+            // does in every two-pane file manager. Only presses nothing in
+            // the pane captured reach this — a row or a button handles its
+            // own and sends `Message::Pane`, which focuses on the way.
+            let view: Element<'a, Message> = iced::widget::mouse_area(view).on_press(Message::FocusPane(id)).into();
             let focused = index == tab.focused;
             both = both.push(
                 column![pane_edge(focused), view].width(Length::FillPortion(1)).height(Length::Fill),
@@ -8434,6 +8448,18 @@ mod tests {
 
     /// Closing the split keeps the pane being worked in — whichever side
     /// it is — and F3 twice puts the tab back as it was.
+    #[test]
+    fn a_press_on_a_pane_s_empty_space_chooses_it_and_changes_nothing_else() {
+        let mut app = app_for_test(&["/dir"]);
+        split(&mut app);
+        let (left, right) = (app.active_tab().panes[0].id, app.active_tab().panes[1].id);
+        let _ = app.update(Message::FocusPane(left));
+        assert_eq!(app.active_tab().focused, 0);
+        let _ = app.update(Message::FocusPane(right));
+        assert_eq!(app.active_tab().focused, 1);
+        assert_eq!(app.active_tab().panes[1].browser.current_dir(), Path::new("/dir"), "only focus moved");
+    }
+
     #[test]
     fn closing_the_split_keeps_the_focused_pane() {
         let mut app = app_for_test(&["/dir"]);
