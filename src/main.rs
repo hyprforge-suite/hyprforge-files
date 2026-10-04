@@ -3144,7 +3144,13 @@ impl App {
                 let _ = self.active_tab_mut().browser.update(BrowserMessage::SelectWhenListed(tab.select.clone()));
             }
         }
-        self.active = 0;
+        // The first named folder in front — but only when the command line
+        // named more than one. With nothing named the tabs are last time's,
+        // and the one in front is the one that was; putting the first back
+        // in front regardless undid that and then saved it.
+        if start.tabs.len() > 1 {
+            self.active = 0;
+        }
         if start.properties {
             let outcome = self.tabs[0].browser.update(BrowserMessage::ToggleProperties);
             tasks.push(self.handle_outcome(0, outcome));
@@ -5594,6 +5600,16 @@ mod tests {
 
     /// One tab per given directory, ids `0..n`, `next_tab_id` past the
     /// last one — the shape `main()` builds, minus the real I/O.
+    /// Restored tabs keep the one that was in front: with nothing named
+    /// on the command line, the start-up tabs step leaves `active` alone.
+    #[test]
+    fn a_restored_session_keeps_the_tab_that_was_in_front() {
+        let mut app = app_for_test(&["/a", "/b", "/c"]);
+        app.active = 2;
+        let _ = app.open_start_tabs(Vec::new(), &hyprforge_files::start::Start::default());
+        assert_eq!(app.active, 2);
+    }
+
     pub(super) fn app_for_test(dirs: &[&str]) -> App {
         let tabs: Vec<Tab> =
             dirs.iter().enumerate().map(|(id, dir)| Tab::new(id as u64, browser_at(dir))).collect();
