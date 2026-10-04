@@ -471,7 +471,7 @@ impl Dialog {
                     Message::Browser(BrowserMessage::ColumnLoaded(dir.clone(), result))
                 })
             })),
-            Outcome::RevealFocused => iced::advanced::widget::operate(hyprforge_files_core::reveal::Reveal::new()),
+            Outcome::RevealFocused(row) => iced::advanced::widget::operate(hyprforge_files_core::reveal::Reveal::new(row)),
             Outcome::SnapTo { id, y } => {
                 iced::widget::operation::snap_to(id, iced::widget::operation::RelativeOffset { x: None, y: Some(y) })
             }

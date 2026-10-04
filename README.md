@@ -70,6 +70,18 @@ few seconds while it is shown, and only then. The window **reopens on
 last time's tabs**, skipping any folder that has gone, unless it was
 started on a folder of its own. Both are switches in Preferences.
 
+**Split view** is per tab: F3 puts a second listing beside the first,
+at the same folder, and F3 again closes the one you are not in. Each
+pane has its own path bar, history and selection; the left one keeps
+the sidebar and the toolbar, and the one with the keyboard has the
+accent across its top. A click chooses a pane, and so does Tab when no
+text field has it. **Copy to Other Pane** and **Move to Other Pane**, in
+the file and folder menus and the Ctrl+K palette, are the paste a
+Ctrl+V over there would make — conflicts asked, the queue showing it,
+Ctrl+Z taking it back — without touching the clipboard. Split tabs come
+back split when the window reopens on last time's tabs, and Preferences
+can open every new tab split.
+
 **Recent and Starred** head the sidebar's Places. Recent is the
 desktop's own list, `~/.local/share/recently-used.xbel` — what was opened
 lately by Files *and* by every GTK application and the portal — newest
@@ -149,7 +161,9 @@ talking to UDisks2 and gvfs is `hyprforge-volumes`'. Quick Look's
 requests are coalesced by `quicklook.rs`, so a held arrow key decodes
 only the picture it stops on. Keeping the folders on screen up to date is
 `watch.rs`, over inotify, and the tabs reopened at startup are
-`session.rs` — both the window's alone.
+`session.rs` — both the window's alone. So are split tabs' panes: the
+browser is told only whether there is another pane, and draws itself
+bare (`Chrome::Bare`) when it is the second.
 
 ## Installing
 

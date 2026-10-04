@@ -231,10 +231,8 @@ impl App {
                 let go = self.update(Message::Browser(BrowserMessage::Navigate(folder)));
                 // After the navigation, which sets its own selection when
                 // it goes up a level and would replace this one.
-                let active = self.active;
-                self.tabs[active]
-                    .browser
-                    .update(BrowserMessage::AfterListing { path, rename: false });
+                let at = self.focused();
+                self.pane_mut(at).browser.update(BrowserMessage::AfterListing { path, rename: false });
                 go
             }
             TransfersMessage::Retry(id) => match self.transfers.history.take_retry(id) {
@@ -1044,13 +1042,13 @@ mod tests {
         let _ = app.update(Message::Transfers(TransfersMessage::Toggle));
         let _ = app.update(Message::KeyPressed(ctrl_k));
         assert!(!app.transfers.is_open());
-        assert!(app.tabs[0].browser.menu_overlay(FontScale::default(), (900.0, 600.0)).is_some(), "the palette opened");
+        assert!(app.tabs[0].browser().menu_overlay(FontScale::default(), (900.0, 600.0)).is_some(), "the palette opened");
 
         let mut app = app_for_test(&["/dir"]);
         let _ = app.update(Message::Transfers(TransfersMessage::ShowQueue));
         let _ = app.update(Message::KeyPressed(ctrl_k));
         assert_eq!(app.transfers.open, Panel::Queue);
-        assert!(app.tabs[0].browser.menu_overlay(FontScale::default(), (900.0, 600.0)).is_none());
+        assert!(app.tabs[0].browser().menu_overlay(FontScale::default(), (900.0, 600.0)).is_none());
     }
 
     #[test]
@@ -1186,6 +1184,6 @@ mod tests {
         let _ = app.update(Message::Transfers(TransfersMessage::ShowQueue));
         let _ = app.update(Message::Transfers(TransfersMessage::Show(PathBuf::from("/dir/sub/copy.txt"))));
         assert!(!app.transfers.is_open());
-        assert_eq!(app.tabs[0].browser.current_dir(), Path::new("/dir/sub"));
+        assert_eq!(app.tabs[0].browser().current_dir(), Path::new("/dir/sub"));
     }
 }

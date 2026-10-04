@@ -4,7 +4,21 @@
 //! ```toml
 //! tabs = ["/home/me/Projects/hyprforge", "/home/me/Downloads"]
 //! active = 1
+//!
+//! [[split]]
+//! tab = 1
+//! second = "/home/me/Pictures"
+//! focused = 1
 //! ```
+//!
+//! A split tab is its `tabs` entry — the left pane's folder — and a
+//! `[[split]]` naming its right pane and which of the two had the
+//! keyboard. Kept beside the list rather than inside it, so a file from
+//! before split view (no `[[split]]` at all) reads as it always did, and
+//! a Files from before split view reading a newer file ignores the table
+//! it does not know and restores the left panes — never refuses the
+//! file. An unsplit session writes no `[[split]]`, so the file reads as
+//! it did then too.
 //!
 //! Its own file rather than a field of `files.toml` — see
 //! `hyprforge_paths::files_session_toml_path` for why — and written
@@ -42,29 +56,72 @@ pub const CHECK_WITHIN: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Session {
-    /// Each tab's folder, left to right.
+    /// Each tab's folder, left to right — a split tab's left pane's.
     pub tabs: Vec<PathBuf>,
     /// Which of them was in front.
     pub active: usize,
+    /// The tabs that were split, in tab order — see the module doc.
+    #[serde(rename = "split", skip_serializing_if = "Vec::is_empty")]
+    pub splits: Vec<Split>,
+}
+
+/// One split tab's second pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Split {
+    /// Which of [`Session::tabs`] this is.
+    pub tab: usize,
+    /// The right pane's folder.
+    pub second: PathBuf,
+    /// Which pane had the keyboard: 0 the left, 1 the right. Anything
+    /// else, hand-written, is read as the left.
+    #[serde(default)]
+    pub focused: usize,
+}
+
+impl Session {
+    /// The split of tab `tab`, if it was split.
+    pub fn split_of(&self, tab: usize) -> Option<&Split> {
+        self.splits.iter().find(|s| s.tab == tab)
+    }
+
+    /// Every folder the session names: each tab's, then each second
+    /// pane's — what has to be checked before any of them is reopened.
+    pub fn folders(&self) -> Vec<PathBuf> {
+        self.tabs.iter().cloned().chain(self.splits.iter().map(|s| s.second.clone())).collect()
+    }
 }
 
 impl Session {
     /// The same tabs without the ones `exists` says are gone, with the
     /// one in front kept in front when it survives, and the nearest one
     /// to its left otherwise. `None` when nothing is left to restore.
+    ///
+    /// A split tab is gone only when both its panes are: one gone leaves
+    /// the tab unsplit, at the folder that is still there — the same
+    /// rule as a whole tab, one pane down.
     pub fn without_gone(&self, mut exists: impl FnMut(&Path) -> bool) -> Option<Session> {
         let mut tabs = Vec::new();
+        let mut splits = Vec::new();
         let mut active = 0;
         for (i, dir) in self.tabs.iter().enumerate() {
-            if !exists(dir) {
-                continue;
-            }
+            let first = exists(dir).then(|| dir.clone());
+            let split = self.split_of(i);
+            let second = split.filter(|s| exists(&s.second)).map(|s| s.second.clone());
+            let (kept, second) = match (first, second) {
+                (Some(first), second) => (first, second),
+                (None, Some(second)) => (second, None),
+                (None, None) => continue,
+            };
             if i <= self.active {
                 active = tabs.len();
             }
-            tabs.push(dir.clone());
+            if let Some(second) = second {
+                let focused = split.map_or(0, |s| s.focused).min(1);
+                splits.push(Split { tab: tabs.len(), second, focused });
+            }
+            tabs.push(kept);
         }
-        (!tabs.is_empty()).then_some(Session { tabs, active })
+        (!tabs.is_empty()).then_some(Session { tabs, active, splits })
     }
 }
 
@@ -124,7 +181,7 @@ pub fn starting_tabs(
         Ok(None) => return (None, None),
         Err(why) => return (None, Some(why)),
     };
-    let present = present(&session.tabs, backend, CHECK_WITHIN);
+    let present = present(&session.folders(), backend, CHECK_WITHIN);
     (session.without_gone(|dir| present.contains(dir)), None)
 }
 
@@ -214,7 +271,11 @@ mod tests {
     use hyprforge_files_core::backend::StdBackend;
 
     fn session(tabs: &[&str], active: usize) -> Session {
-        Session { tabs: tabs.iter().map(PathBuf::from).collect(), active }
+        Session { tabs: tabs.iter().map(PathBuf::from).collect(), active, splits: Vec::new() }
+    }
+
+    fn split(tab: usize, second: &str, focused: usize) -> Split {
+        Split { tab, second: PathBuf::from(second), focused }
     }
 
     #[test]
@@ -293,7 +354,7 @@ mod tests {
     fn a_path_on_the_command_line_wins_over_the_saved_session() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("files-session.toml");
-        save_to(&path, &Session { tabs: vec![dir.path().to_path_buf()], active: 0 }).unwrap();
+        save_to(&path, &Session { tabs: vec![dir.path().to_path_buf()], active: 0, splits: Vec::new() }).unwrap();
         let backend: Arc<dyn FsBackend> = Arc::new(StdBackend);
         assert_eq!(starting_tabs(true, true, &path, backend.clone()), (None, None), "argv wins");
         assert_eq!(starting_tabs(false, false, &path, backend.clone()), (None, None), "switched off");
@@ -320,5 +381,59 @@ mod tests {
         assert_eq!(kept_as(&archive.join("2024")), dir.path());
         assert_eq!(kept_as(&archive), dir.path());
         assert_eq!(kept_as(dir.path()), dir.path());
+    }
+
+    /// Both panes, and which had the keyboard, come back.
+    #[test]
+    fn a_split_tab_round_trips_through_the_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files-session.toml");
+        let saved = Session { splits: vec![split(1, "/home/me/Pictures", 1)], ..session(&["/home/me", "/home/me/Downloads"], 1) };
+        save_to(&path, &saved).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[split]]"), "{text}");
+        assert_eq!(load_from(&path), Ok(Some(saved)));
+    }
+
+    /// A file written before split view existed reads as it always did,
+    /// and an unsplit session is still written the way it was then — so a
+    /// Files from before split view reads it too.
+    #[test]
+    fn a_session_file_from_before_split_view_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files-session.toml");
+        std::fs::write(&path, "tabs = [\"/a\", \"/b\"]\nactive = 1\n").unwrap();
+        assert_eq!(load_from(&path), Ok(Some(session(&["/a", "/b"], 1))));
+        save_to(&path, &session(&["/a"], 0)).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("split"), "nothing new for an unsplit session");
+    }
+
+    /// A newer file's `[[split]]` is ignored by a reader that does not
+    /// know it — the shape of the old struct, which had no field for it.
+    #[test]
+    fn an_older_reader_ignores_the_split_rather_than_refusing_the_file() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Before {
+            tabs: Vec<PathBuf>,
+            active: usize,
+        }
+        let text = toml::to_string(&Session { splits: vec![split(0, "/c", 0)], ..session(&["/a"], 0) }).unwrap();
+        let before: Before = toml::from_str(&text).unwrap();
+        assert_eq!(before, Before { tabs: vec![PathBuf::from("/a")], active: 0 });
+    }
+
+    /// One pane's folder gone leaves the tab unsplit at the other; both
+    /// gone takes the tab, and the splits after it keep their own tabs.
+    #[test]
+    fn a_split_whose_pane_is_gone_restores_unsplit() {
+        let saved = Session {
+            splits: vec![split(0, "/gone2", 0), split(1, "/b2", 1), split(2, "/c2", 1), split(3, "/gone4", 0)],
+            ..session(&["/a", "/gone", "/c", "/gone3"], 2)
+        };
+        let restored = saved.without_gone(|d| !d.to_string_lossy().starts_with("/gone")).unwrap();
+        assert_eq!(restored.tabs, vec![PathBuf::from("/a"), PathBuf::from("/b2"), PathBuf::from("/c")]);
+        assert_eq!(restored.splits, vec![split(2, "/c2", 1)], "the third tab, still split, still focused right");
+        assert_eq!(restored.active, 2);
+        assert_eq!(restored.folders().len(), 4);
     }
 }
