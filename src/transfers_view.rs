@@ -1055,6 +1055,35 @@ mod tests {
         assert!(!app.transfers.is_open());
     }
 
+    /// The keys open what the clicks open, and the same key closes it
+    /// again — through both panels' own handling of a key, which would
+    /// otherwise reopen the popover (it lets a key act after closing)
+    /// or ignore the key (the queue view keeps the keyboard).
+    #[test]
+    fn each_transfers_key_opens_its_panel_and_the_same_key_closes_it() {
+        let press = |key: char| hyprforge_files_core::keymap::KeyPress {
+            key: hyprforge_files_core::keymap::Key::Char(key),
+            mods: hyprforge_files_core::keymap::Modifiers { ctrl: true, shift: true, ..Default::default() },
+            text: None,
+        };
+        let mut app = app_for_test(&["/dir"]);
+        let _ = app.update(Message::KeyPressed(press('y')));
+        assert_eq!(app.transfers.open, Panel::Popover);
+        let _ = app.update(Message::KeyPressed(press('y')));
+        assert_eq!(app.transfers.open, Panel::Closed, "the popover's key closes it and does not reopen it");
+
+        let _ = app.update(Message::KeyPressed(press('j')));
+        assert_eq!(app.transfers.open, Panel::Queue);
+        let _ = app.update(Message::KeyPressed(press('j')));
+        assert_eq!(app.transfers.open, Panel::Closed, "the queue view lets its own key out");
+
+        // From the popover, the queue key goes on to the view rather
+        // than only closing the popover.
+        let _ = app.update(Message::KeyPressed(press('y')));
+        let _ = app.update(Message::KeyPressed(press('j')));
+        assert_eq!(app.transfers.open, Panel::Queue);
+    }
+
     /// The overall bar, driven through the window's own loop: one job
     /// finishing does not drop it, and the batch starts again at zero
     /// once everything is done.

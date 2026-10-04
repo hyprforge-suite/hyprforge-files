@@ -2627,6 +2627,16 @@ impl App {
                 self.handle_outcome(self.active, outcome)
             }
             Action::Preferences => self.open_preferences(),
+            Action::Transfers => self.transfers_update(TransfersMessage::Toggle),
+            // A toggle like the popover's, so the key that opened the
+            // view is also the way out of it.
+            Action::TransferQueue => self.transfers_update(
+                if self.transfers.open == transfers_view::Panel::Queue {
+                    TransfersMessage::Close
+                } else {
+                    TransfersMessage::ShowQueue
+                },
+            ),
             // A browser action has no business here; `Browser::perform`
             // never hands one back. Doing nothing is the safe reading.
             _ => Task::none(),
@@ -2975,6 +2985,15 @@ impl App {
             // live: Ctrl+K opened the palette *under* the popover, and
             // the letters typed for it went to the search box instead.
             Message::KeyPressed(press) if self.transfers.is_open() => {
+                // Its own key closes what it opened. Without this the
+                // popover's "close, then let the key act" would open it
+                // straight back, and the queue view, which keeps the
+                // keyboard, would swallow the key that should leave it.
+                if let Some(Resolved::Action(action @ (Action::Transfers | Action::TransferQueue))) =
+                    self.config.keymap.resolve(&press)
+                {
+                    return self.perform_window(action);
+                }
                 let popover = self.transfers.open == transfers_view::Panel::Popover;
                 let closed = if press.key == keymap::Key::Escape || popover {
                     self.transfers_update(TransfersMessage::Close)
