@@ -252,9 +252,16 @@ a preset is a view and that view's zoom step, both already in
 `files.toml` (`view_mode`, `[zoom]`). Column view, which Explorer has
 nothing like, keeps a plain zoom from 75% to 200% and says its
 percentage when it is not at its own size. Only the listing scales: the zoom
-multiplies the `FontScale` it is drawn at, and rows, icons, names and
-grid cells all follow that already, so one multiplication sizes them
-together and the header, sidebar and status bar stay put. Ctrl+wheel
+multiplies the `FontScale` it is drawn at, so the header, sidebar and
+status bar stay put. In the list and the columns rows, icons and names
+follow that together. The grid does not, since 2026-10-04: Small to
+Extra large grow the icon and its cell and leave the name at the
+window's font size (`density::GridScale`, a text scale and an icon
+scale). The first version zoomed the names too — 30-pixel letters at
+Extra large, cut after a few words — and the person using it asked for
+Explorer's behaviour. The same check found theme icons drawn at the
+zoom *squared* (the grid scaled a size `entry_icon` then scaled again),
+which is what had been pushing names out of their cells. Ctrl+wheel
 needed a widget of its own (`hyprforge-ui`'s `wheel_zoom`): the listing
 is a scrollable, which takes the wheel before a `mouse_area` around it
 ever hears it, so the wrapper looks first and passes a plain wheel
