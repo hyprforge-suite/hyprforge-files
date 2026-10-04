@@ -1020,6 +1020,58 @@ off, the batch landing with all six selected under their new names and
 contents, and inside a zip a find & replace of two members as one
 rewrite, both left selected.
 
+## Recent and Starred — built
+
+Two sidebar rows at the top of Places, each a question rather than a
+place: keyed in `SidebarRow` the way a saved search is, never by a
+made-up path a drop or a folder menu would take at its word. Each can be
+turned off in `[sidebar]` (`show-recent`, `show-starred`) or from
+Preferences.
+
+- **Shown as results, not as a backend.** A collection's entries ride in
+  the search state as the rows (`browser/collections.rs`), so everything
+  that already works on a search's results — the Folder column, Show in
+  Folder at the head of a row's menu, selection and every action keyed by
+  path — works unchanged. The folder in view stays loaded underneath and
+  comes back on going anywhere. A refresh behind it (a rename, a paste,
+  F5) reads the collection again. Typing filters it, as it filters a
+  folder.
+- **Recent is the desktop's list**, `$XDG_DATA_HOME/recently-used.xbel`,
+  read with `quick-xml` in `files-core/src/recent.rs`: newest first, each
+  path once, capped at 200, anything that no longer exists left out
+  (looked up through the backend, at most 2,000 bookmarks). Not re-sorted
+  by the column headings — "what did I have open" is the question, and a
+  name order answers a different one. The file is read bounded (16 MB),
+  and three states stay apart: no file is first run, a file that is not
+  XML is said in the strip and the listing ("Recent couldn't be read"),
+  and a broken bookmark costs only itself.
+- **Opening a file records it** — only a launch that started, only in
+  the window (the dialog's caller opens what it chose). The edit keeps
+  every other application's bookmark as the bytes it wrote: a bookmark
+  Files touches gets new `modified`/`visited` dates in its start tag and
+  its own `<bookmark:application name="hyprforge-files">` line replaced or
+  added, and nothing else moves. Written atomically, `0600` as GTK writes
+  it; a file that will not parse is never written. Checked against
+  GLib's own `GBookmarkFile`, which reads what this writes.
+- **Clear Recent** (Preferences) removes Files' own application line from
+  every bookmark and a bookmark only Files had — never what another
+  application recorded.
+- **Stars** are `files.toml`'s `starred`, the window's one list like the
+  pins: Ctrl+Shift+D or *Star*/*Unstar* in the file and folder menus (one
+  action, whose label says which it will do; a mixed selection is starred
+  whole). Not Ctrl+D, which Pin already holds. The mark is a drawn star
+  (`hyprforge_ui::glyph::star`) on the corner of a starred row's icon and
+  a grid cell, so the name and columns stay where every other row has
+  them. Saved by applying the change to the list on disk, not by writing
+  the window's copy over it.
+- **A star follows a move made in Files** — a rename, a bulk rename, a
+  cut and paste, a folder moved with stars inside it, and an undo of any
+  of them once it has gone through. Nothing else tells the window a file
+  moved, so a star whose file went some other way stays, and the Starred
+  view says how many cannot be found, with *Unstar them*.
+- **The open/save dialog** shows both, read-only, the way GTK's chooser
+  offers Recent; it records nothing.
+
 ## Deferred, and what that costs
 
 Named so nothing here is mistaken for an oversight:

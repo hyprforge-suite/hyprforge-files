@@ -58,6 +58,17 @@ gvfs's and the kernel's, and **Connect to Server** mounts an `smb://`,
 password when the server wants one. UDisks2 not running, or gvfs not
 installed, is said in the sidebar or the dialog rather than hidden.
 
+**Recent and Starred** head the sidebar's Places. Recent is the
+desktop's own list, `~/.local/share/recently-used.xbel` — what was opened
+lately by Files *and* by every GTK application and the portal — newest
+first, with anything since deleted left out; a file Files opens is added
+to it, with every other application's entries kept as they were written.
+Star anything with Ctrl+Shift+D or from its menu; a star follows the
+file through a rename or a move made in Files, and one whose file has
+gone is said, with a way to clear it. Both show the way a search's
+results do, with a Folder column and Show in Folder. Preferences hides
+either row and clears what Files added to Recent — only that.
+
 Copies, moves and archive work run in the background through a
 **queue**: a control in the tab strip shows overall progress, its
 popover lists each job with its rate and estimate and why a waiting one
