@@ -617,15 +617,24 @@ impl Preferences {
                 toggle(prefs.restore_tabs, scale).on_toggle(|on| Message::Browsing(Setting::RestoreTabs(on))),
                 scale,
             ),
+            // The toggle only: which pane Copy to Other Pane goes to needs
+            // no setting, because a split has exactly one other pane.
             setting_row(
                 1,
+                "Open new tabs split",
+                Some(hint_text("Two folders side by side. F3 splits or unsplits any tab.", scale).into()),
+                toggle(prefs.split_new_tabs, scale).on_toggle(|on| Message::Browsing(Setting::SplitNewTabs(on))),
+                scale,
+            ),
+            setting_row(
+                2,
                 "Update folders as they change",
                 Some(hint_text("Off, a folder shows what other programs did only when you press F5.", scale).into()),
                 watch,
                 scale,
             ),
             setting_row(
-                2,
+                3,
                 "Check network folders every",
                 Some(
                     hint_text("A share can't say when someone else changes it, so it is asked while it is shown.", scale)
@@ -985,6 +994,19 @@ mod tests {
         assert_eq!(
             sheet.update(Message::Browsing(Setting::RestoreTabs(false)), &config),
             Effect::Adopt(Setting::RestoreTabs(false))
+        );
+    }
+
+    /// Opening new tabs split is the window's own state, in `files.toml`
+    /// beside restoring tabs: every tab adopts it, and nothing is written
+    /// to `files-config.toml`. That the switch writes exactly its line of
+    /// `files.toml` is `hyprforge_files_core::preferences`'s test.
+    #[test]
+    fn opening_new_tabs_split_is_adopted_by_the_window_like_restoring_tabs() {
+        let mut sheet = ready();
+        assert_eq!(
+            sheet.update(Message::Browsing(Setting::SplitNewTabs(true)), &Config::default()),
+            Effect::Adopt(Setting::SplitNewTabs(true))
         );
     }
 

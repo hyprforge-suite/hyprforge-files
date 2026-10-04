@@ -7,7 +7,7 @@
 //! is mounted in `hyprforge-volumes`, the dialog's phases in
 //! `hyprforge_files::connect`. This is the window's wiring between them.
 
-use super::{dialog, App, BrowserMessage, Message};
+use super::{dialog, App, At, BrowserMessage, Message};
 use hyprforge_files::connect::{hint, ConnectDialog, Phase};
 use hyprforge_files::devices::{Done, Event};
 use hyprforge_files_core::devices::Ask;
@@ -53,14 +53,14 @@ fn password_id() -> Id {
 }
 
 impl App {
-    /// Hands every tab the window's drives as they now are, and asks
+    /// Hands every pane the window's drives as they now are, and asks
     /// for whatever icons the change needs.
     pub(super) fn broadcast_devices(&mut self) -> Task<Message> {
         let snapshot = self.devices.snapshot();
         let mut tasks = Vec::new();
-        for index in 0..self.tabs.len() {
-            let outcome = self.tabs[index].browser.update(BrowserMessage::DevicesChanged(snapshot.clone()));
-            tasks.push(self.handle_outcome(index, outcome));
+        for at in self.every_pane() {
+            let outcome = self.pane_mut(at).browser.update(BrowserMessage::DevicesChanged(snapshot.clone()));
+            tasks.push(self.handle_outcome(at, outcome));
         }
         Task::batch(tasks)
     }
@@ -74,26 +74,26 @@ impl App {
         Task::batch([self.broadcast_devices(), self.leave(gone)])
     }
 
-    /// Sends every tab standing on one of `gone` home. A tab on a drive
+    /// Sends every pane standing on one of `gone` home. A pane on a drive
     /// that has just been unmounted, ejected or pulled out would be
     /// showing files that are not there; home is where a pin to a
     /// vanished folder would have nowhere better to send it either.
     fn leave(&mut self, gone: Vec<PathBuf>) -> Task<Message> {
         let mut tasks = Vec::new();
-        for index in 0..self.tabs.len() {
-            if gone.iter().any(|g| self.tabs[index].browser.current_dir().starts_with(g)) {
+        for at in self.every_pane() {
+            if gone.iter().any(|g| self.pane(at).browser.current_dir().starts_with(g)) {
                 let home = self.home_dir.clone();
-                let outcome = self.tabs[index].browser.update(BrowserMessage::Navigate(home));
-                tasks.push(self.handle_outcome(index, outcome));
+                let outcome = self.pane_mut(at).browser.update(BrowserMessage::Navigate(home));
+                tasks.push(self.handle_outcome(at, outcome));
             }
         }
         Task::batch(tasks)
     }
 
-    /// A tab asked for a drive to be mounted, unmounted or ejected, or a
-    /// share disconnected.
-    pub(super) fn ask_devices(&mut self, tab_index: usize, ask: Ask) -> Task<Message> {
-        let tab = self.tabs[tab_index].id;
+    /// A pane asked for a drive to be mounted, unmounted or ejected, or a
+    /// share disconnected. A mount opens in the pane that asked.
+    pub(super) fn ask_devices(&mut self, at: At, ask: Ask) -> Task<Message> {
+        let tab = self.pane(at).id;
         match self.devices.ask(ask, tab) {
             Some(work) => Task::batch([self.broadcast_devices(), Task::perform(work, Message::DeviceDone)]),
             None => Task::none(),
@@ -107,9 +107,9 @@ impl App {
             self.status = Some(status);
         }
         if let Some((tab, point)) = finished.open {
-            if let Some(index) = self.tab_index(tab) {
-                let outcome = self.tabs[index].browser.update(BrowserMessage::Navigate(point));
-                tasks.push(self.handle_outcome(index, outcome));
+            if let Some(at) = self.locate(tab) {
+                let outcome = self.pane_mut(at).browser.update(BrowserMessage::Navigate(point));
+                tasks.push(self.handle_outcome(at, outcome));
             }
         }
         tasks.push(self.leave(finished.left.into_iter().collect()));
@@ -169,8 +169,9 @@ impl App {
                 let refresh = Task::perform(async move { shares.shares().await }, |s| Message::Devices(Event::Shares(s)));
                 let go = match path {
                     Some(path) => {
-                        let outcome = self.active_tab_mut().browser.update(BrowserMessage::Navigate(path));
-                        self.handle_outcome(self.active, outcome)
+                        let at = self.focused();
+                        let outcome = self.pane_mut(at).browser.update(BrowserMessage::Navigate(path));
+                        self.handle_outcome(at, outcome)
                     }
                     None => {
                         self.status = Some("Connected. This server has no folder to show on its own.".to_string());
@@ -328,7 +329,7 @@ mod tests {
         let (mut app, _, _) = app_with(vec![stick("A", None)]);
         let _ = app.update(Message::Browser(BrowserMessage::Device(DeviceMessage::Open(VolumeId("/b/A".into())))));
         for tab in &app.tabs {
-            let devices = tab.browser.devices();
+            let devices = tab.browser().devices();
             assert!(matches!(devices.volumes, Listing::Listed(ref v) if v.len() == 1));
             assert_eq!(devices.busy.get(&VolumeId("/b/A".into())), Some(&Operation::Mount));
         }
@@ -346,8 +347,8 @@ mod tests {
             op: Operation::Mount,
             result: Ok(Some("/run/media/alex/A".into())),
         }));
-        assert_eq!(app.tabs[1].browser.current_dir(), Path::new("/run/media/alex/A"));
-        assert_eq!(app.tabs[0].browser.current_dir(), Path::new("/home/alex"));
+        assert_eq!(app.tabs[1].browser().current_dir(), Path::new("/run/media/alex/A"));
+        assert_eq!(app.tabs[0].browser().current_dir(), Path::new("/home/alex"));
         assert!(app.status.is_none());
     }
 
@@ -373,7 +374,7 @@ mod tests {
             op: Operation::Eject,
             result: Ok(None),
         }));
-        assert_eq!(app.tabs[0].browser.current_dir(), Path::new("/home/alex"));
+        assert_eq!(app.tabs[0].browser().current_dir(), Path::new("/home/alex"));
         assert!(app.status.as_deref().unwrap().contains("can be removed"));
     }
 
@@ -383,8 +384,8 @@ mod tests {
         let (mut app, _, _) = app_with(vec![stick("A", Some("/run/media/alex/A"))]);
         let _ = app.update(Message::Browser(BrowserMessage::Navigate("/run/media/alex/A".into())));
         let _ = app.update(Message::Devices(Event::Volumes(Ok(vec![]))));
-        assert_eq!(app.tabs[0].browser.current_dir(), Path::new("/home/alex"));
-        assert_eq!(app.tabs[1].browser.current_dir(), Path::new("/home/alex"));
+        assert_eq!(app.tabs[0].browser().current_dir(), Path::new("/home/alex"));
+        assert_eq!(app.tabs[1].browser().current_dir(), Path::new("/home/alex"));
     }
 
     #[test]
@@ -423,6 +424,6 @@ mod tests {
         let _ = app.update(Message::Connect(ConnectMessage::Submit));
         let _ = app.update(Message::Connect(ConnectMessage::Ended(Ok(Some("/run/user/1/gvfs/sftp:host=box".into())))));
         assert!(app.connecting.is_none());
-        assert_eq!(app.active_tab().browser.current_dir(), Path::new("/run/user/1/gvfs/sftp:host=box"));
+        assert_eq!(app.active_tab().browser().current_dir(), Path::new("/run/user/1/gvfs/sftp:host=box"));
     }
 }

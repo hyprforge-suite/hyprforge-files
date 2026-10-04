@@ -410,7 +410,10 @@ sidebar's. With nothing selected it describes the folder in view.
 
 - **One docked panel at a time.** It takes the preview pane's slot.
   Two panels would leave the listing a strip and show the same facts
-  twice. Closing it brings the pane back as it was, and asking for the
+  twice. (This is about panels *beside* a listing. Split view, below,
+  puts two *listings* side by side, each with at most one panel of its
+  own; it reverses nothing here, because two listings are not the same
+  facts shown twice.) Closing it brings the pane back as it was, and asking for the
   preview while it is open swaps them back. Unlike the pane it never
   steps aside on a narrow window: it was asked for, so the listing
   gives way down to its floor.
@@ -1377,7 +1380,8 @@ The open/save dialog does not watch: it is open for seconds, and its
 listing is read when it opens.
 
 **The window reopens on last time's tabs** (`session.rs`), from
-`files-session.toml` — `{ tabs, active }`, written atomically 400ms after
+`files-session.toml` — `{ tabs, active }`, and a `[[split]]` per split
+tab (see Split view below), written atomically 400ms after
 the tabs stop changing, the way the window size is, and at once when the
 last tab is closed, since the process ends before any timer could fire.
 Its own file rather than a field of `files.toml`, because that one is
@@ -1486,6 +1490,69 @@ Save stays off until it is right. It writes one `[[action]]` block at a
 time with `toml_edit`'s array of tables, found by id rather than by
 position, so a block someone added above it in an editor is not the one
 changed, and the comments in and around a block survive its edit.
+
+## Split view — built
+
+Per tab, toggled with F3, which is what was asked for: a split is a way
+of working on two folders, and the tab is the unit someone works in, so
+the tab beside it can stay one listing.
+
+- **A tab holds one or two panes** (`Tab`, `Pane` in `main.rs`). A pane
+  is a `Browser` and what the window keeps beside it — read generation,
+  path bar resolve, search walk — so everything that was per tab is per
+  pane. Every async answer is keyed by the pane's id, never "the browser
+  in front": a split tab has two in front, and thumbnails for the left
+  pane arriving in the right one is exactly the bug that keying on
+  "active" would make. `Message::Answer` carries what used to arrive as
+  a bare browser message — thumbnails, icons, counts, column panes,
+  Recent and Starred, Quick Look — and never moves the keyboard.
+- **Keys go to the focused pane only.** A click in a pane gives it the
+  keyboard (`Message::Pane`, which every pane's view sends) and puts
+  down whatever was open in the one left — its menu, path bar, rename,
+  palette, Quick Look. Tab moves across, but only after asking the layout
+  whether a text field has the keyboard (`field_focus`): Tab in the search
+  field is the field's, and leaving the pane would strand its focus.
+- **Widget ids are per browser** (`Browser::instance`, a process-wide
+  number never reused). The focused row's reveal tag, every drop target
+  and the column panes' scrollables were derived from a path or a fixed
+  string — enough while one browser was on screen, wrong with two at one
+  folder. The drop hit test now takes both panes' targets and answers
+  with the pane as well as the folder, so a drag lights the row in the
+  pane it is over, and only there.
+- **Each pane gets its own width**, half the window, because what the
+  width decides — the sidebar collapsing, the list scrolling sideways —
+  is about the room a listing has. The second pane is drawn bare
+  (`Chrome::Bare`): its own path bar, and the search field only while a
+  query is under way there, no sidebar or toolbar. One of each per
+  window is the design; two at half width would be two windows squeezed
+  into one. The focused pane has a two-pixel strip of the accent across
+  its top — drawn in both, in the header's plane when unfocused, so
+  choosing a pane never shifts a listing.
+- **F3 again closes the pane without the keyboard.** Opening leaves the
+  keyboard where it was, so F3 twice is a no-op, and closing never takes
+  away the folder being worked in.
+- **Copy and Move to Other Pane** (menu and palette; F5 is Refresh here,
+  so the two-pane managers' F5/F6 are not taken) go through
+  `paste_into` with a clip of their own: conflicts, the queue, undo,
+  stars following a move, and the refresh of both folders all come with
+  it. The system clipboard is not touched. The browser is told only
+  whether there is another pane (`set_other_pane`), like `can_paste`, so
+  the open/save dialog — which never says so — never offers them. Not
+  out of an archive (a member's path is nothing a copy can read); not a
+  move out of the Trash.
+- **The watcher and the session cover both panes.** The watch is keyed
+  on every pane's folder. `files-session.toml` keeps a split as
+  `[[split]] tab, second, focused` beside the unchanged `tabs` list, so
+  a file from before split view loads as it did, an unsplit session is
+  written exactly as before, and an older Files ignores the table rather
+  than refusing the file. A gone right pane restores the tab unsplit; a
+  gone left one restores it at the right one's folder.
+- **"Open new tabs split"** in Preferences is `split_new_tabs` in
+  `files.toml`, off by default. It applies to tabs opened from then on,
+  and to the window's first tab when it is not reopening last time's;
+  restored tabs come back as they were saved.
+
+Not built: dragging the divider. The halves are equal.
 
 ## What to verify, not assume
 

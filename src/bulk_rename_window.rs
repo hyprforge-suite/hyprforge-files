@@ -18,7 +18,7 @@
 //!   No undo, for the reason `hyprforge_files_core::undo` gives for every
 //!   archive edit.
 
-use super::{App, Message};
+use super::{App, At, Message};
 use hyprforge_files::bulk_rename::{self, BulkRename, Effect};
 use hyprforge_files_core::browser::Message as BrowserMessage;
 use hyprforge_files_core::bulk_rename::Request;
@@ -46,10 +46,10 @@ pub(super) fn sheet_key(press: &hyprforge_files_core::keymap::KeyPress) -> Optio
 }
 
 impl App {
-    /// Opens the sheet over `request`, for the tab at `tab_index`.
-    pub(super) fn open_bulk_rename(&mut self, tab_index: usize, request: Request) -> Task<Message> {
+    /// Opens the sheet over `request`, for the pane at `at`.
+    pub(super) fn open_bulk_rename(&mut self, at: At, request: Request) -> Task<Message> {
         let (sheet, field) = BulkRename::new(request);
-        self.bulk_rename = Some((self.tabs[tab_index].id, sheet));
+        self.bulk_rename = Some((self.pane(at).id, sheet));
         iced::widget::operation::focus(field)
     }
 
@@ -76,9 +76,9 @@ impl App {
                 self.status = Some("Those names can't be used inside this archive.".to_string());
                 return Task::none();
             };
-            if let Some(index) = self.tab_index(tab_id) {
+            if let Some(at) = self.locate(tab_id) {
                 let renamed = renames.into_iter().map(|(_, to)| to).collect();
-                self.tabs[index].browser.update(BrowserMessage::SelectWhenListed(renamed));
+                self.pane_mut(at).browser.update(BrowserMessage::SelectWhenListed(renamed));
             }
             return self.start_archive_job(hyprforge_files::archive_jobs::Work::Edit { archive, edits });
         }
@@ -124,13 +124,13 @@ impl App {
         if !done.is_empty() {
             tasks.push(self.record(hyprforge_files_core::undo::Undoable::RenamedAll(done.clone())));
         }
-        if let Some(index) = self.tab_index(tab_id) {
+        if let Some(at) = self.locate(tab_id) {
             let renamed: Vec<PathBuf> = done.into_iter().map(|(_, to)| to).collect();
             if !renamed.is_empty() {
-                self.tabs[index].browser.update(BrowserMessage::SelectWhenListed(renamed));
+                self.pane_mut(at).browser.update(BrowserMessage::SelectWhenListed(renamed));
             }
-            let dir = self.tabs[index].browser.current_dir().to_path_buf();
-            tasks.push(self.spawn_read_dir(index, dir));
+            let dir = self.pane(at).browser.current_dir().to_path_buf();
+            tasks.push(self.spawn_read_dir(at, dir));
         }
         Task::batch(tasks)
     }

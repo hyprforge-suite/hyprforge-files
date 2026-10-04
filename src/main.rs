@@ -206,13 +206,14 @@ fn main() -> iced::Result {
         backend.clone(),
     );
     let prefs_status = [prefs_status, session_status].into_iter().flatten().reduce(|a, b| format!("{a} \u{00B7} {b}"));
-    let (start_dir, more_tabs, restored_active) = match restored {
+    let was_restored = restored.is_some();
+    let (start_dir, more_tabs, restored_active, restored_splits) = match restored {
         Some(session) => {
             let mut tabs = session.tabs.into_iter();
             let first = tabs.next().expect("a restored session has at least one tab");
-            (first, tabs.collect::<Vec<_>>(), session.active)
+            (first, tabs.collect::<Vec<_>>(), session.active, session.splits)
         }
-        None => (start_dir, Vec::new(), 0),
+        None => (start_dir, Vec::new(), 0, Vec::new()),
     };
     let (mut browser, outcome) =
         Browser::new(Mode::App, prefs.clone(), start_dir, sidebar_items.clone());
@@ -288,13 +289,26 @@ fn main() -> iced::Result {
     // What every browser asks for thumbnails of, by type: the MIME
     // database just loaded, and the thumbnailers installed here.
     hyprforge_files::preview::install_thumbnail_types(app.mime.clone());
-    let first_read = app.handle_outcome(0, outcome);
-    // The rest of last time's tabs, then the one that was in front put
-    // back in front — `open_tab` brings each new one forward.
-    let restoring: Vec<Task<Message>> = more_tabs.into_iter().map(|dir| app.open_tab(dir)).collect();
+    app.tabs[0].browser_mut().set_type_of(hyprforge_files::launch::type_of(app.mime.clone()));
+    let first_read = app.handle_outcome(At { tab: 0, pane: 0 }, outcome);
+    // The rest of last time's tabs, then each split put back as it was,
+    // then the one that was in front put back in front — `add_tab` brings
+    // each new one forward. `add_tab`, not `open_tab`: a tab saved
+    // unsplit comes back unsplit, whatever "open new tabs split" says now.
+    let mut restoring: Vec<Task<Message>> = more_tabs.into_iter().map(|dir| app.add_tab(dir)).collect();
+    for split in restored_splits {
+        if split.tab < app.tabs.len() {
+            restoring.push(app.open_second_pane(split.tab, split.second));
+            app.tabs[split.tab].focused = split.focused.min(1);
+        }
+    }
+    // A window not reopening last time's tabs opens a new one — split,
+    // if that is how new tabs open.
+    if !was_restored && app.last_prefs.split_new_tabs {
+        restoring.push(app.toggle_split(0));
+    }
     app.active = restored_active.min(app.tabs.len() - 1);
     app.session = hyprforge_files::session::Keeper::new(Some(session_path), app.session_now());
-    app.tabs[0].browser.set_type_of(hyprforge_files::launch::type_of(app.mime.clone()));
     // What the command line named beyond the first folder: what to select
     // in it, the other folders as tabs of their own, and Properties —
     // see `hyprforge_files::start`. Never both this and a restore: tabs
@@ -374,20 +388,40 @@ fn run_file_manager1(args: Vec<std::ffi::OsString>) -> ! {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Message {
+    /// For the pane that has the keyboard, in the tab in front — what a
+    /// key resolves against. The view never sends this: what it sends
+    /// says which pane it came from ([`Message::Pane`]).
     Browser(BrowserMessage),
+    /// A click, a scroll-zoom or a field edit in one pane's view: the
+    /// pane's id (see [`Pane::id`]), and what it said. Gives that pane
+    /// the keyboard first — clicking a pane is how one is chosen — then
+    /// goes where [`Message::Browser`] would.
+    Pane(u64, BrowserMessage),
+    /// An answer for the pane with this id, worked out off the UI thread
+    /// — thumbnails, icons, folder counts, Recent and Starred, Quick
+    /// Look. Never moves the keyboard: an answer arriving is not the
+    /// person choosing a pane. By id rather than "whichever pane is in
+    /// front", because a split tab has two in front and an answer that
+    /// went to the focused one would put the left pane's thumbnails in
+    /// the right pane.
+    Answer(u64, BrowserMessage),
     /// A key nobody else took — resolved in `update` against
     /// [`App::keymap`], which is state a subscription closure cannot see.
     KeyPressed(keymap::KeyPress),
-    /// The tab a directory read was issued for, the generation it was
+    /// The pane a directory read was issued for, the generation it was
     /// issued under, the directory it was for, and what came back — see
-    /// the module doc's note on `read_generation`, and [`Tab`]'s own doc
-    /// for why the guard is per-tab rather than per-window now that a
-    /// window can have several reads in flight at once, one per tab.
+    /// the module doc's note on `read_generation`, and [`Pane`]'s own doc
+    /// for why the guard is per-pane rather than per-window now that a
+    /// window can have several reads in flight at once, one per pane.
+    ///
+    /// Every message below that carries a `u64` "for the tab that asked"
+    /// carries a [`Pane::id`]: the browser that asked is a pane, and a
+    /// split tab has two.
     DirLoaded(u64, u64, PathBuf, Result<Vec<Entry>, DirError>),
-    /// Where a tab's path bar text could go: the tab, the text it
+    /// Where a pane's path bar text could go: the pane, the text it
     /// answers, and the answers.
     PathResolved(u64, String, Vec<hyprforge_files_core::jump::Candidate>),
-    /// What a tab's search below a folder found, or how it ended.
+    /// What a pane's search below a folder found, or how it ended.
     Searched(u64, hyprforge_files::search_jobs::Event),
     /// The tab a trash operation was started from, the directory to
     /// refresh, and what (if anything) failed.
@@ -495,9 +529,9 @@ enum Message {
     DragUnpacked(Result<(), String>),
     /// A drag over the window — see `dnd`.
     Dnd(hyprforge_files::dnd::DropEvent),
-    /// Which folder a point is over, as the layout answered — and, for a
-    /// drop, what was dropped there.
-    DropHit(Option<PathBuf>, Option<hyprforge_files_core::drop::DropFrom>),
+    /// Which folder a point is over, in which pane, as the layout
+    /// answered — and, for a drop, what was dropped there.
+    DropHit(Option<(u64, PathBuf)>, Option<hyprforge_files_core::drop::DropFrom>),
     /// What a drop turned out to mean, once the filesystems were asked.
     DropPlanned(hyprforge_files_core::drop::DropPlan),
     /// A finished restore removed the records of what it put back.
@@ -551,9 +585,6 @@ enum Message {
     /// A bulk rename finished: the tab it was asked from, and what was
     /// renamed — or where a failure left everything.
     BulkRenamed(u64, Result<Vec<(PathBuf, PathBuf)>, Box<hyprforge_fileops::batch::Failure>>),
-    /// An answer for the browser of the tab with this id — Recent or
-    /// Starred, read off the UI thread.
-    Collected(u64, BrowserMessage),
     /// Opening a file was recorded in Recent, or could not be.
     RecentRecorded(Result<(), String>),
     /// Preferences' Clear Recent finished: how many files it forgot.
@@ -568,28 +599,32 @@ enum Message {
     DeviceDone(hyprforge_files::devices::Done),
     /// The Connect to Server dialog — see `devices_view`.
     Connect(ConnectMessage),
+    /// Move the keyboard to the other pane of the split tab in front —
+    /// Tab, once the layout has said no text field is holding it.
+    OtherPane,
 }
 
-/// One open directory tree view, with the state that makes it a tab
-/// rather than a window-wide value someone reopens by accident: its own
-/// [`Browser`] (directory, selection, back/forward history all live
-/// inside that), and its own read-generation counter.
+/// One listing: a [`Browser`] (directory, selection, back/forward
+/// history all live inside that) and the state the window keeps beside
+/// it. A tab has one, or two when it is split — see [`Tab`].
 ///
-/// `id` is a value distinct from this tab's position in `App::tabs` —
-/// closing an earlier tab shifts every later one's position, and an
-/// async `DirLoaded`/`TrashDone` result must still find the *same* tab
-/// it was issued for, not whatever now sits at the index it remembers.
-/// See [`App::tab_index`].
-struct Tab {
+/// `id` is a value distinct from this pane's position — closing an
+/// earlier tab shifts every later one's position, closing a split shifts
+/// the right pane to the left, and an async `DirLoaded`/`TrashDone`
+/// result must still find the *same* pane it was issued for, not
+/// whatever now sits at the place it remembers. See [`App::locate`].
+/// Drawn from the same counter as tab ids, so no pane id is ever another
+/// pane's or reused.
+struct Pane {
     id: u64,
     browser: Browser,
-    /// Stamped on every read this tab issues, and checked against on
+    /// Stamped on every read this pane issues, and checked against on
     /// return — the same generation guard the window used to keep for
-    /// itself, now kept per tab so a slow read racing a fast one in tab 2
-    /// cannot land in tab 1, or vice versa: each tab's counter only ever
-    /// advances for reads *that tab* asked for.
+    /// itself, now kept per pane so a slow read racing a fast one in one
+    /// pane cannot land in another, or vice versa: each pane's counter
+    /// only ever advances for reads *that pane* asked for.
     read_generation: u64,
-    /// Whether a path bar resolve is out for this tab.
+    /// Whether a path bar resolve is out for this pane.
     resolving: bool,
     /// The newest resolve asked for while one was out. Only the newest:
     /// each keystroke is "look again", not a job of its own, so a burst
@@ -598,15 +633,73 @@ struct Tab {
     /// draws from the video player's queue, which grew for as long as a
     /// video played because it did work per signal.
     resolve_next: Option<hyprforge_files_core::jump::Request>,
-    /// This tab's search below a folder — one walk at a time, the newest
-    /// winning. See `hyprforge_files::search_jobs`.
+    /// This pane's search below a folder — one walk at a time, the
+    /// newest winning. See `hyprforge_files::search_jobs`.
     searcher: hyprforge_files::search_jobs::Searcher,
+}
+
+impl Pane {
+    fn new(id: u64, browser: Browser) -> Pane {
+        Pane { id, browser, read_generation: 0, resolving: false, resolve_next: None, searcher: Default::default() }
+    }
+}
+
+/// One tab: one listing, or two side by side when it is split (F3).
+///
+/// Split per tab rather than per window, which is what the person asked
+/// for: a split is a way of working on two folders, and a tab is the unit
+/// someone works in — the tab beside it can stay one listing. `panes` is
+/// never empty and never longer than two; `focused` is which of them has
+/// the keyboard, and is always in range.
+///
+/// A tab has no id of its own: everything that outlives a message —
+/// a read, a rename, a search — was asked for by a listing, and names
+/// that listing's pane ([`Pane::id`]). The number a tab is opened with
+/// becomes its first pane's.
+struct Tab {
+    panes: Vec<Pane>,
+    focused: usize,
 }
 
 impl Tab {
     fn new(id: u64, browser: Browser) -> Tab {
-        Tab { id, browser, read_generation: 0, resolving: false, resolve_next: None, searcher: Default::default() }
+        Tab { panes: vec![Pane::new(id, browser)], focused: 0 }
     }
+
+    /// The pane with the keyboard.
+    fn pane(&self) -> &Pane {
+        &self.panes[self.focused]
+    }
+
+    fn pane_mut(&mut self) -> &mut Pane {
+        &mut self.panes[self.focused]
+    }
+
+    /// The listing with the keyboard — what a tab *is*, for everything
+    /// that does not care whether it is split: its title, its name on the
+    /// tab strip, what a window action acts on.
+    fn browser(&self) -> &Browser {
+        &self.pane().browser
+    }
+
+    fn browser_mut(&mut self) -> &mut Browser {
+        &mut self.pane_mut().browser
+    }
+
+    fn is_split(&self) -> bool {
+        self.panes.len() > 1
+    }
+}
+
+/// Where a pane is right now: its tab's position in `App::tabs`, and its
+/// own in that tab's `panes`. Positions, so good only until the next
+/// message changes them — anything that outlives one (an async answer)
+/// carries the pane's [`Pane::id`] and is found again with
+/// [`App::locate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct At {
+    tab: usize,
+    pane: usize,
 }
 
 /// Where "close the tab at `closed_index`" leaves things, decided as
@@ -851,7 +944,8 @@ struct App {
 struct PendingConfirm {
     removal: Removal,
     paths: Vec<PathBuf>,
-    tab_id: u64,
+    /// The pane it was asked from — see [`Pane::id`].
+    pane_id: u64,
     dir: PathBuf,
 }
 
@@ -1508,36 +1602,63 @@ impl App {
         &mut self.tabs[self.active]
     }
 
-    /// The position of the tab with this id, if it's still open. `None`
-    /// for a `DirLoaded`/`TrashDone` that outlived the tab that asked for
-    /// it — a real case, not a defensive-only branch: closing a tab
-    /// doesn't cancel a read already in flight for it.
-    fn tab_index(&self, id: u64) -> Option<usize> {
-        self.tabs.iter().position(|t| t.id == id)
+    /// Where the pane with this id is, if it is still open. `None` for a
+    /// `DirLoaded`/`TrashDone` that outlived the pane that asked for it —
+    /// a real case, not a defensive-only branch: closing a tab, or
+    /// closing a split, doesn't cancel a read already in flight for it.
+    fn locate(&self, id: u64) -> Option<At> {
+        self.tabs.iter().enumerate().find_map(|(tab, t)| {
+            t.panes.iter().position(|p| p.id == id).map(|pane| At { tab, pane })
+        })
     }
 
-    fn spawn_read_dir(&mut self, tab_index: usize, path: PathBuf) -> Task<Message> {
-        let tab = &mut self.tabs[tab_index];
-        tab.read_generation += 1;
-        let generation = tab.read_generation;
-        let tab_id = tab.id;
+    /// The pane with the keyboard, in the tab in front.
+    fn focused(&self) -> At {
+        At { tab: self.active, pane: self.tabs[self.active].focused }
+    }
+
+    fn pane(&self, at: At) -> &Pane {
+        &self.tabs[at.tab].panes[at.pane]
+    }
+
+    fn pane_mut(&mut self, at: At) -> &mut Pane {
+        &mut self.tabs[at.tab].panes[at.pane]
+    }
+
+    /// Every pane of every tab, by position. Collected, so a caller can
+    /// go on to change them — a loop that says "every listing" has to
+    /// mean both panes of a split tab, and walking `tabs` alone is how a
+    /// right pane would be forgotten.
+    fn every_pane(&self) -> Vec<At> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(tab, t)| (0..t.panes.len()).map(move |pane| At { tab, pane }))
+            .collect()
+    }
+
+    fn spawn_read_dir(&mut self, at: At, path: PathBuf) -> Task<Message> {
+        let pane = self.pane_mut(at);
+        pane.read_generation += 1;
+        let generation = pane.read_generation;
+        let pane_id = pane.id;
         Task::perform(read_dir_task(self.backend.clone(), path.clone()), move |result| {
-            Message::DirLoaded(tab_id, generation, path.clone(), result)
+            Message::DirLoaded(pane_id, generation, path.clone(), result)
         })
     }
 
     /// Works out where a tab's path bar text could go, off the UI thread
     /// and through the same backend as its listings — so a typed path
     /// into an archive or the Trash resolves the way the listing would.
-    /// One at a time per tab; see `Tab::resolve_next`.
-    fn spawn_resolve(&mut self, tab_index: usize, request: hyprforge_files_core::jump::Request) -> Task<Message> {
-        let tab = &mut self.tabs[tab_index];
-        if tab.resolving {
-            tab.resolve_next = Some(request);
+    /// One at a time per pane; see `Pane::resolve_next`.
+    fn spawn_resolve(&mut self, at: At, request: hyprforge_files_core::jump::Request) -> Task<Message> {
+        let pane = self.pane_mut(at);
+        if pane.resolving {
+            pane.resolve_next = Some(request);
             return Task::none();
         }
-        tab.resolving = true;
-        let tab_id = tab.id;
+        pane.resolving = true;
+        let pane_id = pane.id;
         let backend = self.backend.clone();
         let text = request.text.clone();
         Task::perform(
@@ -1549,27 +1670,26 @@ impl App {
                     // to leave it waiting forever.
                     .unwrap_or_default()
             },
-            move |candidates| Message::PathResolved(tab_id, text.clone(), candidates),
+            move |candidates| Message::PathResolved(pane_id, text.clone(), candidates),
         )
     }
 
-    /// Hands a tab's search to its `Searcher`, starting a walk if one is
+    /// Hands a pane's search to its `Searcher`, starting a walk if one is
     /// to start now, and changes the saved searches for every tab.
-    fn search(&mut self, tab_index: usize, ask: hyprforge_files_core::search::Ask) -> Task<Message> {
+    fn search(&mut self, at: At, ask: hyprforge_files_core::search::Ask) -> Task<Message> {
         if let hyprforge_files_core::search::Ask::Smart(change) = &ask {
             return self.change_searches(change);
         }
-        let tab = &mut self.tabs[tab_index];
-        match tab.searcher.ask(ask) {
-            Some(start) => self.spawn_search(tab_index, start),
+        match self.pane_mut(at).searcher.ask(ask) {
+            Some(start) => self.spawn_search(at, start),
             None => Task::none(),
         }
     }
 
-    fn spawn_search(&self, tab_index: usize, (request, cancel): hyprforge_files::search_jobs::Start) -> Task<Message> {
-        let tab_id = self.tabs[tab_index].id;
+    fn spawn_search(&self, at: At, (request, cancel): hyprforge_files::search_jobs::Start) -> Task<Message> {
+        let pane_id = self.pane(at).id;
         Task::run(hyprforge_files::search_jobs::stream(self.backend.clone(), request, cancel), move |event| {
-            Message::Searched(tab_id, event)
+            Message::Searched(pane_id, event)
         })
     }
 
@@ -1578,21 +1698,25 @@ impl App {
     fn change_searches(&mut self, change: &hyprforge_files_core::search::SmartChange) -> Task<Message> {
         let searches = hyprforge_files_core::search::apply_smart_change(&self.last_prefs.searches, change);
         self.last_prefs.searches = searches.clone();
-        for tab in &mut self.tabs {
-            tab.browser.set_smart_folders(searches.clone());
+        for pane in self.tabs.iter_mut().flat_map(|t| &mut t.panes) {
+            pane.browser.set_smart_folders(searches.clone());
         }
         Task::perform(save_prefs(move |p: &mut Prefs| p.searches = searches), Message::PrefsSaved)
     }
 
     /// Carries out everything `Browser::update`/`perform` handed back
     /// but could not do itself — see `hyprforge_files_core::browser::Outcome`'s
-    /// own doc for why each of these belongs to the host. `tab_index` is
-    /// which tab produced the outcome, needed only for `ReadDir` (every
-    /// other variant is window-wide: opening a file, or saving prefs).
-    fn handle_outcome(&mut self, tab_index: usize, outcome: Outcome) -> Task<Message> {
+    /// own doc for why each of these belongs to the host. `at` is which
+    /// pane produced the outcome: where a read, an answer or a refresh
+    /// goes back to (many variants are window-wide: opening a file, or
+    /// saving prefs).
+    fn handle_outcome(&mut self, at: At, outcome: Outcome) -> Task<Message> {
+        // Every answer worked out off this thread goes back to the pane
+        // that asked, by id — see `Message::Answer`.
+        let pane_id = self.pane(at).id;
         match outcome {
             Outcome::None => Task::none(),
-            Outcome::ReadDir(path) => self.spawn_read_dir(tab_index, path),
+            Outcome::ReadDir(path) => self.spawn_read_dir(at, path),
             // A file *inside* an archive has no path any other program
             // can open: `~/x.zip/notes.txt` is not a path the kernel
             // knows. So it is unpacked to a scratch directory first and
@@ -1693,17 +1817,17 @@ impl App {
             ),
             Outcome::Pins(change) => self.change_pins(&change),
             Outcome::Stars(change) => self.change_stars(&change),
-            Outcome::ReadRecent => self.read_recent(tab_index),
-            Outcome::ReadStarred(paths) => self.read_starred(tab_index, paths),
-            Outcome::Search(ask) => self.search(tab_index, ask),
-            Outcome::Devices(ask) => self.ask_devices(tab_index, ask),
+            Outcome::ReadRecent => self.read_recent(at),
+            Outcome::ReadStarred(paths) => self.read_starred(at, paths),
+            Outcome::Search(ask) => self.search(at, ask),
+            Outcome::Devices(ask) => self.ask_devices(at, ask),
             Outcome::LoadThumbnails { paths, edge } => Task::run(
                 thumbnail_stream(paths, edge, self.mime.clone(), self.config.thumbnails),
-                |(path, handle, made)| Message::Browser(BrowserMessage::ThumbnailLoaded(path, handle, made)),
+                move |(path, handle, made)| Message::Answer(pane_id, BrowserMessage::ThumbnailLoaded(path, handle, made)),
             ),
             Outcome::LoadPreview(path) => Task::perform(
                 build_preview(path, self.mime.clone(), self.backend.clone()),
-                |(path, preview)| Message::Browser(BrowserMessage::PreviewLoaded(path, preview)),
+                move |(path, preview)| Message::Answer(pane_id, BrowserMessage::PreviewLoaded(path, preview)),
             ),
             Outcome::LoadQuickLook(path) => hyprforge_files::quicklook::task(
                 &self.quick_look,
@@ -1712,14 +1836,14 @@ impl App {
                 self.backend.clone(),
                 (self.last_window_size.0 as f32, self.last_window_size.1 as f32),
                 self.font_scale,
-                |path, found| Message::Browser(BrowserMessage::QuickLookLoaded(path, found)),
+                move |path, found| Message::Answer(pane_id, BrowserMessage::QuickLookLoaded(path, found)),
             ),
-            Outcome::LoadIcons(keys) => Task::perform(resolve_icons(keys, self.mime.clone()), |icons| {
-                Message::Browser(BrowserMessage::IconsLoaded(icons))
+            Outcome::LoadIcons(keys) => Task::perform(resolve_icons(keys, self.mime.clone()), move |icons| {
+                Message::Answer(pane_id, BrowserMessage::IconsLoaded(icons))
             }),
             Outcome::CountFolders(folders) => {
-                Task::perform(count_folders(self.backend.clone(), folders), |counts| {
-                    Message::Browser(BrowserMessage::CountsLoaded(counts))
+                Task::perform(count_folders(self.backend.clone(), folders), move |counts| {
+                    Message::Answer(pane_id, BrowserMessage::CountsLoaded(counts))
                 })
             }
             // Column view's panes: each its own read, so the nearest folder
@@ -1727,10 +1851,10 @@ impl App {
             // answer for a pane it no longer shows.
             Outcome::ReadColumns(dirs) => Task::batch(dirs.into_iter().map(|dir| {
                 Task::perform(read_dir_task(self.backend.clone(), dir.clone()), move |result| {
-                    Message::Browser(BrowserMessage::ColumnLoaded(dir.clone(), result))
+                    Message::Answer(pane_id, BrowserMessage::ColumnLoaded(dir.clone(), result))
                 })
             })),
-            Outcome::RevealFocused => iced::advanced::widget::operate(hyprforge_files_core::reveal::Reveal::new()),
+            Outcome::RevealFocused(row) => iced::advanced::widget::operate(hyprforge_files_core::reveal::Reveal::new(row)),
             Outcome::SnapTo { id, y } => {
                 iced::widget::operation::snap_to(id, iced::widget::operation::RelativeOffset { x: None, y: Some(y) })
             }
@@ -1750,29 +1874,26 @@ impl App {
             }
             Outcome::Trash(paths) => {
                 let ask = self.config.behaviour.confirm_trash;
-                self.remove(tab_index, Removal::Trash, paths, ask)
+                self.remove(at, Removal::Trash, paths, ask)
             }
-            Outcome::Restore(paths) => {
-                let tab_id = self.tabs[tab_index].id;
-                Task::perform(find_restorable(paths), move |(items, errors)| {
-                    Message::RestoreReady(tab_id, items, errors)
-                })
-            }
+            Outcome::Restore(paths) => Task::perform(find_restorable(paths), move |(items, errors)| {
+                Message::RestoreReady(pane_id, items, errors)
+            }),
             Outcome::EmptyTrash => {
-                let tab = &self.tabs[tab_index];
+                let pane = self.pane(at);
                 // Always asked, whatever `confirm-delete` says: this is
                 // every file in the Trash at once.
                 self.confirm = Some(PendingConfirm {
                     removal: Removal::EmptyTrash,
-                    paths: tab.browser.rows().iter().map(|e| e.path.clone()).collect(),
-                    tab_id: tab.id,
-                    dir: tab.browser.current_dir().to_path_buf(),
+                    paths: pane.browser.rows().iter().map(|e| e.path.clone()).collect(),
+                    pane_id,
+                    dir: pane.browser.current_dir().to_path_buf(),
                 });
                 Task::none()
             }
             Outcome::DeletePermanently(paths) => {
                 let ask = self.config.behaviour.confirm_delete;
-                self.remove(tab_index, Removal::Delete, paths, ask)
+                self.remove(at, Removal::Delete, paths, ask)
             }
             Outcome::Extract { archives, to } => {
                 self.start_archive_job(archive_jobs::Work::Extract { archives, into: to })
@@ -1910,7 +2031,8 @@ impl App {
             Outcome::CopyText(text) => iced::clipboard::write(text),
             Outcome::DragOut(paths) => self.start_drag(paths),
             Outcome::Paste(into) => self.read_clipboard_for(into),
-            Outcome::ResolvePath(request) => self.spawn_resolve(tab_index, request),
+            Outcome::ToOtherPane(clip) => self.paste_in_other_pane(at, clip),
+            Outcome::ResolvePath(request) => self.spawn_resolve(at, request),
             Outcome::FocusPath { id, select_all } => Task::batch([
                 iced::widget::operation::focus(id.clone()),
                 if select_all {
@@ -1939,7 +2061,6 @@ impl App {
                 })
             }
             Outcome::Rename { from, to } => {
-                let tab_id = self.tabs[tab_index].id;
                 Task::perform(
                     async move {
                         let (source, target) = (from.clone(), to.clone());
@@ -1948,12 +2069,11 @@ impl App {
                             .unwrap_or_else(|e| Err(format!("Renaming was interrupted: {e}")));
                         (from, to, result)
                     },
-                    move |(from, to, result)| Message::Renamed(tab_id, from, to, result),
+                    move |(from, to, result)| Message::Renamed(pane_id, from, to, result),
                 )
             }
-            Outcome::BulkRename(request) => self.open_bulk_rename(tab_index, request),
+            Outcome::BulkRename(request) => self.open_bulk_rename(at, request),
             Outcome::CreateFolder(path) => {
-                let tab_id = self.tabs[tab_index].id;
                 Task::perform(
                     async move {
                         let target = path.clone();
@@ -1962,7 +2082,7 @@ impl App {
                             .unwrap_or_else(|e| Err(format!("Making the folder was interrupted: {e}")));
                         (path, result)
                     },
-                    move |(path, result)| Message::FolderCreated(tab_id, path, result),
+                    move |(path, result)| Message::FolderCreated(pane_id, path, result),
                 )
             }
             Outcome::Notice(text) => {
@@ -1970,27 +2090,45 @@ impl App {
                 Task::none()
             }
             Outcome::Many(outcomes) => Task::batch(
-                outcomes.into_iter().map(|outcome| self.handle_outcome(tab_index, outcome)).collect::<Vec<_>>(),
+                outcomes.into_iter().map(|outcome| self.handle_outcome(at, outcome)).collect::<Vec<_>>(),
             ),
             Outcome::OpenContextMenuAtPointer(spot) => {
-                let outcome = self.tabs[tab_index]
+                let outcome = self
+                    .pane_mut(at)
                     .browser
                     .update(BrowserMessage::OpenContextMenu { spot, at: pointer::last() });
-                self.handle_outcome(tab_index, outcome)
+                self.handle_outcome(at, outcome)
             }
             Outcome::Window(action) => self.perform_window(action),
-            Outcome::Properties(request) => self.inspect(tab_index, request),
+            Outcome::Properties(request) => self.inspect(at, request),
         }
+    }
+
+    /// Copy to Other Pane and Move to Other Pane: the selection pasted
+    /// into the folder the other pane of `at`'s tab shows, through the
+    /// very paste a Ctrl+V there would make — so a clash asks, the
+    /// transfers popover shows it, Ctrl+Z takes it back, and stars follow
+    /// a move. Only the system clipboard is left out of it: copying
+    /// between two panes is not a request to replace what someone copied
+    /// for somewhere else. And the job refreshes both panes when it ends,
+    /// because both folders are among the ones it changed.
+    fn paste_in_other_pane(&mut self, at: At, clip: hyprforge_files_core::clipboard::FileClip) -> Task<Message> {
+        let tab = &self.tabs[at.tab];
+        let Some(other) = tab.panes.get(1 - at.pane.min(1)).filter(|_| tab.is_split()) else {
+            return Task::none();
+        };
+        let into = other.browser.current_dir().to_path_buf();
+        self.paste_into(into, Some(clip))
     }
 
     /// Carries out what a tab's Properties inspector asked for, on
     /// blocking workers — see `hyprforge_files::properties` — and routes
     /// each answer back to the tab that asked, by its id, so an answer
     /// arriving after a tab switch still lands where it belongs.
-    fn inspect(&mut self, tab_index: usize, request: hyprforge_files_core::properties::Request) -> Task<Message> {
+    fn inspect(&mut self, at: At, request: hyprforge_files_core::properties::Request) -> Task<Message> {
         use hyprforge_files::properties as host;
         use hyprforge_files_core::properties::{Message as Inspector, Request};
-        let tab_id = self.tabs[tab_index].id;
+        let tab_id = self.pane(at).id;
         let mime = self.mime.clone();
         match request {
             Request::Inspect { generation, facts, apps, measure, cancel } => {
@@ -2083,9 +2221,9 @@ impl App {
             // once rather than once per tab.
             Effect::Adopt(setting) => {
                 let mut tasks = Vec::new();
-                for index in 0..self.tabs.len() {
-                    let outcome = self.tabs[index].browser.update(BrowserMessage::Adopt(setting));
-                    tasks.push(self.handle_outcome(index, outcome));
+                for at in self.every_pane() {
+                    let outcome = self.pane_mut(at).browser.update(BrowserMessage::Adopt(setting));
+                    tasks.push(self.handle_outcome(at, outcome));
                 }
                 setting.apply(&mut self.last_prefs);
                 tasks.push(Task::perform(save_prefs(move |p: &mut Prefs| setting.apply(p)), Message::PrefsSaved));
@@ -2099,23 +2237,23 @@ impl App {
     /// whenever the clipboard changes, and for every new tab.
     fn sync_can_paste(&mut self) {
         let can = self.clipboard.may_hold_files();
-        for tab in &mut self.tabs {
-            tab.browser.set_can_paste(can);
+        for pane in self.tabs.iter_mut().flat_map(|t| &mut t.panes) {
+            pane.browser.set_can_paste(can);
         }
     }
 
-    /// Re-reads every tab showing one of `dirs`.
+    /// Re-reads every pane showing one of `dirs` — both panes of a split
+    /// tab when both show it, which is what a copy between two panes of
+    /// the same folder, or the watcher, needs.
     fn refresh_dirs(&mut self, dirs: &[PathBuf]) -> Task<Message> {
-        let indices: Vec<usize> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, tab)| dirs.iter().any(|d| d == tab.browser.current_dir()))
-            .map(|(i, _)| i)
+        let showing: Vec<At> = self
+            .every_pane()
+            .into_iter()
+            .filter(|at| dirs.iter().any(|d| d == self.pane(*at).browser.current_dir()))
             .collect();
-        Task::batch(indices.into_iter().map(|i| {
-            let dir = self.tabs[i].browser.current_dir().to_path_buf();
-            self.spawn_read_dir(i, dir)
+        Task::batch(showing.into_iter().map(|at| {
+            let dir = self.pane(at).browser.current_dir().to_path_buf();
+            self.spawn_read_dir(at, dir)
         }))
     }
 
@@ -2204,7 +2342,7 @@ impl App {
     /// Starts putting trashed items back, once their records are found.
     fn restore(
         &mut self,
-        tab_id: u64,
+        pane_id: u64,
         items: Vec<(PathBuf, PathBuf, PathBuf)>,
         errors: Vec<String>,
     ) -> Task<Message> {
@@ -2214,9 +2352,7 @@ impl App {
         if items.is_empty() {
             return Task::none();
         }
-        let trash_dir = self
-            .tab_index(tab_id)
-            .map(|i| self.tabs[i].browser.current_dir().to_path_buf());
+        let trash_dir = self.locate(pane_id).map(|at| self.pane(at).browser.current_dir().to_path_buf());
         let mut dirs: Vec<PathBuf> = trash_dir.into_iter().collect();
         let mut steps = Vec::with_capacity(items.len());
         let mut records = Vec::with_capacity(items.len());
@@ -2645,16 +2781,16 @@ impl App {
 
     /// Trashes or deletes `paths` — or, if `ask`, holds them for the
     /// confirmation dialog first.
-    fn remove(&mut self, tab_index: usize, removal: Removal, paths: Vec<PathBuf>, ask: bool) -> Task<Message> {
+    fn remove(&mut self, at: At, removal: Removal, paths: Vec<PathBuf>, ask: bool) -> Task<Message> {
         if paths.is_empty() {
             return Task::none();
         }
-        let tab = &self.tabs[tab_index];
+        let pane = self.pane(at);
         let pending = PendingConfirm {
             removal,
             paths,
-            tab_id: tab.id,
-            dir: tab.browser.current_dir().to_path_buf(),
+            pane_id: pane.id,
+            dir: pane.browser.current_dir().to_path_buf(),
         };
         if ask {
             self.confirm = Some(pending);
@@ -2664,7 +2800,7 @@ impl App {
     }
 
     fn carry_out(&mut self, pending: PendingConfirm) -> Task<Message> {
-        let PendingConfirm { removal, paths, tab_id, dir } = pending;
+        let PendingConfirm { removal, paths, pane_id: tab_id, dir } = pending;
         match removal {
             Removal::Trash => Task::perform(trash_many(paths), move |(trashed, errors)| {
                 Message::TrashDone(tab_id, dir.clone(), trashed, errors)
@@ -2686,7 +2822,7 @@ impl App {
     /// still shows the folder as it really is.
     fn name_changed(
         &mut self,
-        tab_id: u64,
+        pane_id: u64,
         path: PathBuf,
         result: Result<(), String>,
         rename_next: bool,
@@ -2696,19 +2832,17 @@ impl App {
             Ok(()) => self.record(done),
             Err(_) => Task::none(),
         };
-        let Some(index) = self.tab_index(tab_id) else {
+        let Some(at) = self.locate(pane_id) else {
             return noticed;
         };
         match result {
             Ok(()) => {
-                self.tabs[index]
-                    .browser
-                    .update(BrowserMessage::AfterListing { path, rename: rename_next });
+                self.pane_mut(at).browser.update(BrowserMessage::AfterListing { path, rename: rename_next });
             }
             Err(why) => self.status = Some(why),
         }
-        let dir = self.tabs[index].browser.current_dir().to_path_buf();
-        Task::batch([self.spawn_read_dir(index, dir), noticed])
+        let dir = self.pane(at).browser.current_dir().to_path_buf();
+        Task::batch([self.spawn_read_dir(at, dir), noticed])
     }
 
     /// Everything that follows something done: stars move with what was
@@ -2793,9 +2927,20 @@ impl App {
             // opened from here: window scope is what keeps it out of the
             // open/save dialog — see `Action::Properties`.
             Action::Properties => {
-                let outcome = self.active_tab_mut().browser.update(BrowserMessage::ToggleProperties);
-                self.handle_outcome(self.active, outcome)
+                let at = self.focused();
+                let outcome = self.pane_mut(at).browser.update(BrowserMessage::ToggleProperties);
+                self.handle_outcome(at, outcome)
             }
+            Action::ToggleSplit => self.toggle_split(self.active),
+            // Only when no text field has the keyboard: Tab in the
+            // search field or a rename is the field's, not a request to
+            // leave it. Whether one has it is the layout's knowledge, so
+            // it is asked — see `field_focus`.
+            Action::OtherPane if self.active_tab().is_split() => {
+                iced::advanced::widget::operate(field_focus::AnyFocused::default())
+                    .then(|typing| if typing { Task::none() } else { Task::done(Message::OtherPane) })
+            }
+            Action::OtherPane => Task::none(),
             Action::Preferences => self.open_preferences(),
             Action::Transfers => self.transfers_update(TransfersMessage::Toggle),
             // A toggle like the popover's, so the key that opened the
@@ -2821,8 +2966,8 @@ impl App {
             return Task::none();
         }
         self.last_prefs.pinned = pinned.clone();
-        for tab in &mut self.tabs {
-            tab.browser.set_pins(pinned.clone());
+        for pane in self.tabs.iter_mut().flat_map(|t| &mut t.panes) {
+            pane.browser.set_pins(pinned.clone());
         }
         // Only the list is written: the rest of the file belongs to
         // whichever tab last changed a view setting.
@@ -2845,10 +2990,10 @@ impl App {
         }
         self.last_prefs.starred = starred.clone();
         let mut tasks = Vec::with_capacity(self.tabs.len() + 1);
-        for index in 0..self.tabs.len() {
-            // A tab with Starred open reads it again.
-            let outcome = self.tabs[index].browser.set_stars(starred.clone());
-            tasks.push(self.handle_outcome(index, outcome));
+        for at in self.every_pane() {
+            // A pane with Starred open reads it again.
+            let outcome = self.pane_mut(at).browser.set_stars(starred.clone());
+            tasks.push(self.handle_outcome(at, outcome));
         }
         let change = change.clone();
         tasks.push(Task::perform(
@@ -2872,11 +3017,11 @@ impl App {
         self.change_stars(&hyprforge_files_core::starred::StarChange::Follow(moves))
     }
 
-    /// Reads Recent for one tab, off the UI thread.
-    fn read_recent(&self, tab_index: usize) -> Task<Message> {
-        let tab_id = self.tabs[tab_index].id;
+    /// Reads Recent for one pane, off the UI thread.
+    fn read_recent(&self, at: At) -> Task<Message> {
+        let pane_id = self.pane(at).id;
         let Some(file) = self.recent_file.clone() else {
-            return Task::done(Message::Collected(tab_id, BrowserMessage::RecentRead(Ok(Vec::new()))));
+            return Task::done(Message::Answer(pane_id, BrowserMessage::RecentRead(Ok(Vec::new()))));
         };
         let backend = self.backend.clone();
         Task::perform(
@@ -2887,14 +3032,14 @@ impl App {
                 .await
                 .unwrap_or_else(|e| Err(format!("Reading Recent was interrupted: {e}")))
             },
-            move |answer| Message::Collected(tab_id, BrowserMessage::RecentRead(answer)),
+            move |answer| Message::Answer(pane_id, BrowserMessage::RecentRead(answer)),
         )
     }
 
-    /// Looks up each star for one tab, off the UI thread — a star can be
-    /// on a drive that is slow to answer.
-    fn read_starred(&self, tab_index: usize, paths: Vec<PathBuf>) -> Task<Message> {
-        let tab_id = self.tabs[tab_index].id;
+    /// Looks up each star for one pane, off the UI thread — a star can
+    /// be on a drive that is slow to answer.
+    fn read_starred(&self, at: At, paths: Vec<PathBuf>) -> Task<Message> {
+        let pane_id = self.pane(at).id;
         let backend = self.backend.clone();
         Task::perform(
             async move {
@@ -2904,7 +3049,7 @@ impl App {
                     // missing, rather than every star reported gone.
                     .unwrap_or_default()
             },
-            move |(entries, missing)| Message::Collected(tab_id, BrowserMessage::StarredRead { entries, missing }),
+            move |(entries, missing)| Message::Answer(pane_id, BrowserMessage::StarredRead { entries, missing }),
         )
     }
 
@@ -2966,13 +3111,13 @@ impl App {
             DropEvent::Left => {
                 self.drag_over = false;
                 self.drop_probe.1 = None;
-                let _ = self.active_tab_mut().browser.update(BrowserMessage::DropHover(None));
+                self.light_drop(None);
                 Task::none()
             }
             DropEvent::Dropped { x, y, from } => {
                 self.drag_over = false;
                 self.drop_probe.1 = None;
-                let _ = self.active_tab_mut().browser.update(BrowserMessage::DropHover(None));
+                self.light_drop(None);
                 self.probe_drop((x, y), Some(from))
             }
             DropEvent::Failed(why) => {
@@ -2988,10 +3133,28 @@ impl App {
         if dropped.is_none() {
             self.drop_probe.0 = true;
         }
-        let targets = self.active_tab().browser.drop_targets();
+        // Every pane on screen: a split tab draws both, and a drag can be
+        // over either. Each browser's ids are its own (see
+        // `drop::target_id`), so the hit says which pane as well as which
+        // folder.
+        let targets: std::collections::HashMap<_, (u64, PathBuf)> = self
+            .active_tab()
+            .panes
+            .iter()
+            .flat_map(|pane| pane.browser.drop_targets().into_iter().map(move |(id, path)| (id, (pane.id, path))))
+            .collect();
         let point = iced::Point::new(x as f32, y as f32);
         iced::advanced::widget::operate(hyprforge_files_core::drop::HitTest::new(point, targets))
             .map(move |hit| Message::DropHit(hit, dropped.clone()))
+    }
+
+    /// Lights the folder a drag is over in the pane it is over, and
+    /// unlights it in every other pane of the tab — `None` unlights all.
+    fn light_drop(&mut self, hit: Option<(u64, PathBuf)>) {
+        for pane in &mut self.tabs[self.active].panes {
+            let here = hit.as_ref().filter(|(id, _)| *id == pane.id).map(|(_, path)| path.clone());
+            let _ = pane.browser.update(BrowserMessage::DropHover(here));
+        }
     }
 
     /// Decides what a drop means, off the UI thread: which filesystem
@@ -3135,47 +3298,148 @@ impl App {
     /// it arrives, so asking for it now is not too early.
     fn open_start_tabs(&mut self, select: Vec<PathBuf>, start: &hyprforge_files::start::Start) -> Task<Message> {
         if !select.is_empty() {
-            let _ = self.tabs[0].browser.update(BrowserMessage::SelectWhenListed(select));
+            let _ = self.tabs[0].browser_mut().update(BrowserMessage::SelectWhenListed(select));
         }
         let mut tasks = Vec::new();
         for tab in start.tabs.iter().skip(1) {
             tasks.push(self.open_tab(tab.dir.clone()));
             if !tab.select.is_empty() {
-                let _ = self.active_tab_mut().browser.update(BrowserMessage::SelectWhenListed(tab.select.clone()));
+                let _ = self.active_tab_mut().browser_mut().update(BrowserMessage::SelectWhenListed(tab.select.clone()));
             }
         }
         self.active = 0;
         if start.properties {
-            let outcome = self.tabs[0].browser.update(BrowserMessage::ToggleProperties);
-            tasks.push(self.handle_outcome(0, outcome));
+            let at = At { tab: 0, pane: self.tabs[0].focused };
+            let outcome = self.pane_mut(at).browser.update(BrowserMessage::ToggleProperties);
+            tasks.push(self.handle_outcome(at, outcome));
         }
         Task::batch(tasks)
     }
 
     /// Opens a new tab at `start_dir` and makes it active — `Ctrl+T` and
-    /// the titlebar `+` both funnel here.
+    /// the titlebar `+` both funnel here — split at the same folder when
+    /// Preferences says new tabs open split.
     fn open_tab(&mut self, start_dir: PathBuf) -> Task<Message> {
+        let opened = self.add_tab(start_dir);
+        if !self.last_prefs.split_new_tabs {
+            return opened;
+        }
+        Task::batch([opened, self.toggle_split(self.active)])
+    }
+
+    /// [`App::open_tab`] without asking Preferences: a tab of one pane.
+    /// What restoring last time's tabs uses, so a tab saved unsplit comes
+    /// back unsplit whatever the setting now says.
+    fn add_tab(&mut self, start_dir: PathBuf) -> Task<Message> {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let (mut browser, outcome) =
-            Browser::new(Mode::App, self.last_prefs.clone(), start_dir, self.sidebar_items.clone());
+        let (browser, outcome) = self.new_browser(self.last_prefs.clone(), start_dir);
+        self.tabs.push(Tab::new(id, browser));
+        self.active = self.tabs.len() - 1;
+        let at = At { tab: self.active, pane: 0 };
+        Task::batch([self.handle_outcome(at, outcome), self.tell_scale(at)])
+    }
+
+    /// A browser for a new tab or a new pane, told everything the window
+    /// knows that a browser cannot find out for itself — the
+    /// configuration, what files are (for the person's own actions),
+    /// whether there is something to paste, and the pins. One place, so
+    /// a pane cannot be born missing what a tab is born with. The scale
+    /// is told separately, once it has a place ([`App::tell_scale`]).
+    fn new_browser(&self, prefs: Prefs, start_dir: PathBuf) -> (Browser, Outcome) {
+        let (mut browser, outcome) = Browser::new(Mode::App, prefs, start_dir, self.sidebar_items.clone());
         browser.set_config(self.config.clone());
         browser.set_type_of(hyprforge_files::launch::type_of(self.mime.clone()));
         browser.set_can_paste(self.clipboard.may_hold_files());
         let _ = browser.update(BrowserMessage::PinnedLoaded(self.pinned_items.clone()));
-        self.tabs.push(Tab::new(id, browser));
-        self.active = self.tabs.len() - 1;
-        let index = self.active;
-        Task::batch([self.handle_outcome(index, outcome), self.tell_scale(index)])
+        let _ = browser.update(BrowserMessage::DevicesChanged(self.devices.snapshot()));
+        (browser, outcome)
     }
 
-    /// Tells tab `index`'s browser the window's scale — every tab when it
+    /// F3: splits tab `index` into two panes at the folder in view, or —
+    /// split already — closes the pane without the keyboard. Closing
+    /// keeps the one being worked in, which is also what makes F3 twice
+    /// put the tab back exactly as it was: opening leaves the keyboard
+    /// where it was, so the pane F3 opened is the one F3 closes.
+    fn toggle_split(&mut self, index: usize) -> Task<Message> {
+        let Some(tab) = self.tabs.get_mut(index) else { return Task::none() };
+        self.clicks.reset();
+        if tab.is_split() {
+            let keep = tab.focused;
+            let kept = tab.panes.swap_remove(keep);
+            tab.panes = vec![kept];
+            tab.focused = 0;
+            self.tell_other_pane(index);
+            return Task::none();
+        }
+        let dir = tab.browser().current_dir().to_path_buf();
+        self.open_second_pane(index, dir)
+    }
+
+    /// Splits tab `index`, which has one pane, with a second at `dir`.
+    /// The keyboard stays where it was.
+    fn open_second_pane(&mut self, index: usize, dir: PathBuf) -> Task<Message> {
+        if self.tabs[index].is_split() {
+            return Task::none();
+        }
+        // The new pane starts as the one beside it looks — the same view,
+        // sort and zoom — rather than as the last saved preferences: it is
+        // a second look, not a new tab.
+        let prefs = self.tabs[index].browser().prefs().clone();
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let (browser, outcome) = self.new_browser(prefs, dir);
+        self.tabs[index].panes.push(Pane::new(id, browser));
+        self.tell_other_pane(index);
+        let at = At { tab: index, pane: 1 };
+        Task::batch([self.handle_outcome(at, outcome), self.tell_scale(at)])
+    }
+
+    /// Gives pane `pane` of the tab in front the keyboard.
+    ///
+    /// Whatever was open in the pane being left — its menu, its path bar,
+    /// a rename, the palette, Quick Look — is put down, as a click
+    /// anywhere else would put it down: left open, it would go on looking
+    /// like it had the keys the other pane now has. And the click count
+    /// starts over: two presses on row 3 of two different panes are not
+    /// a double-click.
+    fn focus_pane(&mut self, pane: usize) {
+        let tab = &mut self.tabs[self.active];
+        if tab.focused == pane || pane >= tab.panes.len() {
+            return;
+        }
+        let left = tab.browser_mut();
+        for message in [
+            BrowserMessage::CloseMenu,
+            BrowserMessage::PathCancel,
+            BrowserMessage::RenameCancel,
+            BrowserMessage::PaletteCancel,
+        ] {
+            let _ = left.update(message);
+        }
+        left.close_quick_look();
+        tab.focused = pane;
+        self.clicks.reset();
+    }
+
+    /// Tells both panes of tab `index` whether there is another pane —
+    /// what turns Copy to Other Pane on and off. Called whenever the tab
+    /// splits or unsplits.
+    fn tell_other_pane(&mut self, index: usize) {
+        let tab = &mut self.tabs[index];
+        let split = tab.is_split();
+        for pane in &mut tab.panes {
+            pane.browser.set_other_pane(split);
+        }
+    }
+
+    /// Tells the browser at `at` the window's scale — every pane when it
     /// changes, and each new one as it opens, so no browser is left
     /// sizing thumbnails for a 1x screen. See `BrowserMessage::ScaleFactor`.
-    fn tell_scale(&mut self, index: usize) -> Task<Message> {
+    fn tell_scale(&mut self, at: At) -> Task<Message> {
         let message = BrowserMessage::ScaleFactor { output: self.output_scale, font: self.font_scale };
-        let outcome = self.tabs[index].browser.update(message);
-        self.handle_outcome(index, outcome)
+        let outcome = self.pane_mut(at).browser.update(message);
+        self.handle_outcome(at, outcome)
     }
 
     /// `Ctrl+W`, or a tab's own close button. See [`neighbour_after_close`]
@@ -3232,54 +3496,80 @@ impl App {
         }
     }
 
+    /// A message for the browser at `at`, from its view or for the pane
+    /// with the keyboard.
+    ///
+    /// A click arrives from the view bare: no modifiers, and no notion of
+    /// whether it is the second of a pair. Both are facts about the world
+    /// rather than about the model, and this is where the window knows
+    /// them.
+    fn browser_message(&mut self, at: At, msg: BrowserMessage) -> Task<Message> {
+        let msg = match msg {
+            // A right press carries no position; the pointer
+            // tracker has it. See `pointer`.
+            BrowserMessage::OpenContextMenu { spot, .. } => {
+                self.clicks.reset();
+                BrowserMessage::OpenContextMenu { spot, at: pointer::last() }
+            }
+            BrowserMessage::EntryClicked { index, .. } => {
+                let ctrl = self.modifiers.control();
+                let shift = self.modifiers.shift();
+                if ctrl || shift {
+                    // A modifier-held click is a selection
+                    // gesture, never half of an open — and it
+                    // must not leave a press behind that a
+                    // following plain click could pair with.
+                    self.clicks.reset();
+                    BrowserMessage::EntryClicked { index, ctrl, shift }
+                } else {
+                    match self.clicks.press(index, Instant::now()) {
+                        Click::Double => BrowserMessage::EntryActivated(index),
+                        Click::Single => {
+                            BrowserMessage::EntryClicked { index, ctrl, shift }
+                        }
+                    }
+                }
+            }
+            other => other,
+        };
+        let outcome = self.pane_mut(at).browser.update(msg);
+        // Arriving somewhere new ends any click sequence: the row under
+        // the pointer is a different file now, and pairing the next press
+        // with the one that got us here would open whatever happens to be
+        // in that position.
+        if outcome.navigates() {
+            self.clicks.reset();
+        }
+        self.handle_outcome(at, outcome)
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers;
                 Task::none()
             }
-            Message::Browser(msg) => {
-                // A click arrives from the view bare: no modifiers, and
-                // no notion of whether it is the second of a pair. Both
-                // are facts about the world rather than about the model,
-                // and this is where the window knows them.
-                let msg = match msg {
-                    // A right press carries no position; the pointer
-                    // tracker has it. See `pointer`.
-                    BrowserMessage::OpenContextMenu { spot, .. } => {
-                        self.clicks.reset();
-                        BrowserMessage::OpenContextMenu { spot, at: pointer::last() }
-                    }
-                    BrowserMessage::EntryClicked { index, .. } => {
-                        let ctrl = self.modifiers.control();
-                        let shift = self.modifiers.shift();
-                        if ctrl || shift {
-                            // A modifier-held click is a selection
-                            // gesture, never half of an open — and it
-                            // must not leave a press behind that a
-                            // following plain click could pair with.
-                            self.clicks.reset();
-                            BrowserMessage::EntryClicked { index, ctrl, shift }
-                        } else {
-                            match self.clicks.press(index, Instant::now()) {
-                                Click::Double => BrowserMessage::EntryActivated(index),
-                                Click::Single => {
-                                    BrowserMessage::EntryClicked { index, ctrl, shift }
-                                }
-                            }
-                        }
-                    }
-                    other => other,
-                };
-                let outcome = self.active_tab_mut().browser.update(msg);
-                // Arriving somewhere new ends any click sequence: the row
-                // under the pointer is a different file now, and pairing
-                // the next press with the one that got us here would open
-                // whatever happens to be in that position.
-                if outcome.navigates() {
-                    self.clicks.reset();
+            Message::Browser(msg) => self.browser_message(self.focused(), msg),
+            Message::Pane(id, msg) => {
+                let Some(at) = self.locate(id) else { return Task::none() };
+                // Only the tab in front is drawn, so a gesture comes from
+                // one of its panes; anything else is a stale message.
+                if at.tab != self.active {
+                    return Task::none();
                 }
-                self.handle_outcome(self.active, outcome)
+                // A click in the other pane chooses it — see `focus_pane`.
+                self.focus_pane(at.pane);
+                self.browser_message(at, msg)
+            }
+            Message::OtherPane => {
+                let other = 1 - self.active_tab().focused.min(1);
+                self.focus_pane(other);
+                Task::none()
+            }
+            Message::Answer(id, msg) => {
+                let Some(at) = self.locate(id) else { return Task::none() };
+                let outcome = self.pane_mut(at).browser.update(msg);
+                self.handle_outcome(at, outcome)
             }
             // The bulk rename sheet has the keyboard while it is up —
             // see `bulk_rename_window::sheet_key` for which keys mean
@@ -3321,17 +3611,17 @@ impl App {
                 // shows — the menus' key hints included.
                 if let Some(config) = saved {
                     let config = Arc::new(config);
-                    for tab in &mut self.tabs {
-                        tab.browser.set_config(config.clone());
+                    for pane in self.tabs.iter_mut().flat_map(|t| &mut t.panes) {
+                        pane.browser.set_config(config.clone());
                     }
                     self.config = config;
                 }
                 self.preferences_effect(effect)
             }
-            Message::Properties(tab_id, message) => {
-                let Some(index) = self.tab_index(tab_id) else { return Task::none() };
-                let outcome = self.tabs[index].browser.update(BrowserMessage::Properties(Box::new(message)));
-                self.handle_outcome(index, outcome)
+            Message::Properties(pane_id, message) => {
+                let Some(at) = self.locate(pane_id) else { return Task::none() };
+                let outcome = self.pane_mut(at).browser.update(BrowserMessage::Properties(Box::new(message)));
+                self.handle_outcome(at, outcome)
             }
             Message::PropertiesDefaultSet(tab_id, generation, result) => {
                 use hyprforge_files_core::properties::Message as Inspector;
@@ -3420,76 +3710,80 @@ impl App {
             // text field does not take Tab, so it arrives here; nowhere
             // else in the window is it bound.
             Message::KeyPressed(press)
-                if press.key == keymap::Key::Tab && self.active_tab().browser.editing_path() =>
+                if press.key == keymap::Key::Tab && self.active_tab().browser().editing_path() =>
             {
-                let outcome = self.active_tab_mut().browser.update(BrowserMessage::PathComplete);
-                self.handle_outcome(self.active, outcome)
+                let at = self.focused();
+                let outcome = self.pane_mut(at).browser.update(BrowserMessage::PathComplete);
+                self.handle_outcome(at, outcome)
             }
             // A Space between two words of a search typed at the listing is
             // the search's, not Quick Look's — see `typing_under_way`.
             Message::KeyPressed(press) => match self
                 .config
                 .keymap
-                .resolve_typing(&press, self.active_tab().browser.typing_under_way())
+                .resolve_typing(&press, self.active_tab().browser().typing_under_way())
             {
                 // Window actions never reach the browser, which the
                 // dialog host also renders and which has no tabs. Quick
                 // Look closes first: it is a glance at this tab, and a
                 // new tab or the inspector is somewhere else to look.
                 Some(Resolved::Action(action)) if action.scope() == Scope::Window => {
-                    self.active_tab_mut().browser.close_quick_look();
+                    self.active_tab_mut().browser_mut().close_quick_look();
                     self.perform_window(action)
                 }
+                // Every other key goes to the pane with the keyboard, and
+                // only to it: the other pane of a split tab is somewhere
+                // the person is not working right now.
                 Some(Resolved::Action(action)) => {
                     self.clicks.reset();
-                    let outcome = self.active_tab_mut().browser.perform(action);
-                    self.handle_outcome(self.active, outcome)
+                    let at = self.focused();
+                    let outcome = self.pane_mut(at).browser.perform(action);
+                    self.handle_outcome(at, outcome)
                 }
                 Some(Resolved::Text(c)) => {
-                    let outcome =
-                        self.active_tab_mut().browser.update(BrowserMessage::TypeToSearch(c));
-                    self.handle_outcome(self.active, outcome)
+                    let at = self.focused();
+                    let outcome = self.pane_mut(at).browser.update(BrowserMessage::TypeToSearch(c));
+                    self.handle_outcome(at, outcome)
                 }
                 None => Task::none(),
             },
-            Message::PathResolved(tab_id, text, candidates) => {
-                let Some(index) = self.tab_index(tab_id) else {
+            Message::PathResolved(pane_id, text, candidates) => {
+                let Some(at) = self.locate(pane_id) else {
                     return Task::none();
                 };
-                self.tabs[index].resolving = false;
-                let outcome = self.tabs[index]
-                    .browser
-                    .update(BrowserMessage::PathResolved { text: text.clone(), candidates });
-                let task = self.handle_outcome(index, outcome);
+                self.pane_mut(at).resolving = false;
+                let outcome =
+                    self.pane_mut(at).browser.update(BrowserMessage::PathResolved { text: text.clone(), candidates });
+                let task = self.handle_outcome(at, outcome);
                 // What was typed while this one ran. Not when it is the
                 // same text: that answer just arrived.
-                let next = match self.tabs[index].resolve_next.take() {
-                    Some(next) if next.text != text => self.spawn_resolve(index, next),
+                let next = match self.pane_mut(at).resolve_next.take() {
+                    Some(next) if next.text != text => self.spawn_resolve(at, next),
                     _ => Task::none(),
                 };
                 Task::batch([task, next])
             }
-            Message::Searched(tab_id, event) => {
+            Message::Searched(pane_id, event) => {
                 use hyprforge_files::search_jobs::Event;
                 use hyprforge_files_core::search::SearchMessage;
-                let Some(index) = self.tab_index(tab_id) else { return Task::none() };
+                let Some(at) = self.locate(pane_id) else { return Task::none() };
                 let (message, ended) = match event {
                     Event::Found(run, entries) => (SearchMessage::Found { run, entries }, None),
                     Event::Finished(run, summary) => (SearchMessage::Finished { run, summary }, Some(run)),
                 };
-                let outcome = self.tabs[index].browser.update(BrowserMessage::Search(message));
-                let task = self.handle_outcome(index, outcome);
+                let outcome = self.pane_mut(at).browser.update(BrowserMessage::Search(message));
+                let task = self.handle_outcome(at, outcome);
                 // The walk that was waiting for this one, if any.
-                let next = match ended.and_then(|run| self.tabs[index].searcher.finished(run)) {
-                    Some(start) => self.spawn_search(index, start),
+                let next = match ended.and_then(|run| self.pane_mut(at).searcher.finished(run)) {
+                    Some(start) => self.spawn_search(at, start),
                     None => Task::none(),
                 };
                 Task::batch([task, next])
             }
-            Message::DirLoaded(tab_id, generation, path, result) => {
-                let Some(index) = self.tab_index(tab_id) else {
-                    // The tab that asked for this closed before the read
-                    // came back. Not an error — see `Tab::id`'s doc.
+            Message::DirLoaded(pane_id, generation, path, result) => {
+                let Some(at) = self.locate(pane_id) else {
+                    // The pane that asked for this closed before the read
+                    // came back. Not an error — see `Pane::id`'s doc.
                     return Task::none();
                 };
                 // Stale: a newer read has already been issued for *this
@@ -3501,7 +3795,7 @@ impl App {
                 // this tab's own counter, so a slow read for a different
                 // tab can never be mistaken for stale or fresh against
                 // the wrong tab's generation.
-                if generation != self.tabs[index].read_generation {
+                if generation != self.pane(at).read_generation {
                     return Task::none();
                 }
                 // Whether this listing is inside an archive, decided
@@ -3526,8 +3820,8 @@ impl App {
                 let archive = hyprforge_files_core::archive::split(&path)
                     .and_then(|(archive, _)| hyprforge_archive::Format::by_name(&archive))
                     .map(|format| format.label().to_string());
-                if path == self.tabs[index].browser.current_dir() {
-                    self.tabs[index].browser.set_archive(archive);
+                if path == self.pane(at).browser.current_dir() {
+                    self.pane_mut(at).browser.set_archive(archive);
                 }
                 // An encrypted archive — very often a 7z, whose header
                 // can be encrypted so it will not even list. Asked here
@@ -3537,19 +3831,18 @@ impl App {
                     == Some(hyprforge_files_core::DirErrorKind::PasswordRequired)
                 {
                     if let Some((archive, _)) = hyprforge_files_core::archive::split(&path) {
-                        let tab = self.tabs[index].id;
                         return self.ask_for_password(
                             archive,
-                            AfterUnlock::Listing { tab, dir: path },
+                            AfterUnlock::Listing { tab: pane_id, dir: path },
                         );
                     }
                 }
-                let outcome = self.tabs[index].browser.update(BrowserMessage::DirLoaded(path, result));
-                let task = self.handle_outcome(index, outcome);
+                let outcome = self.pane_mut(at).browser.update(BrowserMessage::DirLoaded(path, result));
+                let task = self.handle_outcome(at, outcome);
                 #[cfg(debug_assertions)]
                 let task = {
                     let mut show = std::mem::take(&mut self.debug_show);
-                    let shown = show.after_listing(self, index);
+                    let shown = show.after_listing(self, at);
                     self.debug_show = show;
                     Task::batch([task, shown])
                 };
@@ -3562,11 +3855,6 @@ impl App {
             Message::UndoneMoves(moves, dirs, errors) => {
                 let stars = if errors.is_empty() { self.follow_stars(moves) } else { Task::none() };
                 Task::batch([stars, self.update(Message::Undone(dirs, errors))])
-            }
-            Message::Collected(tab_id, message) => {
-                let Some(index) = self.tab_index(tab_id) else { return Task::none() };
-                let outcome = self.tabs[index].browser.update(message);
-                self.handle_outcome(index, outcome)
             }
             Message::RecentRecorded(Ok(())) => Task::none(),
             // Said, because a Recent that silently stopped keeping track
@@ -3587,9 +3875,9 @@ impl App {
                 }
                 // A Recent on screen anywhere is now out of date.
                 let mut tasks = Vec::new();
-                for index in 0..self.tabs.len() {
-                    if self.tabs[index].browser.collection() == Some(hyprforge_files_core::starred::Collection::Recent) {
-                        tasks.push(self.read_recent(index));
+                for at in self.every_pane() {
+                    if self.pane(at).browser.collection() == Some(hyprforge_files_core::starred::Collection::Recent) {
+                        tasks.push(self.read_recent(at));
                     }
                 }
                 Task::batch(tasks)
@@ -3628,7 +3916,7 @@ impl App {
                 self.drop_probe.0 = false;
                 // An answer for a drag that has since left or been let go.
                 let hit = hit.filter(|_| self.drag_over);
-                let _ = self.active_tab_mut().browser.update(BrowserMessage::DropHover(hit));
+                self.light_drop(hit);
                 match self.drop_probe.1.take() {
                     Some(at) => self.probe_drop(at, None),
                     None => Task::none(),
@@ -3638,7 +3926,7 @@ impl App {
                 self.status = Some("Drop files onto a folder, or onto the listing.".to_string());
                 Task::none()
             }
-            Message::DropHit(Some(into), Some(from)) => self.plan_drop(into, from),
+            Message::DropHit(Some((_, into)), Some(from)) => self.plan_drop(into, from),
             Message::DropPlanned(plan) => match plan {
                 hyprforge_files_core::drop::DropPlan::Nothing => Task::none(),
                 hyprforge_files_core::drop::DropPlan::Paste { clip, into } => {
@@ -3647,7 +3935,7 @@ impl App {
                     self.from_drops.extend(first..self.next_job_id);
                     task
                 }
-                hyprforge_files_core::drop::DropPlan::Trash(paths) => self.handle_outcome(self.active, Outcome::Trash(paths)),
+                hyprforge_files_core::drop::DropPlan::Trash(paths) => self.handle_outcome(self.focused(), Outcome::Trash(paths)),
                 hyprforge_files_core::drop::DropPlan::Refused(why) => {
                     self.status = Some(why);
                     Task::none()
@@ -3706,14 +3994,15 @@ impl App {
                 if self.connecting.is_some() {
                     return self.connect_update(ConnectMessage::Cancel);
                 }
-                let browser = &mut self.active_tab_mut().browser;
+                let at = self.focused();
+                let browser = &mut self.pane_mut(at).browser;
                 let renamed = browser.update(BrowserMessage::RenameCancel);
                 let pathed = browser.update(BrowserMessage::PathCancel);
                 let paletted = browser.update(BrowserMessage::PaletteCancel);
                 let unsaved = browser.update(BrowserMessage::Search(
                     hyprforge_files_core::search::SearchMessage::SaveCancel,
                 ));
-                self.handle_outcome(self.active, Outcome::Many(vec![renamed, pathed, paletted, unsaved]))
+                self.handle_outcome(at, Outcome::Many(vec![renamed, pathed, paletted, unsaved]))
             }
             Message::AnswerConflict(id, policy) => {
                 self.answer_conflict(id, policy);
@@ -3742,13 +4031,13 @@ impl App {
                 }
                 Task::none()
             }
-            Message::TrashDone(tab_id, dir, trashed, errors) => {
+            Message::TrashDone(pane_id, dir, trashed, errors) => {
                 if !errors.is_empty() {
                     self.status = Some(format!("Couldn't remove everything: {}", errors.join("; ")));
                 }
                 let noticed = self.record(hyprforge_files_core::undo::Undoable::Trashed(trashed));
-                let Some(index) = self.tab_index(tab_id) else {
-                    // The tab this delete was started from has since
+                let Some(at) = self.locate(pane_id) else {
+                    // The pane this delete was started from has since
                     // closed. The files are already trashed either way;
                     // there is simply no listing left to refresh.
                     return noticed;
@@ -3759,7 +4048,7 @@ impl App {
                 // this issues a plain read (not a navigation), and
                 // `Browser` ignores a `DirLoaded` for a directory that is
                 // no longer current.
-                Task::batch([self.spawn_read_dir(index, dir), noticed])
+                Task::batch([self.spawn_read_dir(at, dir), noticed])
             }
             Message::PrefsSaved(Ok(prefs)) => {
                 // Feeds the next `Ctrl+T`/`+` — see `last_prefs`'s own
@@ -3834,8 +4123,8 @@ impl App {
                 // and all: what is on disk now is a perfectly normal
                 // file, and which application opens it is the same
                 // question it always was.
-                let index = self.active;
-                self.handle_outcome(index, Outcome::Activated(path))
+                let at = self.focused();
+                self.handle_outcome(at, Outcome::Activated(path))
             }
             Message::ArchiveCopiesReady { verb, result: Ok(paths) } => {
                 // The clipboard always holds a *Copy* of the scratch
@@ -3959,8 +4248,8 @@ impl App {
                 // there is no other way to hand it down.
                 self.keyring.remember(&unlocking.archive, unlocking.typed);
                 match unlocking.then {
-                    AfterUnlock::Listing { tab, dir } => match self.tab_index(tab) {
-                        Some(index) => self.spawn_read_dir(index, dir),
+                    AfterUnlock::Listing { tab, dir } => match self.locate(tab) {
+                        Some(at) => self.spawn_read_dir(at, dir),
                         None => Task::none(),
                     },
                     AfterUnlock::Open(path) => self.open_from_archive(path),
@@ -4058,8 +4347,8 @@ impl App {
                 if paths != self.last_prefs.pinned {
                     return Task::none();
                 }
-                for tab in &mut self.tabs {
-                    let _ = tab.browser.update(BrowserMessage::PinnedLoaded(items.clone()));
+                for pane in self.tabs.iter_mut().flat_map(|t| &mut t.panes) {
+                    let _ = pane.browser.update(BrowserMessage::PinnedLoaded(items.clone()));
                 }
                 self.pinned_items = items;
                 Task::none()
@@ -4094,7 +4383,7 @@ impl App {
             }
             Message::ScaleFactor(output) => {
                 self.output_scale = output;
-                let tasks: Vec<Task<Message>> = (0..self.tabs.len()).map(|index| self.tell_scale(index)).collect();
+                let tasks: Vec<Task<Message>> = self.every_pane().into_iter().map(|at| self.tell_scale(at)).collect();
                 Task::batch(tasks)
             }
             Message::WindowSettled(generation) => {
@@ -4143,7 +4432,7 @@ impl App {
     }
 
     fn title(&self) -> String {
-        let name = tab_display_name(self.active_tab().browser.current_dir());
+        let name = tab_display_name(self.active_tab().browser().current_dir());
         format!("{name} \u{2014} Hyprforge Files")
     }
 
@@ -4242,12 +4531,7 @@ impl App {
         // and the status bar below.
         let mut content = column![tabs_row].width(Length::Fill).height(Length::Fill);
 
-        // The window's own width, so the browser can collapse the
-        // sidebar and decide whether the list has to scroll sideways —
-        // both properties of the window, which is this crate's business
-        // to know and not the model's to go looking for.
-        let viewport_width = self.last_window_size.0 as f32;
-        content = content.push(tab.browser.view(scale, viewport_width).map(Message::Browser));
+        content = content.push(self.panes_view(tab, scale));
 
         // Running work is in the tab strip's transfers control now, not
         // a panel here — see `transfers_view`. What stays below the
@@ -4295,7 +4579,7 @@ impl App {
             return iced::widget::stack![window, sheet.view(scale).map(Message::BulkRename)].into();
         }
         if let Some(sheet) = &self.preferences {
-            let prefs = self.active_tab().browser.prefs();
+            let prefs = self.active_tab().browser().prefs();
             let over = sheet.view(&self.config, prefs, scale).map(Message::Preferences);
             return iced::widget::stack![window, over].into();
         }
@@ -4330,10 +4614,53 @@ impl App {
         if let Some(layer) = transfers_view::overlay(self, scale) {
             return iced::widget::stack![window, layer].into();
         }
-        match tab.browser.menu_overlay(scale, size) {
-            Some(overlay) => iced::widget::stack![window, overlay.map(Message::Browser)].into(),
+        // The pane with the keyboard is the one a menu can be open in: a
+        // right click chooses its pane before it opens anything.
+        let pane = tab.pane();
+        let id = pane.id;
+        match pane.browser.menu_overlay(scale, size) {
+            Some(overlay) => iced::widget::stack![window, overlay.map(move |m| Message::Pane(id, m))].into(),
             None => window,
         }
+    }
+
+    /// The tab's listing — or, split, its two side by side, each given
+    /// its own half of the window's width.
+    ///
+    /// The width is the pane's own, not the window's, because what it
+    /// decides is about the pane: whether the sidebar collapses to its
+    /// rail, and whether the list has to scroll sideways. Both are
+    /// properties of the room a listing actually has, which this crate
+    /// knows and the model has no business going looking for.
+    ///
+    /// The left pane is the whole browser; the right one is drawn bare —
+    /// its own path bar, no second sidebar or toolbar (see
+    /// `browser::Chrome`). The pane with the keyboard carries a strip of
+    /// the accent across its top: the accent means "this one", the same
+    /// claim the tab strip's dot makes about the tab.
+    fn panes_view<'a>(&'a self, tab: &'a Tab, scale: FontScale) -> Element<'a, Message> {
+        use hyprforge_files_core::Chrome;
+        let width = self.last_window_size.0 as f32;
+        if !tab.is_split() {
+            let pane = tab.pane();
+            let id = pane.id;
+            return pane.browser.view(scale, width).map(move |m| Message::Pane(id, m));
+        }
+        let half = ((width - SPLIT_DIVIDER) / 2.0).max(0.0);
+        let mut both = row![].height(Length::Fill);
+        for (index, pane) in tab.panes.iter().enumerate() {
+            if index > 0 {
+                both = both.push(hyprforge_ui::widgets::vertical_divider());
+            }
+            let chrome = if index == 0 { Chrome::Full } else { Chrome::Bare };
+            let id = pane.id;
+            let view = pane.browser.view_as(scale, half, chrome).map(move |m| Message::Pane(id, m));
+            let focused = index == tab.focused;
+            both = both.push(
+                column![pane_edge(focused), view].width(Length::FillPortion(1)).height(Length::Fill),
+            );
+        }
+        both.into()
     }
 
     /// Keys become `Message::KeyPressed`, and what they mean is decided
@@ -4405,13 +4732,16 @@ impl App {
             return None;
         }
         let devices = self.devices.snapshot();
+        // Every pane, both halves of a split tab included: the folder on
+        // the right is on screen too.
         let dirs: std::collections::BTreeSet<PathBuf> = self
             .tabs
             .iter()
+            .flat_map(|tab| &tab.panes)
             // Already known to be inside an archive: not a folder on
             // disk. One not yet listed is caught by the watch's own check.
-            .filter(|tab| !tab.browser.in_archive())
-            .map(|tab| tab.browser.current_dir().to_path_buf())
+            .filter(|pane| !pane.browser.in_archive())
+            .map(|pane| pane.browser.current_dir().to_path_buf())
             .collect();
         if dirs.is_empty() {
             return None;
@@ -4445,11 +4775,22 @@ impl App {
         }
     }
 
-    /// The tabs as `files-session.toml` keeps them.
+    /// The tabs as `files-session.toml` keeps them: each tab's left pane,
+    /// and for a split tab its right pane and which had the keyboard.
     fn session_now(&self) -> hyprforge_files::session::Session {
-        hyprforge_files::session::Session {
-            tabs: self.tabs.iter().map(|tab| tab.browser.current_dir().to_path_buf()).collect(),
+        use hyprforge_files::session::{Session, Split};
+        Session {
+            tabs: self.tabs.iter().map(|tab| tab.panes[0].browser.current_dir().to_path_buf()).collect(),
             active: self.active,
+            splits: self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, tab)| {
+                    let second = tab.panes.get(1)?;
+                    Some(Split { tab: index, second: second.browser.current_dir().to_path_buf(), focused: tab.focused })
+                })
+                .collect(),
         }
     }
 }
@@ -5015,6 +5356,36 @@ use transfers_view::{Transfers, TransfersMessage};
 mod devices_view;
 use devices_view::ConnectMessage;
 
+/// Whether any text field in the window has the keyboard.
+///
+/// Tab moves between the panes of a split tab, and a text field does not
+/// take Tab — so it arrives at the keymap even while someone is typing in
+/// the search field, where leaving the pane would strand the field's
+/// focus in the pane they left. The browser cannot say whether its field
+/// is focused; iced keeps that in the widget tree. So the tree is asked.
+mod field_focus {
+    use iced::advanced::widget::operation::{Focusable, Operation, Outcome};
+    use iced::advanced::widget::Id;
+    use iced::Rectangle;
+
+    #[derive(Default)]
+    pub struct AnyFocused(bool);
+
+    impl Operation<bool> for AnyFocused {
+        fn focusable(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Focusable) {
+            self.0 |= state.is_focused();
+        }
+
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<bool>)) {
+            operate(self);
+        }
+
+        fn finish(&self) -> Outcome<bool> {
+            Outcome::Some(self.0)
+        }
+    }
+}
+
 mod pointer {
     use iced::{event, mouse, Event, Subscription};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -5158,9 +5529,9 @@ impl DebugShow {
 
     /// Everything that needs rows, once the first listing is in. Each
     /// happens once.
-    fn after_listing(&mut self, app: &mut App, index: usize) -> Task<Message> {
+    fn after_listing(&mut self, app: &mut App, index: At) -> Task<Message> {
         use hyprforge_files_core::browser::MenuSpot;
-        let browser = &mut app.tabs[index].browser;
+        let browser = &mut app.pane_mut(index).browser;
         if let Some(at) = self.menu_at.take() {
             browser.update(BrowserMessage::OpenContextMenu { spot: MenuSpot::Row(0), at });
         }
@@ -5301,6 +5672,33 @@ fn tab_button_style(status: button::Status, is_active: bool) -> button::Style {
 /// The floating window's outer chrome: background at the root surface,
 /// corners rounded to the compositor's own `decoration:rounding` (via
 /// `Theme::rounding`) rather than a value this app invented.
+/// The line between the two panes of a split tab, in logical pixels —
+/// what the two halves' widths leave room for.
+const SPLIT_DIVIDER: f32 = 1.0;
+
+/// How tall the strip over a pane is that says it has the keyboard.
+const PANE_EDGE: f32 = 2.0;
+
+/// The strip across the top of each pane of a split tab: the accent over
+/// the one with the keyboard, and the header's own plane over the other,
+/// where it disappears into the chrome. Always drawn, in both, so
+/// choosing a pane changes a colour and never moves a listing by two
+/// pixels.
+fn pane_edge<'a>(focused: bool) -> Element<'a, Message> {
+    container(iced::widget::Space::new())
+        .width(Length::Fill)
+        .height(Length::Fixed(PANE_EDGE))
+        .style(move |_t: &Theme| container::Style {
+            background: Some(Background::Color(if focused {
+                hyprforge_ui::color::to_iced(hyprforge_ui::theme::active().accent)
+            } else {
+                hyprforge_ui::theme::surface::sidebar()
+            })),
+            ..container::Style::default()
+        })
+        .into()
+}
+
 fn window_frame_style(_theme: &Theme) -> container::Style {
     // `density::outer_radius`, not a second read of `Theme::rounding`:
     // the radius ladder (12 outer / 6 inner / 4 nested) has one source,
@@ -5320,7 +5718,9 @@ fn window_frame_style(_theme: &Theme) -> container::Style {
 fn tab_widget(index: usize, tab: &Tab, is_active: bool, scale: FontScale) -> Element<'_, Message> {
     let height = scale.apply(hyprforge_files::tabstrip::height(is_active));
     let mark = hyprforge_files::tabstrip::identity_mark(tab_dot_color(is_active), scale);
-    let name = tab_display_name(tab.browser.current_dir());
+    // A split tab is named for the pane with the keyboard: that is the
+    // folder the person is in.
+    let name = tab_display_name(tab.browser().current_dir());
 
     // Dim text on an inactive tab, full brightness on the active one.
     // The identity mark above keeps its colour either way — see
@@ -5506,8 +5906,10 @@ fn merge_tab_prefs(on_disk: &Prefs, mut from_tab: Prefs) -> Prefs {
 /// A session as written: each tab inside an archive kept as the folder
 /// holding it — see `session::kept_as`. Blocking.
 fn keep_as(session: hyprforge_files::session::Session) -> hyprforge_files::session::Session {
-    hyprforge_files::session::Session {
-        tabs: session.tabs.iter().map(|dir| hyprforge_files::session::kept_as(dir)).collect(),
+    use hyprforge_files::session::{kept_as, Session, Split};
+    Session {
+        tabs: session.tabs.iter().map(|dir| kept_as(dir)).collect(),
+        splits: session.splits.iter().map(|split| Split { second: kept_as(&split.second), ..split.clone() }).collect(),
         ..session
     }
 }
@@ -5693,9 +6095,9 @@ mod tests {
         let _ = app.update(Message::Dnd(DropEvent::Over { x: 3.0, y: 3.0 }));
         assert_eq!(app.drop_probe.1, Some((3.0, 3.0)), "only the newest waits");
 
-        let _ = app.update(Message::DropHit(Some(PathBuf::from("/a/docs")), None));
+        let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
         assert!(app.drop_probe.0 && app.drop_probe.1.is_none(), "the waiting one went out");
-        let _ = app.update(Message::DropHit(Some(PathBuf::from("/a/docs")), None));
+        let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
         assert!(!app.drop_probe.0);
     }
 
@@ -5726,17 +6128,17 @@ mod tests {
         let _ = app.update(Message::Dnd(DropEvent::Over { x: 1.0, y: 1.0 }));
         let _ = app.update(Message::Dnd(DropEvent::Left));
         // The hit-test that went out on `Over` comes back late.
-        let _ = app.update(Message::DropHit(Some(PathBuf::from("/a/docs")), None));
-        assert!(!format!("{:?}", app.tabs[0].browser).contains("drop_hover: Some"));
+        let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
+        assert!(!format!("{:?}", app.tabs[0].browser()).contains("drop_hover: Some"));
     }
 
     #[test]
     fn a_drag_leaving_the_window_unlights_the_folder() {
         use hyprforge_files::dnd::DropEvent;
         let mut app = app_for_test(&["/a"]);
-        let _ = app.update(Message::DropHit(Some(PathBuf::from("/a/docs")), None));
+        let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
         let _ = app.update(Message::Dnd(DropEvent::Left));
-        assert!(!format!("{:?}", app.tabs[0].browser).contains("drop_hover: Some"));
+        assert!(!format!("{:?}", app.tabs[0].browser()).contains("drop_hover: Some"));
     }
 
     #[test]
@@ -5761,19 +6163,19 @@ mod tests {
         let mut app = app_for_test(&["/a"]);
         let _ = app.update(Message::Browser(BrowserMessage::EditPath));
         type_path(&mut app, "~/p");
-        assert!(app.tabs[0].resolving);
+        assert!(app.tabs[0].pane().resolving);
         type_path(&mut app, "~/pr");
         type_path(&mut app, "~/pro");
         type_path(&mut app, "~/proj");
-        let waiting = app.tabs[0].resolve_next.as_ref().map(|r| r.text.as_str());
+        let waiting = app.tabs[0].pane().resolve_next.as_ref().map(|r| r.text.as_str());
         assert_eq!(waiting, Some("~/proj"), "the letters in between are never resolved");
 
         let _ = app.update(Message::PathResolved(0, "~/p".to_string(), vec![]));
-        assert!(app.tabs[0].resolving, "the newest went out as the old one came back");
-        assert!(app.tabs[0].resolve_next.is_none());
+        assert!(app.tabs[0].pane().resolving, "the newest went out as the old one came back");
+        assert!(app.tabs[0].pane().resolve_next.is_none());
 
         let _ = app.update(Message::PathResolved(0, "~/proj".to_string(), vec![]));
-        assert!(!app.tabs[0].resolving, "and nothing after it");
+        assert!(!app.tabs[0].pane().resolving, "and nothing after it");
     }
 
     #[test]
@@ -5786,7 +6188,7 @@ mod tests {
         let tab = keymap::KeyPress { key: keymap::Key::Tab, mods: Default::default(), text: None };
         let _ = app.update(Message::KeyPressed(tab));
         // Through the browser's own state: what the field now holds.
-        let shown = format!("{:?}", app.tabs[0].browser);
+        let shown = format!("{:?}", app.tabs[0].browser());
         assert!(shown.contains("text: \"/usr/\""), "{shown}");
     }
 
@@ -5821,7 +6223,7 @@ mod tests {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
         app.mime = Arc::new(mime);
-        let _ = app.handle_outcome(0, Outcome::Activated("/a/part.stl".into()));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Activated("/a/part.stl".into()));
         let chooser = app.chooser.expect("a chooser, not a browser");
         assert_eq!(chooser.mime.as_deref(), Some("model/stl"));
         assert_eq!(chooser.reason, ChooserReason::NothingHandlesIt);
@@ -5840,7 +6242,7 @@ mod tests {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
         app.mime = Arc::new(mime);
-        let _ = app.handle_outcome(0, Outcome::Activated("/a/page.html".into()));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Activated("/a/page.html".into()));
         assert_eq!(app.chooser, None);
     }
 
@@ -5852,11 +6254,11 @@ mod tests {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
         app.mime = Arc::new(mime);
-        let _ = app.handle_outcome(0, Outcome::Activated("/a/mystery.qqq".into()));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Activated("/a/mystery.qqq".into()));
         assert_eq!(app.chooser, None);
 
         let mut bare = app_for_test(&["/a"]);
-        let _ = bare.handle_outcome(0, Outcome::Activated("/a/page.html".into()));
+        let _ = bare.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Activated("/a/page.html".into()));
         assert_eq!(bare.chooser, None, "no database means no opinion");
     }
 
@@ -5870,7 +6272,7 @@ mod tests {
         let mut config = (*app.config).clone();
         config.terminal = Some(vec!["no-such-terminal-xyz".to_string()]);
         app.config = Arc::new(config);
-        let _ = app.handle_outcome(0, Outcome::OpenTerminal("/a".into()));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::OpenTerminal("/a".into()));
         let said = app.status.clone().expect("a sentence");
         assert!(said.contains("no-such-terminal-xyz") && said.contains("Preferences"), "{said}");
     }
@@ -5912,7 +6314,7 @@ mod tests {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
         app.mime = Arc::new(mime);
-        let _ = app.handle_outcome(0, Outcome::OpenWith("/a/page.html".into()));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::OpenWith("/a/page.html".into()));
         let chooser = app.chooser.clone().expect("a chooser");
         assert_eq!(chooser.reason, ChooserReason::Asked);
         assert!(!chooser.all);
@@ -5931,7 +6333,7 @@ mod tests {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
         app.mime = Arc::new(mime);
-        let _ = app.handle_outcome(0, Outcome::OpenWith("/a/page.html".into()));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::OpenWith("/a/page.html".into()));
 
         let typing = hyprforge_files_core::keymap::KeyPress {
             key: keymap::Key::Char('n'),
@@ -5940,7 +6342,7 @@ mod tests {
         };
         let _ = app.update(Message::KeyPressed(typing));
         assert!(app.chooser.is_some(), "still up");
-        assert_eq!(app.tabs[0].browser.search_query(), "", "and nothing was typed behind it");
+        assert_eq!(app.tabs[0].browser().search_query(), "", "and nothing was typed behind it");
 
         let escape = hyprforge_files_core::keymap::KeyPress {
             key: keymap::Key::Escape,
@@ -5958,9 +6360,9 @@ mod tests {
     fn alt_enter_opens_and_closes_properties_in_the_active_tab() {
         let mut app = app_for_test(&["/a"]);
         let _ = app.update(key("Alt+Enter"));
-        assert!(app.tabs[0].browser.properties_open());
+        assert!(app.tabs[0].browser().properties_open());
         let _ = app.update(key("Alt+Enter"));
-        assert!(!app.tabs[0].browser.properties_open());
+        assert!(!app.tabs[0].browser().properties_open());
     }
 
     /// An answer is routed by tab id, so one arriving after a switch
@@ -5970,13 +6372,13 @@ mod tests {
         use hyprforge_files_core::properties::{Message as Inspector, Tally, TallyState};
         let mut app = app_for_test(&["/a"]);
         let _ = app.update(key("Alt+Enter"));
-        let asked = app.tabs[0].id;
-        let generation = app.tabs[0].browser.inspector().unwrap().generation();
+        let asked = app.tabs[0].pane().id;
+        let generation = app.tabs[0].browser().inspector().unwrap().generation();
         let _ = app.update(key("Ctrl+T"));
         assert_ne!(app.active, 0);
         let tally = Tally { bytes: 7, state: TallyState::Done, ..Tally::default() };
         let _ = app.update(Message::Properties(asked, Inspector::Tallied { generation, tally }));
-        assert_eq!(app.tabs[0].browser.inspector().unwrap().tally(), Some(tally));
+        assert_eq!(app.tabs[0].browser().inspector().unwrap().tally(), Some(tally));
     }
 
     #[test]
@@ -5985,7 +6387,7 @@ mod tests {
         let _ = app.update(key("Ctrl+,"));
         assert!(app.preferences.is_some());
         let _ = app.update(typed('n'));
-        assert_eq!(app.tabs[0].browser.search_query(), "", "nothing reaches the listing behind the sheet");
+        assert_eq!(app.tabs[0].browser().search_query(), "", "nothing reaches the listing behind the sheet");
         let _ = app.update(key("Escape"));
         assert!(app.preferences.is_none());
     }
@@ -6034,7 +6436,7 @@ mod tests {
         let (_dir, mime) = mime_fixture();
         let mut app = app_for_test(&["/a"]);
         app.mime = Arc::new(mime);
-        let _ = app.handle_outcome(0, Outcome::OpenWith("/a/page.html".into()));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::OpenWith("/a/page.html".into()));
         let _ = app.update(Message::ChooseApp("browser.desktop".to_string()));
         assert_eq!(app.chooser, None);
     }
@@ -6147,14 +6549,14 @@ mod tests {
     #[test]
     fn a_pin_made_in_one_tab_reaches_every_tab() {
         let mut app = app_for_test(&["/a", "/b"]);
-        let _ = app.handle_outcome(0, Outcome::Pins(PinChange::Pin("/a".into())));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Pins(PinChange::Pin("/a".into())));
         assert_eq!(app.last_prefs.pinned, vec![PathBuf::from("/a")]);
         let _ = app.update(Message::PinnedLoaded(vec![pinned_item("/a")]));
         for tab in &app.tabs {
-            assert_eq!(tab.browser.pinned(), &[pinned_item("/a")]);
+            assert_eq!(tab.browser().pinned(), &[pinned_item("/a")]);
         }
         let _ = app.open_tab("/c".into());
-        assert_eq!(app.tabs[2].browser.pinned(), &[pinned_item("/a")], "a new tab too");
+        assert_eq!(app.tabs[2].browser().pinned(), &[pinned_item("/a")], "a new tab too");
     }
 
     /// A read that started before a later change must not put the older
@@ -6162,10 +6564,10 @@ mod tests {
     #[test]
     fn a_stale_pinned_read_is_ignored() {
         let mut app = app_for_test(&["/a"]);
-        let _ = app.handle_outcome(0, Outcome::Pins(PinChange::Pin("/a".into())));
-        let _ = app.handle_outcome(0, Outcome::Pins(PinChange::Pin("/b".into())));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Pins(PinChange::Pin("/a".into())));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Pins(PinChange::Pin("/b".into())));
         let _ = app.update(Message::PinnedLoaded(vec![pinned_item("/a")]));
-        assert!(app.tabs[0].browser.pinned().is_empty());
+        assert!(app.tabs[0].browser().pinned().is_empty());
     }
 
     /// A tab saving its view settings must not put back pins or a window
@@ -6215,23 +6617,23 @@ mod tests {
     #[test]
     fn a_stale_dir_loaded_result_is_ignored() {
         let mut app = app_for_test(&["/dir"]);
-        let tab_id = app.tabs[0].id;
+        let tab_id = app.tabs[0].pane().id;
 
         // Simulate two reads having been issued for /dir: generation 1
         // (slow — about to arrive) and generation 2 (fast — arrives
         // first, below).
-        app.tabs[0].read_generation = 2;
+        app.tabs[0].pane_mut().read_generation = 2;
 
         let fresh = vec![entry_named("fresh.txt")];
         let _ = app.update(Message::DirLoaded(tab_id, 2, PathBuf::from("/dir"), Ok(fresh.clone())));
-        assert_eq!(row_names(&app.tabs[0].browser), names_of(&fresh));
+        assert_eq!(row_names(app.tabs[0].browser()), names_of(&fresh));
 
         // The stale generation-1 result now arrives, for the same path.
         let stale = vec![entry_named("stale.txt")];
         let _ = app.update(Message::DirLoaded(tab_id, 1, PathBuf::from("/dir"), Ok(stale)));
 
         assert_eq!(
-            row_names(&app.tabs[0].browser),
+            row_names(app.tabs[0].browser()),
             names_of(&fresh),
             "the stale generation-1 result must not have overwritten the fresh listing"
         );
@@ -6240,12 +6642,12 @@ mod tests {
     #[test]
     fn a_matching_generation_is_applied() {
         let mut app = app_for_test(&["/dir"]);
-        let tab_id = app.tabs[0].id;
-        app.tabs[0].read_generation = 1;
+        let tab_id = app.tabs[0].pane().id;
+        app.tabs[0].pane_mut().read_generation = 1;
 
         let entries = vec![entry_named("a.txt")];
         let _ = app.update(Message::DirLoaded(tab_id, 1, PathBuf::from("/dir"), Ok(entries.clone())));
-        assert_eq!(row_names(&app.tabs[0].browser), names_of(&entries));
+        assert_eq!(row_names(app.tabs[0].browser()), names_of(&entries));
     }
 
     /// The bug the brief names as the one "most likely to exist and
@@ -6255,13 +6657,13 @@ mod tests {
     #[test]
     fn a_read_that_completes_after_switching_tabs_lands_in_the_tab_that_asked_for_it() {
         let mut app = app_for_test(&["/one", "/two"]);
-        let tab_two_id = app.tabs[1].id;
+        let tab_two_id = app.tabs[1].pane().id;
 
         // Tab 2 issues a read (its generation becomes 1) while it's the
         // active tab...
         app.active = 1;
-        let _ = app.spawn_read_dir(1, PathBuf::from("/two"));
-        assert_eq!(app.tabs[1].read_generation, 1);
+        let _ = app.spawn_read_dir(At { tab: 1, pane: 0 }, PathBuf::from("/two"));
+        assert_eq!(app.tabs[1].pane().read_generation, 1);
 
         // ...then the user switches back to tab 1 before it comes back.
         app.active = 0;
@@ -6270,12 +6672,12 @@ mod tests {
         let _ = app.update(Message::DirLoaded(tab_two_id, 1, PathBuf::from("/two"), Ok(two_entries.clone())));
 
         assert_eq!(
-            row_names(&app.tabs[1].browser),
+            row_names(app.tabs[1].browser()),
             names_of(&two_entries),
             "the result must still reach tab 2, even though it is no longer visible"
         );
         assert!(
-            app.tabs[0].browser.rows().is_empty(),
+            app.tabs[0].browser().rows().is_empty(),
             "tab 1, the one actually on screen, must not have received tab 2's listing"
         );
     }
@@ -6287,14 +6689,14 @@ mod tests {
     #[test]
     fn a_dir_loaded_for_a_since_closed_tab_is_ignored_without_panicking() {
         let mut app = app_for_test(&["/one", "/two"]);
-        let closed_id = app.tabs[1].id;
+        let closed_id = app.tabs[1].pane().id;
         let _ = app.close_tab(1);
         assert_eq!(app.tabs.len(), 1, "the tab must actually be gone");
 
         let _ = app.update(Message::DirLoaded(closed_id, 1, PathBuf::from("/two"), Ok(vec![])));
         // No panic reaching here is most of what this test checks; the
         // rest is that the surviving tab was left alone.
-        assert_eq!(app.tabs[0].browser.current_dir(), Path::new("/one"));
+        assert_eq!(app.tabs[0].browser().current_dir(), Path::new("/one"));
     }
 
     // --- tabs: switching keeps each tab's own directory and history -------
@@ -6306,21 +6708,21 @@ mod tests {
         // Navigate tab 1 somewhere else, then switch to tab 2 and
         // navigate it somewhere else too.
         let _ = app.update(Message::Browser(BrowserMessage::Navigate(PathBuf::from("/one/sub"))));
-        assert_eq!(app.tabs[0].browser.current_dir(), Path::new("/one/sub"));
+        assert_eq!(app.tabs[0].browser().current_dir(), Path::new("/one/sub"));
 
         app.active = 1;
         let _ = app.update(Message::Browser(BrowserMessage::Navigate(PathBuf::from("/two/sub"))));
-        assert_eq!(app.tabs[1].browser.current_dir(), Path::new("/two/sub"));
+        assert_eq!(app.tabs[1].browser().current_dir(), Path::new("/two/sub"));
 
         // Switching back to tab 1 must not have disturbed where it was,
         // nor its back-history (built by the `Navigate` above).
         app.active = 0;
         assert_eq!(
-            app.tabs[0].browser.current_dir(),
+            app.tabs[0].browser().current_dir(),
             Path::new("/one/sub"),
             "tab 1 must still be where it was navigated, unaffected by tab 2's own navigation"
         );
-        let outcome = app.tabs[0].browser.update(BrowserMessage::GoBack);
+        let outcome = app.tabs[0].browser_mut().update(BrowserMessage::GoBack);
         assert_eq!(
             outcome,
             Outcome::ReadDir(PathBuf::from("/one")),
@@ -6337,7 +6739,7 @@ mod tests {
         let _ = app.close_tab(1);
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(app.active, 1, "the tab that slid into slot 1 (originally /c) is the sensible neighbour");
-        assert_eq!(app.tabs[app.active].browser.current_dir(), Path::new("/c"));
+        assert_eq!(app.tabs[app.active].browser().current_dir(), Path::new("/c"));
     }
 
     #[test]
@@ -6494,9 +6896,9 @@ mod tests {
             Ok(vec![entry_named("alpha.txt"), entry_named("beta.txt")]),
         )));
         let _ = app.update(typed('b'));
-        assert_eq!(app.active_tab().browser.rows().len(), 1);
+        assert_eq!(app.active_tab().browser().rows().len(), 1);
         let _ = app.update(key("Escape"));
-        assert_eq!(app.active_tab().browser.rows().len(), 2);
+        assert_eq!(app.active_tab().browser().rows().len(), 2);
     }
 
     #[test]
@@ -6507,7 +6909,7 @@ mod tests {
             Ok(vec![entry_named("a.txt"), entry_named("b.txt"), entry_named("c.txt")]),
         )));
         let _ = app.update(key("Ctrl+A"));
-        assert_eq!(app.active_tab().browser.selected_shown().len(), 3);
+        assert_eq!(app.active_tab().browser().selected_shown().len(), 3);
     }
 
     /// The Menu key goes out to the window for the pointer and back in
@@ -6520,9 +6922,9 @@ mod tests {
             Ok(vec![entry_named("a.txt")]),
         )));
         let _ = app.update(key("Menu"));
-        assert!(app.active_tab().browser.menu_open());
+        assert!(app.active_tab().browser().menu_open());
         let _ = app.update(key("Escape"));
-        assert!(!app.active_tab().browser.menu_open());
+        assert!(!app.active_tab().browser().menu_open());
     }
 
     #[test]
@@ -6536,7 +6938,7 @@ mod tests {
             spot: hyprforge_files_core::browser::MenuSpot::Row(0),
             at: (0.0, 0.0),
         }));
-        assert!(app.active_tab().browser.menu_open());
+        assert!(app.active_tab().browser().menu_open());
     }
 
     /// A Ctrl-held letter nobody bound must not type into search — it is
@@ -6553,7 +6955,7 @@ mod tests {
             mods: keymap::Modifiers { ctrl: true, ..keymap::Modifiers::default() },
             text: Some('q'),
         }));
-        assert_eq!(app.active_tab().browser.rows().len(), 1, "no search was typed");
+        assert_eq!(app.active_tab().browser().rows().len(), 1, "no search was typed");
     }
 
     fn space() -> Message {
@@ -6575,9 +6977,9 @@ mod tests {
         )));
         let _ = app.update(key("Down"));
         let _ = app.update(space());
-        assert!(app.active_tab().browser.quick_look_open());
+        assert!(app.active_tab().browser().quick_look_open());
         let _ = app.update(space());
-        assert!(!app.active_tab().browser.quick_look_open());
+        assert!(!app.active_tab().browser().quick_look_open());
     }
 
     /// A Space between two words of a search typed at the listing is the
@@ -6594,8 +6996,8 @@ mod tests {
         }
         let _ = app.update(space());
         let _ = app.update(typed('n'));
-        assert_eq!(app.active_tab().browser.search_query(), "my n");
-        assert!(!app.active_tab().browser.quick_look_open());
+        assert_eq!(app.active_tab().browser().search_query(), "my n");
+        assert!(!app.active_tab().browser().quick_look_open());
     }
 
     /// Switching tabs is a key the browser never sees, and must not
@@ -6609,9 +7011,9 @@ mod tests {
         )));
         let _ = app.update(key("Down"));
         let _ = app.update(space());
-        assert!(app.active_tab().browser.quick_look_open());
+        assert!(app.active_tab().browser().quick_look_open());
         let _ = app.update(key("Ctrl+Tab"));
-        assert!(!app.tabs[0].browser.quick_look_open());
+        assert!(!app.tabs[0].browser().quick_look_open());
     }
 
     // --- ctrl/shift click ---------------------------------------------------
@@ -6639,7 +7041,7 @@ mod tests {
             ctrl: false,
             shift: false,
         }));
-        assert_eq!(app.active_tab().browser.selection().selected_paths().len(), 1);
+        assert_eq!(app.active_tab().browser().selection().selected_paths().len(), 1);
 
         // Ctrl goes down, and the same message — which the view still
         // builds with `ctrl: false` — now adds to the selection instead
@@ -6653,7 +7055,7 @@ mod tests {
             shift: false,
         }));
         assert_eq!(
-            app.active_tab().browser.selection().selected_paths().len(),
+            app.active_tab().browser().selection().selected_paths().len(),
             2,
             "ctrl-click must add to the selection, not replace it"
         );
@@ -6679,7 +7081,7 @@ mod tests {
             ctrl: false,
             shift: false,
         }));
-        assert_eq!(app.active_tab().browser.selection().selected_paths().len(), 3);
+        assert_eq!(app.active_tab().browser().selection().selected_paths().len(), 3);
     }
 
     // --- double click to open ------------------------------------------------
@@ -6714,14 +7116,14 @@ mod tests {
 
         let _ = app.update(clicked(0));
         assert_eq!(
-            app.active_tab().browser.current_dir(),
+            app.active_tab().browser().current_dir(),
             Path::new("/dir"),
             "one click selects and stays put"
         );
 
         let _ = app.update(clicked(0));
         assert_eq!(
-            app.active_tab().browser.current_dir(),
+            app.active_tab().browser().current_dir(),
             Path::new("/dir/sub"),
             "the second click opens the folder"
         );
@@ -6737,7 +7139,7 @@ mod tests {
             Ok(vec![entry_named("a.txt"), entry_named("b.txt")]),
         )));
         let _ = app.update(clicked(1));
-        assert_eq!(app.active_tab().browser.selection().selected_paths().len(), 1);
+        assert_eq!(app.active_tab().browser().selection().selected_paths().len(), 1);
     }
 
     /// A ctrl-click is a selection gesture, never half of an open — and
@@ -6760,7 +7162,7 @@ mod tests {
         let _ = app.update(clicked(0));
         let _ = app.update(clicked(0));
         assert_eq!(
-            app.active_tab().browser.current_dir(),
+            app.active_tab().browser().current_dir(),
             Path::new("/dir"),
             "ctrl-clicking twice selects and deselects; it does not open"
         );
@@ -6799,7 +7201,7 @@ mod tests {
         )));
         let _ = app.update(clicked(0));
         assert_eq!(
-            app.active_tab().browser.current_dir(),
+            app.active_tab().browser().current_dir(),
             Path::new("/dir/sub"),
             "the first click in the new folder selects; it must not open"
         );
@@ -6819,7 +7221,7 @@ mod tests {
     /// would have — iced runs that task; a test stands in for it.
     fn paste(app: &mut App) {
         let _ = app.update(key("Ctrl+V"));
-        let into = app.active_tab().browser.current_dir().to_path_buf();
+        let into = app.active_tab().browser().current_dir().to_path_buf();
         let clip = app.clipboard.get();
         let _ = app.update(Message::PasteFrom(into, clip));
     }
@@ -6843,7 +7245,7 @@ mod tests {
 
         let _ = app.update(key("Ctrl+A"));
         let _ = app.update(key("Ctrl+C"));
-        assert!(app.active_tab().browser.action_context().can_paste, "the tab knows there is something");
+        assert!(app.active_tab().browser().action_context().can_paste, "the tab knows there is something");
         paste(&mut app);
         assert_eq!(app.jobs.len(), 1, "a paste job is running");
 
@@ -6875,7 +7277,7 @@ mod tests {
         app.clipboard.clear();
         let _ = app.update(Message::ClipboardCleared);
         assert_eq!(app.clipboard.get(), None);
-        assert!(!app.active_tab().browser.action_context().can_paste);
+        assert!(!app.active_tab().browser().action_context().can_paste);
         wait_until("the move", || to.path().join("a.txt").exists());
     }
 
@@ -7047,12 +7449,12 @@ mod tests {
         let from = dir.path().join("a.txt");
         let to = dir.path().join("b.txt");
         let result = jobs::rename(&from, &to);
-        let _ = app.update(Message::Renamed(app.tabs[0].id, from.clone(), to.clone(), result));
+        let _ = app.update(Message::Renamed(app.tabs[0].pane().id, from.clone(), to.clone(), result));
         let entries = RoutingBackend::default().read_dir(dir.path()).unwrap();
         let _ = app.update(Message::Browser(BrowserMessage::DirLoaded(dir.path().to_path_buf(), Ok(entries))));
 
         assert!(to.exists() && !from.exists());
-        assert_eq!(app.active_tab().browser.selected_shown(), [to]);
+        assert_eq!(app.active_tab().browser().selected_shown(), [to]);
     }
 
     /// Escape in the rename field reaches the browser even though the
@@ -7189,7 +7591,7 @@ mod tests {
 
         let mut app = app_for_test(&["/dir"]);
         let _ = app.update(Message::RestoreReady(
-            app.tabs[0].id,
+            app.tabs[0].pane().id,
             vec![(stored.clone(), original.clone(), record.clone())],
             vec![],
         ));
@@ -7634,14 +8036,14 @@ mod tests {
 
         // The batch runs on a task iced would deliver; stand in for it.
         let result = hyprforge_files::bulk_rename::run(renames);
-        let _ = app.update(Message::BulkRenamed(app.tabs[0].id, result));
+        let _ = app.update(Message::BulkRenamed(app.tabs[0].pane().id, result));
         let entries = RoutingBackend::default().read_dir(dir.path()).unwrap();
         let _ = app.update(Message::Browser(BrowserMessage::DirLoaded(dir.path().to_path_buf(), Ok(entries))));
 
         assert!(app.bulk_rename.is_none(), "the sheet closes on success");
         assert_eq!(std::fs::read_to_string(&one).unwrap(), "was two");
         assert_eq!(std::fs::read_to_string(&two).unwrap(), "was one");
-        assert_eq!(app.active_tab().browser.selected_shown().len(), 2, "both stay selected");
+        assert_eq!(app.active_tab().browser().selected_shown().len(), 2, "both stay selected");
         assert_eq!(app.notice.as_ref().map(|(_, t)| t.as_str()), Some("Renamed 2 items"));
 
         let _ = app.update(key("Ctrl+Z"));
@@ -7673,7 +8075,7 @@ mod tests {
         // Something called "c" appears between the preview and the rename.
         std::fs::write(dir.path().join("c"), "someone else's").unwrap();
         let result = hyprforge_files::bulk_rename::run(renames);
-        let _ = app.update(Message::BulkRenamed(app.tabs[0].id, result));
+        let _ = app.update(Message::BulkRenamed(app.tabs[0].pane().id, result));
 
         let (_, sheet) = app.bulk_rename.as_ref().expect("still open");
         assert!(!sheet.applying(), "and usable again");
@@ -7704,7 +8106,7 @@ mod tests {
         let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
         std::fs::write(&b, "x").unwrap();
         let mut app = app_on(dir.path());
-        let _ = app.update(Message::Renamed(app.tabs[0].id, a.clone(), b.clone(), Ok(())));
+        let _ = app.update(Message::Renamed(app.tabs[0].pane().id, a.clone(), b.clone(), Ok(())));
         assert_eq!(app.notice.as_ref().map(|(_, t)| t.as_str()), Some("Renamed to \u{201C}b.txt\u{201D}"));
 
         let _ = app.update(key("Ctrl+Z"));
@@ -7725,17 +8127,17 @@ mod tests {
     fn a_star_follows_a_rename_and_its_undo() {
         let mut app = app_for_test(&["/dir", "/elsewhere"]);
         let (a, b) = (PathBuf::from("/dir/a.txt"), PathBuf::from("/dir/b.txt"));
-        let _ = app.handle_outcome(0, Outcome::Stars(hyprforge_files_core::starred::StarChange::Star(vec![a.clone()])));
-        let _ = app.update(Message::Renamed(app.tabs[0].id, a.clone(), b.clone(), Ok(())));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Stars(hyprforge_files_core::starred::StarChange::Star(vec![a.clone()])));
+        let _ = app.update(Message::Renamed(app.tabs[0].pane().id, a.clone(), b.clone(), Ok(())));
         assert_eq!(app.last_prefs.starred, std::slice::from_ref(&b));
         for tab in &app.tabs {
-            assert_eq!(tab.browser.prefs().starred, std::slice::from_ref(&b), "every tab follows");
+            assert_eq!(tab.browser().prefs().starred, std::slice::from_ref(&b), "every tab follows");
         }
         let _ = app.update(Message::UndoneMoves(vec![(b.clone(), a.clone())], vec![], vec![]));
         assert_eq!(app.last_prefs.starred, std::slice::from_ref(&a));
         // An undo that could not put it back leaves the star where the
         // file still is.
-        let _ = app.update(Message::Renamed(app.tabs[0].id, a.clone(), b.clone(), Ok(())));
+        let _ = app.update(Message::Renamed(app.tabs[0].pane().id, a.clone(), b.clone(), Ok(())));
         let _ = app.update(Message::UndoneMoves(vec![(b.clone(), a.clone())], vec![], vec!["busy".into()]));
         assert_eq!(app.last_prefs.starred, [b]);
     }
@@ -7745,8 +8147,8 @@ mod tests {
     #[test]
     fn a_rename_of_something_unstarred_leaves_the_stars_alone() {
         let mut app = app_for_test(&["/dir"]);
-        let _ = app.handle_outcome(0, Outcome::Stars(hyprforge_files_core::starred::StarChange::Star(vec!["/dir/s".into()])));
-        let _ = app.update(Message::Renamed(app.tabs[0].id, "/dir/x".into(), "/dir/y".into(), Ok(())));
+        let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Stars(hyprforge_files_core::starred::StarChange::Star(vec!["/dir/s".into()])));
+        let _ = app.update(Message::Renamed(app.tabs[0].pane().id, "/dir/x".into(), "/dir/y".into(), Ok(())));
         assert_eq!(app.last_prefs.starred, [PathBuf::from("/dir/s")]);
     }
 
@@ -7921,9 +8323,9 @@ mod tests {
     #[test]
     fn a_folder_that_changed_is_re_read_in_every_tab_showing_it_and_only_there() {
         let mut app = app_for_test(&["/one", "/two", "/one"]);
-        let before: Vec<u64> = app.tabs.iter().map(|t| t.read_generation).collect();
+        let before: Vec<u64> = app.tabs.iter().map(|t| t.pane().read_generation).collect();
         let _ = app.update(Message::DirChanged(PathBuf::from("/one")));
-        let after: Vec<u64> = app.tabs.iter().map(|t| t.read_generation).collect();
+        let after: Vec<u64> = app.tabs.iter().map(|t| t.pane().read_generation).collect();
         assert_eq!(after, vec![before[0] + 1, before[1], before[2] + 1]);
     }
 
@@ -7985,6 +8387,220 @@ mod tests {
             place: None,
         };
     }
+    // --- split view --------------------------------------------------------------
+
+    /// F3 through the keymap, the road a real press takes.
+    fn split(app: &mut App) {
+        let _ = app.update(key("F3"));
+    }
+
+    /// Hands pane `pane` of the tab in front the listing a read would
+    /// have returned, through the window's own guard.
+    fn list_pane(app: &mut App, pane: usize, entries: Vec<Entry>) {
+        let at = At { tab: app.active, pane };
+        let (id, generation) = (app.pane(at).id, app.pane(at).read_generation);
+        let dir = app.pane(at).browser.current_dir().to_path_buf();
+        let _ = app.update(Message::DirLoaded(id, generation, dir, Ok(entries)));
+    }
+
+    #[test]
+    fn f3_splits_the_tab_at_the_folder_in_view_and_keeps_the_keyboard_where_it_was() {
+        let mut app = app_for_test(&["/dir", "/other"]);
+        split(&mut app);
+        let tab = app.active_tab();
+        assert!(tab.is_split());
+        assert_eq!(tab.panes[1].browser.current_dir(), Path::new("/dir"), "a second look at the same folder");
+        assert_eq!(tab.focused, 0, "the keyboard stays in the pane it was in");
+        assert!(tab.panes.iter().all(|p| p.browser.action_context().other_pane), "both know there is another");
+        assert!(!app.tabs[1].is_split(), "per tab: the tab beside it is untouched");
+        assert_eq!(app.pane(At { tab: 0, pane: 1 }).read_generation, 1, "the new pane asked for its listing");
+    }
+
+    /// Closing the split keeps the pane being worked in — whichever side
+    /// it is — and F3 twice puts the tab back as it was.
+    #[test]
+    fn closing_the_split_keeps_the_focused_pane() {
+        let mut app = app_for_test(&["/dir"]);
+        split(&mut app);
+        let right = app.active_tab().panes[1].id;
+        let _ = app.update(Message::Pane(right, BrowserMessage::Navigate(PathBuf::from("/elsewhere"))));
+        assert_eq!(app.active_tab().focused, 1, "a gesture in a pane chooses it");
+        split(&mut app);
+        let tab = app.active_tab();
+        assert!(!tab.is_split());
+        assert_eq!((tab.pane().id, tab.browser().current_dir()), (right, Path::new("/elsewhere")));
+        assert!(!tab.browser().action_context().other_pane, "nothing to copy to any more");
+
+        let mut app = app_for_test(&["/dir"]);
+        let left = app.active_tab().pane().id;
+        split(&mut app);
+        split(&mut app);
+        assert_eq!(app.active_tab().panes.len(), 1);
+        assert_eq!(app.active_tab().pane().id, left, "F3 twice is where it started");
+    }
+
+    /// A key reaches the pane with the keyboard and only it; Tab moves
+    /// the keyboard across, and from then on the keys go there.
+    #[test]
+    fn actions_reach_only_the_focused_pane() {
+        let mut app = app_for_test(&["/dir"]);
+        split(&mut app);
+        for pane in 0..2 {
+            list_pane(&mut app, pane, vec![entry_named("a.txt"), entry_named("b.txt")]);
+        }
+        let selected = |app: &App, pane: usize| app.active_tab().panes[pane].browser.selected_shown().len();
+        let _ = app.update(key("Ctrl+A"));
+        assert_eq!((selected(&app, 0), selected(&app, 1)), (2, 0));
+
+        let _ = app.update(Message::OtherPane);
+        assert_eq!(app.active_tab().focused, 1);
+        let _ = app.update(key("Down"));
+        assert_eq!((selected(&app, 0), selected(&app, 1)), (2, 1), "the left pane's selection is left alone");
+    }
+
+    /// Tab is the keymap's like any other key: on a split tab it asks the
+    /// layout whether a field has the keyboard before moving it (a task a
+    /// test cannot run), and on a tab of one pane it does nothing at all.
+    #[test]
+    fn tab_moves_between_panes_only_on_a_split_tab() {
+        let mut app = app_for_test(&["/dir"]);
+        assert_eq!(app.update(key("Tab")).units(), 0, "nothing to ask on a tab of one pane");
+        split(&mut app);
+        assert!(app.update(key("Tab")).units() > 0, "asks the layout first");
+        assert_eq!(app.active_tab().focused, 0, "and moves only once it has answered");
+    }
+
+    #[test]
+    fn two_panes_on_the_same_folder_have_distinct_ids() {
+        let mut app = app_for_test(&["/dir"]);
+        split(&mut app);
+        list_pane(&mut app, 0, vec![entry_named("docs")]);
+        list_pane(&mut app, 1, vec![entry_named("docs")]);
+        let [left, right] = &app.active_tab().panes[..] else { panic!("two panes") };
+        assert_ne!(left.id, right.id, "async answers can tell them apart");
+        assert_ne!(left.browser.instance(), right.browser.instance(), "and so can the widget tree");
+        assert_ne!(left.browser.list_scrollable_id(), right.browser.list_scrollable_id());
+        let (a, b) = (left.browser.drop_targets(), right.browser.drop_targets());
+        assert!(a.keys().all(|id| !b.contains_key(id)), "a drop target names its pane");
+        assert_eq!(app.locate(right.id), Some(At { tab: 0, pane: 1 }));
+    }
+
+    /// A read, a path bar answer or a thumbnail for one pane lands in
+    /// that pane — never in the other, and never by being "the pane in
+    /// front", which a split tab has two of.
+    #[test]
+    fn async_results_for_one_pane_never_land_in_the_other() {
+        let mut app = app_for_test(&["/dir"]);
+        split(&mut app);
+        let right = app.active_tab().panes[1].id;
+        list_pane(&mut app, 1, vec![entry_named("only-right.txt")]);
+        let rows = |app: &App, pane: usize| app.active_tab().panes[pane].browser.rows().len();
+        assert_eq!((rows(&app, 0), rows(&app, 1)), (0, 1));
+
+        // A read the left pane issues does not make the right pane's
+        // answer stale — each pane keeps its own generation.
+        let before = app.pane(At { tab: 0, pane: 1 }).read_generation;
+        let _ = app.spawn_read_dir(At { tab: 0, pane: 0 }, PathBuf::from("/dir"));
+        assert_eq!(app.pane(At { tab: 0, pane: 1 }).read_generation, before);
+
+        // An answer keeps the keyboard where the person put it.
+        let _ = app.update(Message::Answer(right, BrowserMessage::RecentRead(Ok(Vec::new()))));
+        assert_eq!(app.active_tab().focused, 0, "an answer is not a click");
+
+        // A pane closed since is somewhere an answer has nowhere to go.
+        split(&mut app);
+        let _ = app.update(Message::DirLoaded(right, 2, PathBuf::from("/dir"), Ok(vec![entry_named("x")])));
+        assert_eq!(app.locate(right), None);
+    }
+
+    /// Copy to Other Pane is the paste a Ctrl+V in the other pane would
+    /// make — a job in the transfers, landing on disk — and it leaves the
+    /// clipboard as it was.
+    #[test]
+    fn copy_to_the_other_pane_goes_through_the_paste_path() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        std::fs::write(from.path().join("a.txt"), "hello").unwrap();
+        let mut app = app_on(from.path());
+        split(&mut app);
+        let right = app.active_tab().panes[1].id;
+        let _ = app.update(Message::Pane(right, BrowserMessage::Navigate(to.path().to_path_buf())));
+        let _ = app.update(Message::OtherPane);
+        assert_eq!(app.active_tab().focused, 0);
+
+        let _ = app.update(key("Ctrl+A"));
+        let _ = app.update(Message::Browser(BrowserMessage::Perform(Action::CopyToOtherPane)));
+        assert_eq!(app.jobs.len(), 1, "a paste job, with the queue, conflicts and undo that come with one");
+        assert!(app.jobs[0].dirs.iter().any(|d| d == to.path()), "and the other pane is refreshed when it ends");
+        assert_eq!(app.clipboard.get(), None, "the clipboard is not how it got there");
+        wait_until("the copy", || to.path().join("a.txt").exists());
+        assert!(from.path().join("a.txt").exists(), "a copy, not a move");
+    }
+
+    /// The watcher watches what is on screen, and both halves of a split
+    /// tab are.
+    #[test]
+    fn the_folder_watch_covers_both_panes() {
+        let mut app = app_for_test(&["/dir"]);
+        split(&mut app);
+        let right = app.active_tab().panes[1].id;
+        let _ = app.update(Message::Pane(right, BrowserMessage::Navigate(PathBuf::from("/elsewhere"))));
+        let watched = app.watched().unwrap();
+        assert!(watched.dirs.contains(Path::new("/dir")) && watched.dirs.contains(Path::new("/elsewhere")));
+    }
+
+    /// A split tab is saved with both folders and the side that had the
+    /// keyboard, and putting it back the way `main` does gives the same
+    /// session again.
+    #[test]
+    fn a_split_tab_round_trips_through_the_session() {
+        use hyprforge_files::session::{Session, Split};
+        let mut app = app_for_test(&["/a", "/b"]);
+        let _ = app.update(key("Ctrl+2"));
+        split(&mut app);
+        let right = app.active_tab().panes[1].id;
+        let _ = app.update(Message::Pane(right, BrowserMessage::Navigate(PathBuf::from("/c"))));
+        let saved = app.session_now();
+        assert_eq!(
+            saved,
+            Session {
+                tabs: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+                active: 1,
+                splits: vec![Split { tab: 1, second: PathBuf::from("/c"), focused: 1 }],
+            }
+        );
+
+        let mut restored = app_for_test(&["/a", "/b"]);
+        for split in &saved.splits {
+            let _ = restored.open_second_pane(split.tab, split.second.clone());
+            restored.tabs[split.tab].focused = split.focused;
+        }
+        restored.active = saved.active;
+        assert_eq!(restored.session_now(), saved);
+    }
+
+    /// "Open new tabs split" applies to tabs opened from now on — not to
+    /// the tabs already open.
+    #[test]
+    fn a_new_tab_opens_split_when_preferences_say_so() {
+        let mut app = app_for_test(&["/dir"]);
+        app.last_prefs.split_new_tabs = true;
+        let _ = app.update(key("Ctrl+T"));
+        assert!(app.active_tab().is_split());
+        assert!(!app.tabs[0].is_split(), "the tab already open is left as it was");
+    }
+
+    /// A refresh after a job reaches every pane showing a folder it
+    /// changed — both sides of a split on the same folder.
+    #[test]
+    fn a_changed_folder_is_read_again_in_both_panes_showing_it() {
+        let mut app = app_for_test(&["/dir"]);
+        split(&mut app);
+        let before: Vec<u64> = app.active_tab().panes.iter().map(|p| p.read_generation).collect();
+        let _ = app.update(Message::DirChanged(PathBuf::from("/dir")));
+        let after: Vec<u64> = app.active_tab().panes.iter().map(|p| p.read_generation).collect();
+        assert_eq!(after, before.iter().map(|g| g + 1).collect::<Vec<_>>());
+    }
 }
 
 #[cfg(test)]
@@ -8035,7 +8651,7 @@ mod archive_tests {
         let mut app = app_for_test(&[dir.path().to_str().unwrap()]);
 
         let _task = app.handle_outcome(
-            0,
+            At { tab: 0, pane: 0 },
             Outcome::Extract {
                 archives: vec![archive.clone()],
                 to: None,
@@ -8061,7 +8677,7 @@ mod archive_tests {
         let mut app = app_for_test(&[dir.path().to_str().unwrap()]);
 
         let _open = app.handle_outcome(
-            0,
+            At { tab: 0, pane: 0 },
             Outcome::Compress {
                 sources: vec![dir.path().join("notes.txt")],
                 into: dir.path().to_path_buf(),
@@ -8089,7 +8705,7 @@ mod archive_tests {
         std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
         let mut app = app_for_test(&[dir.path().to_str().unwrap()]);
         let _open = app.handle_outcome(
-            0,
+            At { tab: 0, pane: 0 },
             Outcome::Compress {
                 sources: vec![dir.path().join("notes.txt")],
                 into: dir.path().to_path_buf(),
@@ -8123,7 +8739,7 @@ mod archive_tests {
         let mut app = app_for_test(&[archive.to_str().unwrap()]);
 
         let _task = app.handle_outcome(
-            0,
+            At { tab: 0, pane: 0 },
             Outcome::Rename {
                 from: archive.join("payload/readme.md"),
                 to: archive.join("payload/README.md"),
@@ -8155,7 +8771,7 @@ mod archive_tests {
         let mut app = app_for_test(&[archive.to_str().unwrap()]);
 
         let _task = app.handle_outcome(
-            0,
+            At { tab: 0, pane: 0 },
             Outcome::DeletePermanently(vec![archive.join("payload/docs")]),
         );
         for _ in 0..60 {
