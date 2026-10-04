@@ -46,6 +46,9 @@ hyprforge-thumbnails = "0.1"
 # photo viewer finds it — the two share one thumbnail cache, and two
 # programs picking different frames would each find the other's there.
 hyprforge-video = "0.1"
+# STL, 3MF and OBJ thumbnails in the grid, drawn the way the viewer's
+# own grid draws them — see `preview::thumbnail`.
+hyprforge-mesh = "0.1"
 # Zip, tar and 7z. The browsing of them is `hyprforge-files-core`'s
 # (through `FsBackend`); what this crate adds is the long, cancellable
 # work — extracting, compressing and rewriting — which needs the backend

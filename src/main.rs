@@ -228,6 +228,7 @@ fn main() -> iced::Result {
         pinned_items: Vec::new(),
         recent_file: Some(hyprforge_files_core::recent::path()),
         font_scale: FontScale(hyprforge_ui::theme::active().font_scale),
+        output_scale: 1.0,
         status: startup_status(prefs_status, &config_problems),
         last_window_size,
         resize_generation: 0,
@@ -284,6 +285,9 @@ fn main() -> iced::Result {
     // otherwise the window opens showing nothing at all, forever, for
     // the same reason CLAUDE.md's "a five-second gap" rule exists: an
     // outcome nobody satisfies is silent, not merely slow.
+    // What every browser asks for thumbnails of, by type: the MIME
+    // database just loaded, and the thumbnailers installed here.
+    hyprforge_files::preview::install_thumbnail_types(app.mime.clone());
     let first_read = app.handle_outcome(0, outcome);
     // The rest of last time's tabs, then the one that was in front put
     // back in front — `open_tab` brings each new one forward.
@@ -301,6 +305,7 @@ fn main() -> iced::Result {
         app.load_pinned(),
         app.attach_drag(),
         app.open_start_tabs(start_select, &start),
+        learn_scale(),
     ]);
 
     // `iced::application` calls this closure exactly once; a `RefCell`
@@ -449,6 +454,9 @@ enum Message {
     /// The mime database, read again after a default changed.
     MimeReloaded(hyprforge_mime::MimeDb),
     WindowResized(Size),
+    /// The output's scale factor, as the window last reported it — what
+    /// every tab's thumbnails are sized for.
+    ScaleFactor(f32),
     /// Ctrl/shift went down or came up. Tracked so a click on a row can
     /// be told what was held at the time — see [`App::modifiers`].
     ModifiersChanged(keyboard::Modifiers),
@@ -661,6 +669,9 @@ struct App {
     /// history, not per-tab view preferences).
     last_prefs: Prefs,
     font_scale: FontScale,
+    /// The output's scale factor, from `Message::ScaleFactor` — `1.0`
+    /// until the window has said.
+    output_scale: f32,
     /// The sidebar's pinned folders, as last read. The window owns the
     /// pinned list rather than each tab: a tab's `Prefs` is a copy taken
     /// when it opened, so letting a tab save its copy would put back a
@@ -1686,9 +1697,10 @@ impl App {
             Outcome::ReadStarred(paths) => self.read_starred(tab_index, paths),
             Outcome::Search(ask) => self.search(tab_index, ask),
             Outcome::Devices(ask) => self.ask_devices(tab_index, ask),
-            Outcome::LoadThumbnails(paths) => Task::run(thumbnail_stream(paths), |(path, handle)| {
-                Message::Browser(BrowserMessage::ThumbnailLoaded(path, handle))
-            }),
+            Outcome::LoadThumbnails { paths, edge } => Task::run(
+                thumbnail_stream(paths, edge, self.mime.clone(), self.config.thumbnails),
+                |(path, handle, made)| Message::Browser(BrowserMessage::ThumbnailLoaded(path, handle, made)),
+            ),
             Outcome::LoadPreview(path) => Task::perform(
                 build_preview(path, self.mime.clone(), self.backend.clone()),
                 |(path, preview)| Message::Browser(BrowserMessage::PreviewLoaded(path, preview)),
@@ -3154,6 +3166,15 @@ impl App {
         self.tabs.push(Tab::new(id, browser));
         self.active = self.tabs.len() - 1;
         let index = self.active;
+        Task::batch([self.handle_outcome(index, outcome), self.tell_scale(index)])
+    }
+
+    /// Tells tab `index`'s browser the window's scale — every tab when it
+    /// changes, and each new one as it opens, so no browser is left
+    /// sizing thumbnails for a 1x screen. See `BrowserMessage::ScaleFactor`.
+    fn tell_scale(&mut self, index: usize) -> Task<Message> {
+        let message = BrowserMessage::ScaleFactor { output: self.output_scale, font: self.font_scale };
+        let outcome = self.tabs[index].browser.update(message);
         self.handle_outcome(index, outcome)
     }
 
@@ -4057,13 +4078,24 @@ impl App {
                 // `resize_generation`.
                 self.resize_generation += 1;
                 let generation = self.resize_generation;
-                Task::perform(
-                    async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(RESIZE_SETTLE)).await;
-                        generation
-                    },
-                    Message::WindowSettled,
-                )
+                // A window moved to another output is resized by the
+                // move; asking the scale again here is how thumbnails
+                // follow it there.
+                Task::batch([
+                    Task::perform(
+                        async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(RESIZE_SETTLE)).await;
+                            generation
+                        },
+                        Message::WindowSettled,
+                    ),
+                    learn_scale(),
+                ])
+            }
+            Message::ScaleFactor(output) => {
+                self.output_scale = output;
+                let tasks: Vec<Task<Message>> = (0..self.tabs.len()).map(|index| self.tell_scale(index)).collect();
+                Task::batch(tasks)
             }
             Message::WindowSettled(generation) => {
                 // A later resize has already armed its own timer; this
@@ -5188,6 +5220,12 @@ impl DebugShow {
 /// All of it, in one line. A person who mistyped two bindings should
 /// learn about both at once rather than fix one, restart and find the
 /// other.
+/// Asks the window for its output's scale factor — see
+/// `Message::ScaleFactor`.
+fn learn_scale() -> Task<Message> {
+    window::latest().and_then(window::scale_factor).map(Message::ScaleFactor)
+}
+
 fn startup_status(
     prefs_status: Option<String>,
     config_problems: &[hyprforge_files_core::config::ConfigProblem],
@@ -5576,6 +5614,7 @@ mod tests {
             // write to the recent-files list of whoever runs it.
             recent_file: None,
             font_scale: FontScale::default(),
+            output_scale: 1.0,
             status: None,
             last_window_size: (900, 600),
             resize_generation: 0,

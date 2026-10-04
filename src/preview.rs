@@ -19,7 +19,12 @@
 //!   hundred kilobytes of PNG whatever the source was.
 //!
 //! The listing's thumbnails come from here too ([`thumbnail`]): the same
-//! readers, through the shared freedesktop cache.
+//! readers, through the shared freedesktop cache, at the size the cell is
+//! drawn — plus 3D models through `hyprforge-mesh`, and anything else a
+//! `*.thumbnailer` file on this machine claims, through
+//! `hyprforge_thumbnails::thumbnailers`. The built-in readers go first:
+//! they are measured and bounded here, and somebody else's program is
+//! for what none of them can read.
 //!
 //! # The tools are optional
 //!
@@ -32,7 +37,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use hyprforge_files_core::preview::{Excerpt, Listing, Picture, Preview};
+use hyprforge_files_core::preview::{Excerpt, Listing, Picture, Preview, Source};
 use hyprforge_files_core::backend::FsBackend;
 
 /// How much of a text file is read.
@@ -94,60 +99,114 @@ fn file(path: &Path, kind: &str, mime: &hyprforge_mime::MimeDb, backend: &dyn Fs
 /// and "as small as possible" is the cache's first rule.
 const SMALL_PICTURE: u64 = 64 * 1024;
 
-/// A thumbnail of `path`: from the shared cache while the file is
-/// unchanged, and made — then stored — only when it is not.
+/// A model bigger than this keeps its icon in the grid. Loading one is
+/// reading and welding every triangle — an STL is fifty bytes a
+/// triangle, so this is about 1.3 million of them — which is a viewer's
+/// job when someone opens it, not a listing's for every file it shows.
+const MODEL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The installed thumbnailers, found once — a directory or two of small
+/// key files, read the first time a listing asks.
+pub fn system_thumbnailers() -> &'static hyprforge_thumbnails::thumbnailers::Thumbnailers {
+    static FOUND: std::sync::OnceLock<hyprforge_thumbnails::thumbnailers::Thumbnailers> = std::sync::OnceLock::new();
+    FOUND.get_or_init(hyprforge_thumbnails::thumbnailers::Thumbnailers::discover)
+}
+
+/// Where a thumbnail of `path` would come from, by name: the picture
+/// decoder's own format list, then the mesh loader's, then the MIME
+/// type — the built-in PDF, video and SVG readers before any installed
+/// thumbnailer.
+pub fn source_for(
+    path: &Path,
+    mime: &hyprforge_mime::MimeDb,
+    thumbnailers: &hyprforge_thumbnails::thumbnailers::Thumbnailers,
+) -> Option<Source> {
+    if hyprforge_image::format::looks_decodable(path) {
+        return Some(Source::Picture);
+    }
+    if hyprforge_mesh::detect(path).is_some() {
+        return Some(Source::Model);
+    }
+    let kind = mime.type_of(path)?;
+    let canonical = mime.canonical(kind);
+    Source::for_mime(canonical).or_else(|| thumbnailer_for(kind, mime, thumbnailers).map(|_| Source::System))
+}
+
+/// The thumbnailer for `kind`, by its own name or the name the database
+/// calls canonical — a thumbnailer file may list either.
+fn thumbnailer_for<'t>(
+    kind: &str,
+    mime: &hyprforge_mime::MimeDb,
+    thumbnailers: &'t hyprforge_thumbnails::thumbnailers::Thumbnailers,
+) -> Option<&'t hyprforge_thumbnails::thumbnailers::Thumbnailer> {
+    thumbnailers.for_mime(kind).or_else(|| thumbnailers.for_mime(mime.canonical(kind)))
+}
+
+/// Makes [`source_for`], over `mime` and this machine's thumbnailers, the
+/// answer every browser in this process asks — see
+/// `hyprforge_files_core::preview::ThumbnailTypes`.
+pub fn install_thumbnail_types(mime: std::sync::Arc<hyprforge_mime::MimeDb>) {
+    hyprforge_files_core::preview::install_thumbnail_types(hyprforge_files_core::preview::ThumbnailTypes::new(
+        move |path| source_for(path, &mime, system_thumbnailers()),
+    ));
+}
+
+/// A thumbnail of `path` fitting an `edge`-pixel square, and the bucket
+/// it was made at: from the shared cache while the file is unchanged,
+/// and made — then stored — only when it is not.
 ///
-/// The browser only asks about names `preview::wants_thumbnail` accepts;
+/// `edge` is rounded up to the freedesktop size that covers it, so the
+/// file stored is one any other program reading `normal/`, `large/` or
+/// `x-large/` would also accept.
+///
+/// The browser only asks about files `preview::wants_thumbnail` accepts;
 /// one that turns out not to be what its name said is recorded as a
 /// failure, so it is not tried again until it changes. A tool that is
 /// not installed, or did not answer in time, is *not* a failure: the
 /// same file may well work after the user installs ffmpeg, or when the
 /// machine is less busy.
-pub fn thumbnail(path: &Path, cache: Option<&hyprforge_thumbnails::Cache>) -> Option<Picture> {
-    use hyprforge_thumbnails::{Lookup, Stamp, NORMAL};
-    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+pub fn thumbnail(
+    path: &Path,
+    edge: u32,
+    cache: Option<&hyprforge_thumbnails::Cache>,
+    mime: &hyprforge_mime::MimeDb,
+    allowed: &hyprforge_files_core::config::Thumbnails,
+) -> Option<(Picture, u32)> {
+    use hyprforge_thumbnails::{Lookup, Size, Stamp};
+    let source = hyprforge_files_core::preview::source_of(path).filter(|s| allowed.allows(*s))?;
+    let size = Size::for_edge(edge);
+    let edge = size.edge();
     // Drawn by iced from the file itself, at whatever size: there is
     // nothing to store.
-    if ext == "svg" {
-        return Some(Picture::from_path(path));
+    if source == Source::Svg {
+        return Some((Picture::from_path(path), edge));
     }
     let stamp = Stamp::of(path).ok()?;
-    let is_picture = hyprforge_image::format::looks_decodable(path);
-    if is_picture && stamp.size <= SMALL_PICTURE {
-        return decode_rgba(path, NORMAL).map(raster);
+    if !allowed.allows_size(stamp.size) {
+        return None;
+    }
+    if source == Source::Picture && stamp.size <= SMALL_PICTURE {
+        return decode_rgba(path, edge).map(|rgba| (raster(rgba), edge));
     }
     // The cache is keyed by an absolute URI; every listing path is one,
     // and anything else is simply not cached.
     let cache = cache.filter(|_| path.is_absolute());
     if let Some(cache) = cache {
-        match cache.get(path, stamp) {
-            Lookup::Current(rgba) => return Some(raster(rgba)),
+        match cache.get_sized(size, path, stamp) {
+            Lookup::Current(rgba) => return Some((raster(rgba), edge)),
             Lookup::Failed => return None,
             Lookup::Missing => {}
         }
     }
-    let made: Result<Option<hyprforge_thumbnails::Rgba>, Unavailable> = if is_picture {
-        Ok(decode_rgba(path, NORMAL))
-    } else if ext == "pdf" {
-        pdf_page(path, NORMAL).map(|png| png.and_then(|b| hyprforge_thumbnails::decode_png(&b)))
-    } else {
-        // A video: its first real frame — past the black most videos
-        // open on — as the photo viewer finds it, so the one cache holds
-        // one answer. See `hyprforge_video::frame`.
-        match hyprforge_video::frame::first_real_frame(path, NORMAL) {
-            Ok(png) => Ok(png.and_then(|b| hyprforge_thumbnails::decode_png(&b))),
-            Err(hyprforge_video::frame::Unavailable::Missing) => Err(Unavailable::Missing),
-            Err(hyprforge_video::frame::Unavailable::Busy) => Err(Unavailable::Busy),
-        }
-    };
+    let made = make(path, source, edge, stamp.size, mime);
     match made {
         Ok(Some(rgba)) => {
             if let Some(cache) = cache {
-                if let Err(e) = cache.put(path, stamp, &rgba) {
+                if let Err(e) = cache.put_sized(size, path, stamp, &rgba) {
                     tracing::debug!(error = %e, "thumbnail not stored");
                 }
             }
-            Some(raster(rgba))
+            Some((raster(rgba), edge))
         }
         Ok(None) => {
             if let Some(cache) = cache {
@@ -156,6 +215,53 @@ pub fn thumbnail(path: &Path, cache: Option<&hyprforge_thumbnails::Cache>) -> Op
             None
         }
         Err(_) => None,
+    }
+}
+
+/// Makes a thumbnail of `path` from `source`, within `edge` — the part
+/// [`thumbnail`] does when the cache has nothing.
+fn make(
+    path: &Path,
+    source: Source,
+    edge: u32,
+    bytes: u64,
+    mime: &hyprforge_mime::MimeDb,
+) -> Result<Option<hyprforge_thumbnails::Rgba>, Unavailable> {
+    let png = |made: Option<Vec<u8>>| made.and_then(|b| hyprforge_thumbnails::decode_png(&b));
+    match source {
+        Source::Picture => Ok(decode_rgba(path, edge)),
+        Source::Pdf => pdf_page(path, edge).map(png),
+        // A video: its first real frame — past the black most videos
+        // open on — as the photo viewer finds it, so the one cache holds
+        // one answer. See `hyprforge_video::frame`.
+        Source::Video => match hyprforge_video::frame::first_real_frame(path, edge) {
+            Ok(made) => Ok(png(made)),
+            Err(hyprforge_video::frame::Unavailable::Missing) => Err(Unavailable::Missing),
+            Err(hyprforge_video::frame::Unavailable::Busy) => Err(Unavailable::Busy),
+        },
+        // Drawn the way the viewer's own grid draws it
+        // (`hyprforge-media`'s `thumbs`), so the cache holds one picture
+        // of a model whichever program made it.
+        Source::Model if bytes > MODEL_BYTES => Err(Unavailable::Busy),
+        Source::Model => match hyprforge_mesh::load(path, true) {
+            Ok((mesh, _)) => {
+                let image = hyprforge_mesh::thumbnail::render(&mesh, edge);
+                Ok(Some(hyprforge_thumbnails::Rgba { width: image.width, height: image.height, pixels: image.pixels }))
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "model not loaded");
+                Ok(None)
+            }
+        },
+        Source::System => {
+            let kind = mime.type_of(path).ok_or(Unavailable::Busy)?;
+            let thumbnailer = thumbnailer_for(kind, mime, system_thumbnailers()).ok_or(Unavailable::Missing)?;
+            thumbnailer.run(path, edge, hyprforge_process::TIMEOUT).map_err(|e| {
+                tracing::debug!(thumbnailer = %thumbnailer.name, error = %e, "thumbnailer did not finish");
+                Unavailable::Busy
+            })
+        }
+        Source::Svg => Ok(None),
     }
 }
 
@@ -586,6 +692,124 @@ mod tests {
         std::fs::write(path, b).unwrap();
     }
 
+    fn mime() -> hyprforge_mime::MimeDb {
+        hyprforge_mime::MimeDb::load_from(&[], &[])
+    }
+
+    fn all() -> hyprforge_files_core::config::Thumbnails {
+        hyprforge_files_core::config::Thumbnails::default()
+    }
+
+    /// The bucket follows the edge asked for: a picture wanted at 300
+    /// pixels is made at 512, stored under `x-large/`, and says so — and
+    /// what is stored fits that size.
+    #[test]
+    fn a_thumbnail_is_made_at_the_bucket_that_covers_the_edge() {
+        use hyprforge_thumbnails::{Lookup, Size, Stamp};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = scratch_cache(dir.path());
+        let photo = dir.path().join("photo.bmp");
+        bmp(&photo, 700);
+        let (_, made) = thumbnail(&photo, 300, Some(&cache), &mime(), &all()).unwrap();
+        assert_eq!(made, 512);
+        let Lookup::Current(stored) = cache.get_sized(Size::XLarge, &photo, Stamp::of(&photo).unwrap()) else {
+            panic!("not stored at x-large")
+        };
+        assert_eq!(stored.width.max(stored.height), 512);
+        assert_eq!(cache.get(&photo, Stamp::of(&photo).unwrap()), Lookup::Missing, "not under normal/");
+    }
+
+    /// The `[thumbnails]` switches and size cap are the host's to apply
+    /// too: a file over the cap, or of a source switched off, keeps its
+    /// icon and is not recorded as a failure.
+    #[test]
+    fn a_file_over_the_cap_or_switched_off_is_left_alone() {
+        use hyprforge_thumbnails::{Lookup, Stamp};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = scratch_cache(dir.path());
+        let photo = dir.path().join("photo.bmp");
+        bmp(&photo, 800); // about 1.9MB
+        let capped = hyprforge_files_core::config::Thumbnails { max_file_mb: 1, ..all() };
+        assert!(thumbnail(&photo, 128, Some(&cache), &mime(), &capped).is_none());
+        let off = hyprforge_files_core::config::Thumbnails { pictures: false, ..all() };
+        assert!(thumbnail(&photo, 128, Some(&cache), &mime(), &off).is_none());
+        assert_eq!(cache.get(&photo, Stamp::of(&photo).unwrap()), Lookup::Missing, "no failure recorded");
+    }
+
+    /// An STL in the grid gets a picture of the model, the way the
+    /// viewer draws one.
+    #[test]
+    fn a_model_gets_a_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = scratch_cache(dir.path());
+        let model = dir.path().join("cube.stl");
+        let c = |i: usize| [(i & 1) * 10, (i >> 1 & 1) * 10, (i >> 2 & 1) * 10];
+        let faces = [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]];
+        let mut text = String::from("solid cube\n");
+        for f in faces {
+            for t in [[f[0], f[1], f[2]], [f[0], f[2], f[3]]] {
+                text.push_str("facet normal 0 0 0\nouter loop\n");
+                for v in t {
+                    let [x, y, z] = c(v);
+                    text.push_str(&format!("vertex {x} {y} {z}\n"));
+                }
+                text.push_str("endloop\nendfacet\n");
+            }
+        }
+        text.push_str("endsolid cube\n");
+        std::fs::write(&model, text).unwrap();
+        let (_, made) = thumbnail(&model, 256, Some(&cache), &mime(), &all()).expect("a picture of the cube");
+        assert_eq!(made, 256);
+        assert!(cached_at(dir.path(), "large", &model));
+    }
+
+    /// The bucket list here and the cache's sizes are one list.
+    #[test]
+    fn the_browsers_buckets_are_the_caches_sizes() {
+        let sizes: Vec<u32> = hyprforge_thumbnails::Size::ALL.iter().map(|s| s.edge()).collect();
+        assert_eq!(sizes, hyprforge_files_core::preview::BUCKETS);
+        for edge in [1, 90, 128, 129, 200, 256, 300, 512, 900] {
+            assert_eq!(
+                hyprforge_files_core::preview::bucket_for(edge as f32),
+                hyprforge_thumbnails::Size::for_edge(edge).edge(),
+                "{edge}"
+            );
+        }
+    }
+
+    /// Glycin's own thumbnailer files claim AVIF and JPEG XL; with the
+    /// database knowing those types, they are the system's to draw, and
+    /// a type nothing claims is nobody's.
+    #[test]
+    fn a_type_only_a_thumbnailer_claims_is_the_systems() {
+        use hyprforge_thumbnails::thumbnailers::{Thumbnailer, Thumbnailers};
+        let dir = tempfile::tempdir().unwrap();
+        let packages = dir.path().join("mime/packages");
+        std::fs::create_dir_all(&packages).unwrap();
+        std::fs::write(
+            dir.path().join("mime/globs2"),
+            "50:image/avif:*.avif\n50:image/jxl:*.jxl\n50:application/pdf:*.pdf\n50:text/plain:*.txt\n",
+        )
+        .unwrap();
+        let db = hyprforge_mime::MimeDb::load_from(&[dir.path().to_path_buf()], &[]);
+        let glycin = Thumbnailers::from_list(vec![Thumbnailer {
+            name: "glycin".into(),
+            try_exec: None,
+            exec: vec!["glycin-thumbnailer".into()],
+            mime_types: vec!["image/avif".into(), "image/jxl".into(), "application/pdf".into()],
+        }]);
+        assert_eq!(source_for(Path::new("/d/a.avif"), &db, &glycin), Some(Source::System));
+        assert_eq!(source_for(Path::new("/d/a.jxl"), &db, &glycin), Some(Source::System));
+        assert_eq!(source_for(Path::new("/d/a.pdf"), &db, &glycin), Some(Source::Pdf), "built in first");
+        assert_eq!(source_for(Path::new("/d/a.png"), &db, &glycin), Some(Source::Picture), "built in first");
+        assert_eq!(source_for(Path::new("/d/a.stl"), &db, &glycin), Some(Source::Model));
+        assert_eq!(source_for(Path::new("/d/a.txt"), &db, &glycin), None);
+    }
+
+    fn cached_at(dir: &Path, size: &str, source: &Path) -> bool {
+        dir.join("thumbnails").join(size).join(hyprforge_thumbnails::thumbnail_name(source)).exists()
+    }
+
     fn scratch_cache(dir: &Path) -> hyprforge_thumbnails::Cache {
         hyprforge_thumbnails::Cache::at(dir.join("thumbnails"))
     }
@@ -604,7 +828,7 @@ mod tests {
         let photo = dir.path().join("photo.bmp");
         bmp(&photo, 200);
 
-        assert!(thumbnail(&photo, Some(&cache)).is_some());
+        assert!(thumbnail(&photo, 128, Some(&cache), &mime(), &all()).is_some());
         assert!(cached(dir.path(), &photo), "stored after it was made");
         let stamp = Stamp::of(&photo).unwrap();
         let Lookup::Current(stored) = cache.get(&photo, stamp) else { panic!("not current") };
@@ -625,7 +849,7 @@ mod tests {
         let icon = dir.path().join("small.bmp");
         bmp(&icon, 40);
         assert!(std::fs::metadata(&icon).unwrap().len() <= SMALL_PICTURE);
-        assert!(thumbnail(&icon, Some(&cache)).is_some(), "still drawn");
+        assert!(thumbnail(&icon, 128, Some(&cache), &mime(), &all()).is_some(), "still drawn");
         assert!(!cached(dir.path(), &icon), "but not stored");
     }
 
@@ -638,7 +862,7 @@ mod tests {
         let cache = scratch_cache(dir.path());
         let fake = dir.path().join("renamed.png");
         std::fs::write(&fake, vec![7u8; SMALL_PICTURE as usize + 1]).unwrap();
-        assert!(thumbnail(&fake, Some(&cache)).is_none());
+        assert!(thumbnail(&fake, 128, Some(&cache), &mime(), &all()).is_none());
         assert_eq!(cache.get(&fake, Stamp::of(&fake).unwrap()), Lookup::Failed);
     }
 

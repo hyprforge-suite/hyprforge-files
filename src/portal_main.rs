@@ -157,7 +157,10 @@ fn run_dialog() -> Answer {
         devices: hyprforge_files::devices::DeviceHost::new(hyprforge_files::devices::Backends::system(), false),
     };
     dialog.apply_filter();
-    let boot = Task::batch([dialog.handle(first), Task::done(Message::Settle)]);
+    // What the browser asks for thumbnails of, by type — the same answer
+    // the Files window installs.
+    hyprforge_files::preview::install_thumbnail_types(dialog.mime.clone());
+    let boot = Task::batch([dialog.handle(first), Task::done(Message::Settle), dialog.learn_scale()]);
     let boot = std::cell::RefCell::new(Some((dialog, boot)));
 
     let title = boot.borrow().as_ref().map(|(d, _)| d.request.title.clone()).unwrap_or_default();
@@ -403,7 +406,9 @@ impl Dialog {
             Message::Resized(size) => {
                 self.width = size.width;
                 self.height = size.height;
-                Task::none()
+                // A dialog dragged to another output is drawn at its
+                // scale; thumbnails follow it.
+                self.learn_scale()
             }
             Message::Devices(event) => {
                 if !self.devices.heard(event) {
@@ -470,9 +475,10 @@ impl Dialog {
             Outcome::SnapTo { id, y } => {
                 iced::widget::operation::snap_to(id, iced::widget::operation::RelativeOffset { x: None, y: Some(y) })
             }
-            Outcome::LoadThumbnails(paths) => Task::run(thumbnail_stream(paths), |(path, picture)| {
-                Message::Browser(BrowserMessage::ThumbnailLoaded(path, picture))
-            }),
+            Outcome::LoadThumbnails { paths, edge } => Task::run(
+                thumbnail_stream(paths, edge, self.mime.clone(), self.browser.config().thumbnails),
+                |(path, picture, made)| Message::Browser(BrowserMessage::ThumbnailLoaded(path, picture, made)),
+            ),
             Outcome::LoadPreview(path) => Task::perform(
                 build_preview(path, self.mime.clone(), self.backend.clone()),
                 |(path, preview)| Message::Browser(BrowserMessage::PreviewLoaded(path, preview)),
@@ -895,6 +901,16 @@ impl Dialog {
             Some(overlay) => iced::widget::stack![window, overlay.map(Message::Browser)].into(),
             None => window,
         }
+    }
+
+    /// Asks the window for its output's scale factor and tells the
+    /// browser, with the font scale beside it — what its thumbnails are
+    /// sized for. See `BrowserMessage::ScaleFactor`.
+    fn learn_scale(&self) -> Task<Message> {
+        let font = self.font_scale;
+        window::latest()
+            .and_then(window::scale_factor)
+            .map(move |output| Message::Browser(BrowserMessage::ScaleFactor { output, font }))
     }
 
     fn subscription(&self) -> Subscription<Message> {
