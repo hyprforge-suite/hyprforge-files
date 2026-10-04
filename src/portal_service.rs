@@ -65,6 +65,13 @@ impl FileChooser {
         options: HashMap<String, OwnedValue>,
     ) -> (u32, HashMap<String, OwnedValue>) {
         tracing::debug!(method, ?options, "a file chooser request");
+        // One line per step, at info, so a request that never comes back
+        // says in the journal which step it stopped at. Requests that
+        // stuck in the service once left nothing to go on: three of them
+        // sat open with no dialog running and not a line logged. Counts
+        // and outcomes only — never a path, so the journal does not
+        // become a record of where someone browsed.
+        tracing::info!(method, app_id, handle = %handle.as_str(), "request received");
         let request = match Request::decode(method, app_id, title, &options) {
             Ok(request) => request,
             Err(why) => {
@@ -76,15 +83,23 @@ impl FileChooser {
         // Registered before the dialog starts, so a `Close` that arrives
         // the moment the call does still finds something to close.
         let registered = server.at(&handle, PortalRequest { close: close.clone() }).await;
-        if let Err(e) = &registered {
-            tracing::warn!(error = %e, "the request object could not be exported; Close will not reach this dialog");
+        match &registered {
+            Ok(_) => tracing::info!(handle = %handle.as_str(), "request object registered"),
+            Err(e) => {
+                tracing::warn!(error = %e, "the request object could not be exported; Close will not reach this dialog")
+            }
         }
         let answer = run_dialog(&self.dialog, &request, close).await;
+        match &answer {
+            Answer::Chosen { paths, .. } => {
+                tracing::info!(handle = %handle.as_str(), chosen = paths.len(), "dialog answered")
+            }
+            Answer::Cancelled => tracing::info!(handle = %handle.as_str(), "dialog cancelled"),
+            Answer::Failed(why) => tracing::warn!(method, handle = %handle.as_str(), reason = %why, "the dialog failed"),
+        }
         if registered.is_ok() {
             let _ = server.remove::<PortalRequest, _>(&handle).await;
-        }
-        if let Answer::Failed(why) = &answer {
-            tracing::warn!(method, reason = %why, "the dialog failed");
+            tracing::info!(handle = %handle.as_str(), "request object removed");
         }
         answer.encode()
     }
@@ -140,6 +155,7 @@ struct PortalRequest {
 #[zbus::interface(name = "org.freedesktop.impl.portal.Request")]
 impl PortalRequest {
     async fn close(&self) {
+        tracing::info!("Close received");
         // `notify_one` keeps the permit if nothing is waiting yet, so a
         // Close before the dialog has started is not lost.
         self.close.notify_one();
@@ -165,6 +181,7 @@ pub async fn run_dialog(command: &DialogCommand, request: &Request, close: Arc<N
         Ok(child) => child,
         Err(e) => return Answer::Failed(format!("the dialog could not start: {e}")),
     };
+    tracing::info!(pid = child.id(), "dialog started");
     if let Some(mut stdin) = child.stdin.take() {
         if let Err(e) = stdin.write_all(&json).await {
             return Answer::Failed(format!("the dialog was not given its request: {e}"));
@@ -174,13 +191,43 @@ pub async fn run_dialog(command: &DialogCommand, request: &Request, close: Arc<N
     let Some(mut stdout) = child.stdout.take() else {
         return Answer::Failed("the dialog has no output to answer on".to_string());
     };
-    let reading = tokio::spawn(async move {
-        let mut out = Vec::new();
-        stdout.read_to_end(&mut out).await.map(|_| out)
-    });
+    // What has been read so far, shared, so a read cut short by
+    // `READ_AFTER_EXIT` still has the answer the dialog wrote.
+    let partial = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reading = {
+        let partial = partial.clone();
+        tokio::spawn(async move {
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = stdout.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut p) = partial.lock() {
+                    p.extend_from_slice(&chunk[..n]);
+                }
+            }
+            let out = partial.lock().map(|p| p.clone()).unwrap_or_default();
+            Ok::<_, std::io::Error>(out)
+        })
+    };
     tokio::select! {
         status = child.wait() => {
-            let out = reading.await.ok().and_then(Result::ok).unwrap_or_default();
+            // Bounded. The dialog has exited, so its answer is already in
+            // the pipe — but end-of-file only arrives when *every* holder
+            // of the write end has closed it, and anything the dialog
+            // started that inherited its stdout keeps it open after the
+            // dialog is gone. Waiting for that end-of-file unbounded is a
+            // request that never comes back for a dialog that answered.
+            // `READ_AFTER_EXIT` is long past anything a finished pipe
+            // needs, and what arrived by then is the answer.
+            let out = match tokio::time::timeout(READ_AFTER_EXIT, reading).await {
+                Ok(read) => read.ok().and_then(Result::ok).unwrap_or_default(),
+                Err(_) => {
+                    tracing::warn!("the dialog exited but something it started still holds its output open; answering with what it wrote");
+                    partial.lock().map(|p| p.clone()).unwrap_or_default()
+                }
+            };
             match serde_json::from_slice::<Answer>(&out) {
                 Ok(answer) => answer,
                 Err(_) => Answer::Failed(match status {
@@ -195,6 +242,10 @@ pub async fn run_dialog(command: &DialogCommand, request: &Request, close: Arc<N
         }
     }
 }
+
+/// How long to keep reading a dialog's answer once the dialog has exited
+/// — see where it is used.
+const READ_AFTER_EXIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Serves the interface on the session bus until the process is killed.
 pub async fn serve(dialog: DialogCommand) -> zbus::Result<()> {
@@ -272,6 +323,26 @@ mod tests {
         let answer = run_dialog(&command, &request(), close).await;
         assert_eq!(answer, Answer::Cancelled);
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "it did not wait for the dialog");
+    }
+
+    #[tokio::test]
+    async fn a_dialog_that_left_something_holding_its_output_still_answers() {
+        // The answer is written, then a background process that inherited
+        // the dialog's stdout outlives it — what a helper the dialog
+        // started does. Waiting for end-of-file on that pipe never
+        // finished, and the request never came back.
+        let (_dir, command) = script(
+            r#"cat > /dev/null; echo '"Cancelled"'; sleep 30 & exit 0"#,
+        );
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_dialog(&command, &request(), Arc::new(Notify::new())),
+        )
+        .await
+        .expect("the request came back");
+        assert_eq!(answer, Answer::Cancelled, "the answer the dialog wrote");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "bounded by READ_AFTER_EXIT, not the helper");
     }
 
     #[tokio::test]

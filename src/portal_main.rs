@@ -51,7 +51,9 @@ fn main() {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                // The service's own steps at info — see `portal_service::run`
+                // — and everything else, the dialog included, at warn.
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,hyprforge_files::portal_service=info")),
         )
         .init();
     match std::env::args().nth(1).as_deref() {

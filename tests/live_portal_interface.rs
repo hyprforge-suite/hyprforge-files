@@ -107,3 +107,96 @@ async fn the_service_declares_exactly_the_methods_the_portal_calls() {
     let ours = methods_of(&declared, INTERFACE);
     assert_eq!(ours, wanted, "our FileChooser must match the installed interface method for method");
 }
+
+/// Overlapping requests must each get their own dialog, however they
+/// interleave — found when the real session's service stopped starting
+/// dialogs after a few uses: three requests sat open in it, the newest
+/// never having started its dialog.
+///
+/// A, then B while A's dialog is up; A's dialog answers while B's is
+/// still up; then C arrives. C's dialog must start, and all three calls
+/// must come back.
+#[tokio::test]
+#[ignore = "starts a private dbus-daemon; run by check.sh"]
+async fn a_request_arriving_after_another_finished_still_gets_its_dialog() {
+    if std::process::Command::new("dbus-daemon").arg("--version").output().is_err() {
+        eprintln!("HYPRFORGE-SKIP: dbus-daemon is not installed, so there is no private bus to serve on");
+        return;
+    }
+    let mut daemon = std::process::Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("dbus-daemon starts");
+    let address = {
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(daemon.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        line.trim().to_string()
+    };
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _daemon = Kill(daemon);
+
+    // A stand-in dialog that notes it started, waits as long as its
+    // title says, and cancels. Run by `sh`, never exec'd — see
+    // CLAUDE.md on ETXTBSY.
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("dialog.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nreq=$(cat)\nname=$(printf '%s' \"$req\" | sed -n 's/.*\"title\":\"\\([a-z]*\\)-\\([0-9]*\\)\".*/\\1/p')\nwait=$(printf '%s' \"$req\" | sed -n 's/.*\"title\":\"\\([a-z]*\\)-\\([0-9]*\\)\".*/\\2/p')\ntouch \"$(dirname \"$0\")/started-$name\"\nsleep \"$wait\"\necho '\"Cancelled\"'\n",
+    )
+    .unwrap();
+    let chooser = FileChooser::new(DialogCommand { program: "/bin/sh".into(), args: vec![script.display().to_string()] });
+    let server = zbus::connection::Builder::address(address.as_str())
+        .unwrap()
+        .serve_at(OBJECT_PATH, chooser)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let name = server.unique_name().unwrap().to_owned();
+    let client = zbus::connection::Builder::address(address.as_str()).unwrap().build().await.unwrap();
+
+    let call = |handle: &'static str, title: &'static str| {
+        let client = client.clone();
+        let name = name.clone();
+        async move {
+            let options: std::collections::HashMap<&str, zbus::zvariant::Value> = std::collections::HashMap::new();
+            let handle = zbus::zvariant::ObjectPath::try_from(handle).unwrap();
+            client
+                .call_method(
+                    Some(name),
+                    OBJECT_PATH,
+                    Some(INTERFACE),
+                    "OpenFile",
+                    &(handle, "test.app", "", title, options),
+                )
+                .await
+                .map(|_| ())
+        }
+    };
+    let started = |n: &str| dir.path().join(format!("started-{n}")).exists();
+    let within = |secs: u64| tokio::time::Duration::from_secs(secs);
+
+    let a = tokio::spawn(call("/org/freedesktop/portal/desktop/request/1_1/a", "a-1"));
+    let b = tokio::spawn(call("/org/freedesktop/portal/desktop/request/1_1/b", "b-4"));
+    // A answers after a second while B's dialog is still up.
+    tokio::time::timeout(within(10), a).await.expect("A's call came back").unwrap().unwrap();
+    assert!(started("b"), "B's dialog started while A's was up");
+
+    let c = tokio::spawn(call("/org/freedesktop/portal/desktop/request/1_1/c", "c-1"));
+    let deadline = tokio::time::Instant::now() + within(5);
+    while !started("c") && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    assert!(started("c"), "C's dialog never started — the service stopped taking requests");
+    tokio::time::timeout(within(10), c).await.expect("C's call came back").unwrap().unwrap();
+    tokio::time::timeout(within(10), b).await.expect("B's call came back").unwrap().unwrap();
+}
