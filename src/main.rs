@@ -88,6 +88,15 @@ fn main() -> iced::Result {
         )
         .init();
 
+    // `--dbus-service` is a different program in the same binary — it
+    // draws nothing — so it is decided before anything a window needs.
+    // The rest of the command line is read below, once the backend that
+    // can say what each path is exists.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == hyprforge_files::start::DBUS_SERVICE) {
+        run_file_manager1(args);
+    }
+
     // Resolve the shared look before the first frame — the one place
     // that joins hyprforge-appearance (what the user set) and
     // hyprforge-ui (how to draw it), exactly as every other app in this
@@ -125,7 +134,22 @@ fn main() -> iced::Result {
     // `RoutingBackend::keyring`.
     let keyring = routing.keyring();
     let backend: Arc<dyn FsBackend> = Arc::new(routing);
-    let start_dir = resolve_start_dir(backend.as_ref(), std::env::args().nth(1));
+    let start = match hyprforge_files::start::parse(args, &|path| backend.stat(path).ok().map(|e| e.is_dir)) {
+        Ok(hyprforge_files::start::Request::Window(start)) => start,
+        Ok(hyprforge_files::start::Request::Help) => {
+            println!("{}", hyprforge_files::start::USAGE);
+            return Ok(());
+        }
+        Ok(hyprforge_files::start::Request::DbusService) => unreachable!("handled above"),
+        Err(why) => {
+            eprintln!("hyprforge-files: {why}");
+            std::process::exit(2);
+        }
+    };
+    let (start_dir, start_select) = match start.tabs.first() {
+        Some(tab) => (tab.dir.clone(), tab.select.clone()),
+        None => (backend.home_dir(), Vec::new()),
+    };
 
     // A `files.toml` that exists and will not parse must be reported,
     // never silently defaulted — see `hyprforge_files_core::prefs`'s own
@@ -174,7 +198,9 @@ fn main() -> iced::Result {
     // share that has stopped answering costs its tab, not the window.
     let session_path = hyprforge_paths::files_session_toml_path();
     let (restored, session_status) = hyprforge_files::session::starting_tabs(
-        std::env::args().nth(1).is_some(),
+        // Anything the command line named — a folder, `--select`ed files,
+        // `--properties` — is someone asking for that, not for last time.
+        !start.tabs.is_empty(),
         prefs.restore_tabs,
         &session_path,
         backend.clone(),
@@ -264,7 +290,18 @@ fn main() -> iced::Result {
     let restoring: Vec<Task<Message>> = more_tabs.into_iter().map(|dir| app.open_tab(dir)).collect();
     app.active = restored_active.min(app.tabs.len() - 1);
     app.session = hyprforge_files::session::Keeper::new(Some(session_path), app.session_now());
-    let boot_task = Task::batch([first_read, Task::batch(restoring), app.load_pinned(), app.attach_drag()]);
+    app.tabs[0].browser.set_type_of(hyprforge_files::launch::type_of(app.mime.clone()));
+    // What the command line named beyond the first folder: what to select
+    // in it, the other folders as tabs of their own, and Properties —
+    // see `hyprforge_files::start`. Never both this and a restore: tabs
+    // are restored only when the command line named none.
+    let boot_task = Task::batch([
+        first_read,
+        Task::batch(restoring),
+        app.load_pinned(),
+        app.attach_drag(),
+        app.open_start_tabs(start_select, &start),
+    ]);
 
     // `iced::application` calls this closure exactly once; a `RefCell`
     // lets `main` build the real starting state above (which needs I/O)
@@ -293,62 +330,33 @@ fn main() -> iced::Result {
 }
 
 // ---------------------------------------------------------------------
-// Startup path resolution
+// Startup
 // ---------------------------------------------------------------------
 
-/// Resolves the optional CLI argument into a directory to open.
-///
-/// With no argument, the user's home directory. With one, it may be a
-/// plain path or a `file://` URI (the `.desktop` entry passes `%U`,
-/// which a launcher can hand either as) — see [`resolve_arg_path`]. If
-/// that path names a file rather than a directory, its *parent* is
-/// opened instead — the convention every graphical file manager follows
-/// for "open containing folder" and for a `%U` that named a document.
-///
-/// A path that does not exist at all is deliberately **not** validated
-/// here and **not** silently replaced with home: it is handed to
-/// `Browser` as the starting directory unchanged, and the ordinary
-/// `ReadDir` -> `StdBackend::read_dir` -> `NotFound` path produces
-/// `Browser`'s own `LoadState::Error` — the actionable "doesn't exist"
-/// sentence the brief asks for, already built, not a second copy of it
-/// invented here. See [`tests::a_nonexistent_start_path_is_not_short_circuited`].
-fn resolve_start_dir(backend: &dyn FsBackend, arg: Option<String>) -> PathBuf {
-    let Some(arg) = arg else {
-        return backend.home_dir();
-    };
-    let path = resolve_arg_path(&arg);
-    match backend.stat(&path) {
-        Ok(entry) if !entry.is_dir => path.parent().map(Path::to_path_buf).unwrap_or(path),
-        _ => path,
+/// `hyprforge-files --dbus-service`: serves `org.freedesktop.FileManager1`
+/// until it has been idle for five minutes, then exits — see
+/// `hyprforge_files::file_manager1`. Never returns.
+fn run_file_manager1(args: Vec<std::ffi::OsString>) -> ! {
+    if args.len() > 1 {
+        eprintln!(
+            "hyprforge-files: {} takes nothing else\n{}",
+            hyprforge_files::start::DBUS_SERVICE,
+            hyprforge_files::start::USAGE
+        );
+        std::process::exit(2);
     }
-}
-
-/// Plain path, or a `file://` URI — percent-decoded, with an optional
-/// `localhost` authority stripped (`file://localhost/home/x` is valid
-/// per RFC 8089; a bare `file:///home/x` is what most tools actually
-/// emit). Not a general URI parser: this crate does not depend on one,
-/// and the `.desktop` entry's `%U` for a local path never needs more.
-fn resolve_arg_path(arg: &str) -> PathBuf {
-    let Some(rest) = arg.strip_prefix("file://") else {
-        return PathBuf::from(arg);
-    };
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-    // `hyprforge_fileops::percent` decodes over raw bytes rather than
-    // `str`, so a filename that is not valid UTF-8 survives the trip —
-    // the same reason that module gives for doing it that way. A `%`
-    // that is not a valid escape makes it refuse; the argument is then
-    // taken literally, which is the only remaining honest reading of it.
-    let Ok(decoded) = hyprforge_fileops::percent::decode_path(rest) else {
-        return PathBuf::from(arg);
-    };
-    if decoded.is_absolute() {
-        decoded
-    } else {
-        // No leading slash means no `///` triple-slash form was used —
-        // still an absolute local path per the scheme, so one is added
-        // rather than resolving it against whatever the cwd happens to
-        // be.
-        Path::new("/").join(decoded)
+    use hyprforge_files::file_manager1::{serve, Launch, ThisBinary};
+    let served = ThisBinary::new().map_err(|e| e.to_string()).and_then(|launch| {
+        let launch: Arc<dyn Launch> = Arc::new(launch);
+        let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+        runtime.block_on(serve(launch)).map_err(|e| e.to_string())
+    });
+    match served {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("hyprforge-files: the FileManager1 service could not start: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -491,6 +499,9 @@ enum Message {
     Undone(Vec<PathBuf>, Vec<String>),
     /// The undo notice with this number has been up long enough.
     NoticeExpired(u64),
+    /// One of the person's own actions ended — `Err` is the sentence
+    /// for the status bar. See `hyprforge_files::terminal::run_custom`.
+    CustomFinished(Result<(), String>),
     /// The records behind a restore were found: the tab it was asked
     /// from, the items (stored path, original path, record), and anything
     /// that could not be found.
@@ -1647,6 +1658,24 @@ impl App {
                 self.chooser = Some(chooser.with_rows(&self.mime));
                 Task::none()
             }
+            // "Open Terminal Here" and the person's own actions — see
+            // `hyprforge_files::terminal`. Finding the terminal walks
+            // `PATH`, a handful of `stat`s, so it is done here rather
+            // than kept: a terminal installed while the window is open
+            // is found the next time it is asked for.
+            Outcome::OpenTerminal(dir) => {
+                use hyprforge_files::terminal;
+                self.status = match terminal::find(self.config.terminal.as_deref()) {
+                    Some(found) => terminal::open_in(&found, &dir).err(),
+                    None => Some(terminal::none_found()),
+                };
+                Task::none()
+            }
+            Outcome::RunCustom { action, paths, cwd } => {
+                use hyprforge_files::terminal;
+                let found = if action.terminal { terminal::find(self.config.terminal.as_deref()) } else { None };
+                Task::perform(terminal::run_custom(*action, paths, cwd, found), Message::CustomFinished)
+            }
             Outcome::PrefsChanged(prefs) => Task::perform(
                 save_prefs(move |p: &mut Prefs| *p = merge_tab_prefs(p, prefs)),
                 Message::PrefsSaved,
@@ -2000,10 +2029,19 @@ impl App {
         }
         let path = hyprforge_paths::files_config_toml_path();
         self.preferences = Some(Preferences::new(path.clone(), Page::Behaviour));
-        Task::perform(
+        // What "Automatic" would start, for the Terminal & actions page
+        // to name — it walks `PATH`, so it is looked for off this thread.
+        let found = Task::perform(
+            async move {
+                tokio::task::spawn_blocking(|| hyprforge_files::terminal::find(None)).await.unwrap_or_default()
+            },
+            |found| Message::Preferences(Sheet::Launching(sheet::launching::Message::Found(found))),
+        );
+        let read = Task::perform(
             async move { tokio::task::spawn_blocking(move || sheet::read(&path)).await.unwrap_or_default() },
             |(state, problems)| Message::Preferences(Sheet::Read(state, problems)),
-        )
+        );
+        Task::batch([read, found])
     }
 
     fn preferences_effect(&mut self, effect: hyprforge_files::preferences::Effect) -> Task<Message> {
@@ -3077,6 +3115,31 @@ impl App {
         )
     }
 
+    /// The rest of what the command line asked for, once the first tab
+    /// exists: `select` in it, a tab for each further folder with its own
+    /// selection, the first tab shown, and Properties on its selection
+    /// when `--properties` asked. Each selection waits for its listing
+    /// (`SelectWhenListed`), and the inspector follows the selection once
+    /// it arrives, so asking for it now is not too early.
+    fn open_start_tabs(&mut self, select: Vec<PathBuf>, start: &hyprforge_files::start::Start) -> Task<Message> {
+        if !select.is_empty() {
+            let _ = self.tabs[0].browser.update(BrowserMessage::SelectWhenListed(select));
+        }
+        let mut tasks = Vec::new();
+        for tab in start.tabs.iter().skip(1) {
+            tasks.push(self.open_tab(tab.dir.clone()));
+            if !tab.select.is_empty() {
+                let _ = self.active_tab_mut().browser.update(BrowserMessage::SelectWhenListed(tab.select.clone()));
+            }
+        }
+        self.active = 0;
+        if start.properties {
+            let outcome = self.tabs[0].browser.update(BrowserMessage::ToggleProperties);
+            tasks.push(self.handle_outcome(0, outcome));
+        }
+        Task::batch(tasks)
+    }
+
     /// Opens a new tab at `start_dir` and makes it active — `Ctrl+T` and
     /// the titlebar `+` both funnel here.
     fn open_tab(&mut self, start_dir: PathBuf) -> Task<Message> {
@@ -3085,6 +3148,7 @@ impl App {
         let (mut browser, outcome) =
             Browser::new(Mode::App, self.last_prefs.clone(), start_dir, self.sidebar_items.clone());
         browser.set_config(self.config.clone());
+        browser.set_type_of(hyprforge_files::launch::type_of(self.mime.clone()));
         browser.set_can_paste(self.clipboard.may_hold_files());
         let _ = browser.update(BrowserMessage::PinnedLoaded(self.pinned_items.clone()));
         self.tabs.push(Tab::new(id, browser));
@@ -3218,7 +3282,7 @@ impl App {
                 let message = match (capturing, press.key) {
                     (true, keymap::Key::Escape) => Sheet::CancelCapture,
                     (true, _) => Sheet::Captured(keymap::Combo { key: press.key, mods: press.mods }),
-                    (false, keymap::Key::Escape) => Sheet::Close,
+                    (false, keymap::Key::Escape) => Sheet::Escape,
                     (false, _) => return Task::none(),
                 };
                 self.update(Message::Preferences(message))
@@ -3518,6 +3582,14 @@ impl App {
             Message::NoticeExpired(id) => {
                 if self.notice.as_ref().is_some_and(|(current, _)| *current == id) {
                     self.notice = None;
+                }
+                Task::none()
+            }
+            Message::CustomFinished(result) => {
+                // Success says nothing, like opening a file: the program's
+                // own window, or the changed files, are the answer.
+                if let Err(why) = result {
+                    self.status = Some(why);
                 }
                 Task::none()
             }
@@ -5422,72 +5494,6 @@ mod tests {
     use super::*;
     use hyprforge_files_core::DirErrorKind;
 
-    // --- CLI argument / start-path resolution -----------------------------
-
-    #[test]
-    fn a_plain_path_resolves_unchanged() {
-        assert_eq!(resolve_arg_path("/home/alex/Documents"), PathBuf::from("/home/alex/Documents"));
-    }
-
-    #[test]
-    fn a_file_uri_decodes_to_the_same_plain_path() {
-        assert_eq!(
-            resolve_arg_path("file:///home/alex/Documents"),
-            PathBuf::from("/home/alex/Documents")
-        );
-    }
-
-    #[test]
-    fn a_file_uri_with_a_localhost_authority_is_accepted() {
-        assert_eq!(
-            resolve_arg_path("file://localhost/home/alex/Documents"),
-            PathBuf::from("/home/alex/Documents")
-        );
-    }
-
-    #[test]
-    fn a_file_uri_percent_decodes_a_space_in_the_path() {
-        assert_eq!(
-            resolve_arg_path("file:///home/alex/My%20Documents"),
-            PathBuf::from("/home/alex/My Documents")
-        );
-    }
-
-    #[test]
-    fn resolve_start_dir_with_no_argument_is_home() {
-        let backend = RoutingBackend::default();
-        assert_eq!(resolve_start_dir(&backend, None), backend.home_dir());
-    }
-
-    #[test]
-    fn resolve_start_dir_of_a_file_opens_its_parent() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("notes.txt");
-        std::fs::write(&file, "hi").unwrap();
-        let backend = RoutingBackend::default();
-        assert_eq!(
-            resolve_start_dir(&backend, Some(file.to_string_lossy().into_owned())),
-            dir.path()
-        );
-    }
-
-    /// The design choice this module's doc calls out by name: a
-    /// nonexistent path is handed to `Browser` as-is rather than
-    /// pre-validated and replaced with something safe, because
-    /// `Browser`'s own error state already exists to say "this doesn't
-    /// exist" and a second copy of that logic here would be redundant —
-    /// and could disagree with it.
-    #[test]
-    fn a_nonexistent_start_path_is_not_short_circuited() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist");
-        let backend = RoutingBackend::default();
-        assert_eq!(
-            resolve_start_dir(&backend, Some(missing.to_string_lossy().into_owned())),
-            missing
-        );
-    }
-
     // --- reading a nonexistent directory: error state, not empty --------
 
     #[test]
@@ -5813,6 +5819,51 @@ mod tests {
         let mut bare = app_for_test(&["/a"]);
         let _ = bare.handle_outcome(0, Outcome::Activated("/a/page.html".into()));
         assert_eq!(bare.chooser, None, "no database means no opinion");
+    }
+
+    /// A terminal chosen in Preferences that is not installed is said,
+    /// naming the choice — and never quietly swapped for another. (A
+    /// configured one that is missing is also the only way to ask this
+    /// without starting a real terminal on the machine running it.)
+    #[test]
+    fn a_chosen_terminal_that_is_missing_is_a_sentence_in_the_status_bar() {
+        let mut app = app_for_test(&["/a"]);
+        let mut config = (*app.config).clone();
+        config.terminal = Some(vec!["no-such-terminal-xyz".to_string()]);
+        app.config = Arc::new(config);
+        let _ = app.handle_outcome(0, Outcome::OpenTerminal("/a".into()));
+        let said = app.status.clone().expect("a sentence");
+        assert!(said.contains("no-such-terminal-xyz") && said.contains("Preferences"), "{said}");
+    }
+
+    #[test]
+    fn a_custom_action_that_failed_says_so_and_one_that_worked_says_nothing() {
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(Message::CustomFinished(Ok(())));
+        assert_eq!(app.status, None);
+        let _ = app.update(Message::CustomFinished(Err("\u{201c}Shrink\u{201d} failed (exit 1)".into())));
+        assert_eq!(app.status.as_deref(), Some("\u{201c}Shrink\u{201d} failed (exit 1)"));
+    }
+
+    /// Escape on the Terminal & actions page puts the editor away first;
+    /// only a second one closes the sheet.
+    #[test]
+    fn escape_closes_the_action_editor_before_the_sheet() {
+        use hyprforge_files::preferences::{launching::Message as Page, Message as Sheet, Page as Pages};
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(Message::Browser(BrowserMessage::Perform(Action::Preferences)));
+        let _ = app.update(Message::Preferences(Sheet::Read(Default::default(), Vec::new())));
+        let _ = app.update(Message::Preferences(Sheet::Show(Pages::Launching)));
+        let _ = app.update(Message::Preferences(Sheet::Launching(Page::Add)));
+        let escape = hyprforge_files_core::keymap::KeyPress {
+            key: keymap::Key::Escape,
+            mods: Default::default(),
+            text: None,
+        };
+        let _ = app.update(Message::KeyPressed(escape));
+        assert!(app.preferences.is_some(), "the editor went, the sheet stayed");
+        let _ = app.update(Message::KeyPressed(escape));
+        assert!(app.preferences.is_none());
     }
 
     /// Asked for deliberately, the list starts as the applications for

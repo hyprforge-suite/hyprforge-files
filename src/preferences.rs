@@ -35,12 +35,16 @@ use iced::{Background, Border, Color, Element, Length};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+pub mod launching;
+
 /// The sheet's two pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
     #[default]
     Behaviour,
     Keys,
+    /// The terminal, and the person's own actions — see [`launching`].
+    Launching,
 }
 
 /// A key that belongs to another action, waiting for a yes.
@@ -80,6 +84,8 @@ pub struct Preferences {
     cleared: Option<String>,
     /// A Clear Recent on its way.
     clearing: bool,
+    /// The "Terminal & actions" page.
+    launching: launching::Launching,
 }
 
 /// What a write came back with: the configuration as it now loads, what
@@ -115,6 +121,9 @@ pub enum Message {
     ClearRecent,
     /// What Clear Recent did, in a sentence — the window's answer.
     RecentCleared(String),
+    /// Escape: puts away what is open on a page, else closes the sheet.
+    Escape,
+    Launching(launching::Message),
 }
 
 /// What the window should do after the sheet has updated.
@@ -146,6 +155,7 @@ impl Preferences {
             filter: String::new(),
             cleared: None,
             clearing: false,
+            launching: launching::Launching::new(launching::Installed::default()),
         }
     }
 
@@ -173,6 +183,15 @@ impl Preferences {
                 Effect::None
             }
             Message::Close => Effect::Close,
+            Message::Escape if self.page == Page::Launching && self.launching.editing() => {
+                self.launching.cancel();
+                Effect::None
+            }
+            Message::Escape => Effect::Close,
+            Message::Launching(message) => match self.launching.update(message, config, self.writable()) {
+                Some(edits) => self.write(edits),
+                None => Effect::None,
+            },
             Message::Read(file, problems) => {
                 self.file = Some(file);
                 self.problems = problems;
@@ -226,6 +245,7 @@ impl Preferences {
             Message::Saved(result) => {
                 let result = *result;
                 self.saving = false;
+                self.launching.saved(result.is_ok());
                 match result {
                     Ok((_, file, problems)) => {
                         self.file = Some(file);
@@ -289,6 +309,7 @@ impl Preferences {
         let nav = column![
             nav_item(Page::Behaviour, "Behaviour"),
             nav_item(Page::Keys, "Key bindings"),
+            nav_item(Page::Launching, "Terminal & actions"),
             Space::new().height(Length::Fill),
             hint_text("Colours, fonts and the accent come from the Settings app, so every Hyprforge window matches.", scale)
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
@@ -300,6 +321,9 @@ impl Preferences {
         let page: Element<'a, Message> = match self.page {
             Page::Behaviour => self.behaviour(config, prefs, scale),
             Page::Keys => self.keys(config, scale),
+            Page::Launching => {
+                self.launching.view(config, &self.problems, self.writable(), scale).map(Message::Launching)
+            }
         };
 
         let mut body = column![
@@ -308,6 +332,7 @@ impl Preferences {
                     match self.page {
                         Page::Behaviour => "Behaviour",
                         Page::Keys => "Key bindings",
+                        Page::Launching => "Terminal & actions",
                     },
                     Some(shown_path),
                     scale,

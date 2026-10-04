@@ -153,5 +153,11 @@ hyprforge-fileops = { version = "0.1", features = ["mock"] }
 # one.
 hyprforge-volumes = { version = "0.1", features = ["mock"] }
 # Paused time, so the folder watch's debounce is tested in virtual
-# milliseconds rather than by sleeping through real ones.
-tokio = { version = "1.53", features = ["test-util"] }
+# milliseconds rather than by sleeping through real ones; and `net` for
+# the FileManager1 service's tests below.
+tokio = { version = "1.53", features = ["test-util", "rt-multi-thread", "macros", "net"] }
+# The FileManager1 service's interface, called over a real D-Bus
+# connection in its tests — peer to peer on a socket pair, so no bus is
+# joined and no caller on the machine can reach it. `p2p` is what lets a
+# connection be its own server.
+zbus = { version = "5.18", default-features = false, features = ["tokio", "p2p"] }

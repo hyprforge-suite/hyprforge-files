@@ -1081,7 +1081,8 @@ Named so nothing here is mistaken for an oversight:
   the file moves. Removes the Tags sidebar section and the pink role.
 - **The terminal drawer (`1i`)** — the most cuttable thing in the document, and
   the one with a good alternative: opening a terminal at the current directory
-  is one keybind and does not need a drawer.
+  is one keybind and does not need a drawer. That keybind is built — F4,
+  "Open Terminal Here"; see "Launching" below.
 
 ## The order I would actually build in
 
@@ -1360,6 +1361,93 @@ places a tab can move.
   window opens on one tab at home.
 - "Reopen last time's tabs" in Preferences is `restore_tabs` in
   `files.toml`, on by default; off, nothing is written either.
+
+## Launching — built
+
+Three ways Files starts things or is started, which share one rule: a
+command is a list of words, and a path is one of them, byte for byte,
+never a line handed to a shell.
+
+**Showing files for other applications.** `hyprforge-files
+--dbus-service` serves `org.freedesktop.FileManager1`
+(`src/file_manager1.rs`), modelled on the portal service. `ShowFolders`,
+`ShowItems` and `ShowItemProperties` each start a window of this binary —
+`PATH…`, `--select PATH…`, `--properties PATH…` — detached, reaped on a
+thread, with the caller's startup id passed on as `XDG_ACTIVATION_TOKEN`
+so the window may take focus. The URIs are decoded to paths in the
+service; a non-`file://` one is left out with a warning naming only its
+scheme, and a call with nothing local in it is an error back to the
+caller, so a browser with another way to show the file uses it. The
+service exits after five minutes without a call, and the bus starts it
+again. The installer claims the name in the user's own services
+directory, which the bus reads before `/usr/share` — where Nemo's or
+Nautilus's file is — and gives it back on uninstall.
+
+**The command line** (`src/start.rs`) takes several paths, `--select`
+and `--properties`. Items are grouped by folder: a tab per folder, in the
+order first named, each with its items selected through
+`SelectWhenListed` — so "show these five downloads" is one tab, not
+five. A folder given to `--select` is shown in *its* folder, selected;
+going into it is `ShowFolders`. A plain file is opened in its folder,
+selected. A path that is not there still goes to the browser, which says
+so. The grouping lives here rather than in the service, so the command
+line and the bus cannot disagree about it. The photo viewer's "Show in
+Files" runs `--select` too.
+
+**Open Terminal Here** (F4; the folder and empty-space menus; the
+palette) opens a terminal in the folder a folder row's menu was opened
+on, or else in the folder in view — never the *selected* folder on F4,
+because going back or up leaves the folder you came from selected.
+Which terminal (`src/terminal.rs`): `[behaviour] terminal` in
+`files-config.toml`, then `xdg-terminal-exec`, then `$TERMINAL`, then the
+first of ghostty, kitty, foot, alacritty, wezterm, konsole,
+gnome-terminal and xterm. A configured one is used even when it is
+missing — quietly starting another would hide that the choice is broken
+— and says so. Every terminal is started with the folder as its working
+directory; the ones known to take a flag for it get that too, and
+Ghostty is told not to hand the window to an instance already running,
+which would open it in *its* directory. Off inside an archive and in
+the Trash: neither is a directory the kernel knows.
+
+**Your own actions** are `[[action]]` blocks (`hyprforge_files_core::custom`):
+
+```toml
+[[action]]
+label = "Resize to 50%"
+command = ["magick", "mogrify", "-resize", "50%"]   # the selection is appended
+types = ["image/*"]       # MIME globs; a type's parents count, so text/plain covers source code
+selection = "any"         # one | many | any
+terminal = false
+```
+
+- **Offered where they suit.** The entry, folder and empty-space menus
+  end with the actions whose `types` match everything the menu acts on
+  — by name, through the shared MIME database, as the menu opens. A
+  type that does not suit hides the row; a selection of the wrong size
+  greys it, so the menu keeps its shape. From the empty space the folder
+  in view is what is acted on. The palette lists the ones that can run.
+  The open/save dialog offers none: it is never handed the type matcher.
+- **Run as argv.** The command, then each path as an argument of its
+  own, with the folder in view as the working directory; no shell, no
+  `%f` field codes — the suite's `Exec=` policy. Waited for on the async
+  runtime with no bound, on purpose: a long conversion may take as long
+  as it takes. A non-zero exit is a sentence in the status bar with the
+  last line the program printed to stderr; success says nothing.
+- **A bad block costs that block.** Each is checked alone and reported by
+  its label. A restriction that cannot be read — a misspelt `types`, an
+  unknown `selection`, an unknown key that may be one — leaves the whole
+  block out rather than dropping the restriction: an action for pictures
+  that starts offering itself on everything is worse than one missing
+  with a reason. A repeated id keeps the first.
+
+**Preferences** has a "Terminal & actions" page (`src/preferences/launching.rs`):
+Automatic, naming what it finds, or a chosen command; and the action list
+with Add, Edit and Remove. The editor checks as you type — the program
+must be installed, the types must be types, a quote must close — and
+Save stays off until it is right. It writes one `[[action]]` block at a
+time with `toml_edit`'s array of tables, found by id rather than by
+position, so a block someone added above it in an editor is not the one
+changed, and the comments in and around a block survive its edit.
 
 ## What to verify, not assume
 
