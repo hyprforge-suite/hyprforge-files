@@ -23,6 +23,8 @@
 
 pub mod archive_jobs;
 pub mod bulk_rename;
+pub mod connect;
+pub mod devices;
 pub mod dnd;
 pub mod drag_out;
 pub mod host;

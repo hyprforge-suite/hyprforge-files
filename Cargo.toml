@@ -3,7 +3,7 @@ name = "hyprforge-files"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "A file manager for Hyprland: tabs, a sidebar, list, grid and column views with thumbnails, a preview pane and a Space-bar Quick Look, the freedesktop trash, copy, paste and drag with other applications, zip/tar/7z archives browsed and edited in place, bulk rename, a Properties inspector, Preferences with rebindable keys, and the desktop's open/save dialog through xdg-desktop-portal."
+description = "A file manager for Hyprland: tabs, a sidebar, list, grid and column views with thumbnails, a preview pane and a Space-bar Quick Look, drives and network shares in the sidebar with Connect to Server, the freedesktop trash, copy, paste and drag with other applications, zip/tar/7z archives browsed and edited in place, bulk rename, a Properties inspector, Preferences with rebindable keys, and the desktop's open/save dialog through xdg-desktop-portal."
 repository = "https://github.com/hyprforge-suite/hyprforge"
 documentation = "https://docs.rs/hyprforge-files"
 readme = "README.md"
@@ -51,6 +51,14 @@ hyprforge-video = "0.1"
 # work — extracting, compressing and rewriting — which needs the backend
 # directly rather than through a listing.
 hyprforge-archive = "0.1"
+# Drives over UDisks2 and network shares over gvfs: the sidebar's Devices
+# and Remote sections — see `devices.rs`. With its `client` feature (on by
+# default), which is the D-Bus client and the `gio` runner; the browser
+# view takes the same crate without them.
+hyprforge-volumes = "0.1"
+# A server's password, from the Connect to Server dialog to `gio`'s
+# standard input, in a type whose `Debug` is its length.
+hyprforge-secret = "0.1"
 # Grid thumbnails and the preview pane: decoded within a budget, with
 # the EXIF orientation applied — the same decode the image viewer uses,
 # so a photograph is the same way up in both.
@@ -133,3 +141,7 @@ hyprforge-files-core = { version = "0.1", features = ["mock"] }
 # `MockFilesystem`, so undo's tests can trash into a temporary directory
 # rather than the real Trash of whoever runs them.
 hyprforge-fileops = { version = "0.1", features = ["mock"] }
+# Drives that mount, refuse and vanish on cue, so the window's handling of
+# a busy unmount or an unplugged stick is tested without touching a real
+# one.
+hyprforge-volumes = { version = "0.1", features = ["mock"] }
