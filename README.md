@@ -199,8 +199,12 @@ its dialog takes the window with it. Each application's dialog opens
 where it was last left, remembered in `files-portal.toml` beside Files'
 own settings.
 
-Installing it switches nothing. To make it every application's dialog,
-put this in `~/.config/xdg-desktop-portal/hyprland-portals.conf`:
+Installing it switches nothing. With Hyprforge Settings installed, its
+**Set up** page (or `hyprforge-settings --setup`) can switch it on. It
+adds the line below to your existing `hyprland-portals.conf`, keeps the
+rest of the file, and removes only that line on undo. By hand, to make
+it every application's dialog, put this in
+`~/.config/xdg-desktop-portal/hyprland-portals.conf`:
 
 ```
 [preferred]
@@ -234,8 +238,10 @@ folders, `ShowItemProperties` is `--properties`. It is started by the
 session bus when something asks and exits after five minutes idle.
 `./hyprforge --install` claims the name in your own D-Bus services
 directory, where it wins over another file manager's file in
-`/usr/share`, and `--uninstall` gives it back; the Arch package installs
-an activation file too.
+`/usr/share`, and `--uninstall` gives it back. The Arch package installs
+an activation file in `/usr/share` too. When another file manager has
+one there as well, the bus picks one of them, and Settings → **Set up**'s
+"Show in folder" item writes the user's own file to settle it.
 
 ## Licence
 
