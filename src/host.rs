@@ -177,7 +177,10 @@ fn resolve_icon(key: &str, mime: &hyprforge_mime::MimeDb) -> Option<hyprforge_fi
         // The place's own name first, and a plain folder when the theme
         // has nothing by that name — a theme without `folder-cloud` still
         // draws a folder rather than the coloured mark.
-        IconSource::Themed(name) => themed(&[name, "folder"]),
+        IconSource::Themed(names) => {
+            let names: Vec<&str> = IconSource::names(names).chain(std::iter::once("folder")).collect();
+            themed(&names)
+        }
         IconSource::File(path) => user_icon(path).or_else(|| {
             tracing::warn!(path = %path.display(), "[sidebar.icons] names an image that cannot be drawn; using the theme's folder");
             themed(&["folder"])
