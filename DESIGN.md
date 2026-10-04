@@ -1245,6 +1245,70 @@ was the client's first. With a virtual keyboard present the clipboard's
 device was first again, the drag entered *it*, and the source got
 `cancelled`, exactly as "Dropping onto Files" above says.
 
+## Live folder updates and reopened tabs — built
+
+**A folder on screen re-reads itself** when something else changes it
+(`watch.rs`). The window's subscription is keyed on the distinct folders
+its tabs show, so iced starts a new watch whenever a tab navigates, opens
+or closes, and drops the old one — inotify descriptor and all — in the
+same step. Watched for `CREATE`, `DELETE`, the two `MOVED`s,
+`CLOSE_WRITE` and `ATTRIB`, plus the folder's own `DELETE_SELF` and
+`MOVE_SELF`. Not `MODIFY`: a file being written fires one per `write`,
+and its size can wait for the close.
+
+- **Every event is "look again".** The first event of a burst starts a
+  wait; the burst is drained as it arrives until it has been quiet for
+  250ms, or a second has passed since it began, and each folder it
+  touched is re-read once — through `refresh_dirs`, the same re-read F5
+  does, so the selection survives (`apply_dir_loaded`'s `retain`), the
+  scroll position is kept, and a slower earlier read is dropped by the
+  generation guard. Measured: two hundred files written to a folder on
+  screen arrive as one re-read 254ms after the first write.
+- **Never watched by the kernel:** a folder inside an archive (skipped —
+  the archive's own rewrite already re-reads it); a folder on a network
+  share, which the sidebar knows or `statfs` names (NFS, SMB, 9p, Ceph,
+  AFS, FUSE — gvfs, sshfs and rclone are all FUSE), because inotify only
+  hears changes made through this machine; and a folder the kernel
+  refuses (`ENOSPC` when `max_user_watches` is spent). The last two are
+  polled every `watch-network-every` seconds while they are shown, and a
+  refusal is logged once per process. A folder that is gone is neither
+  watched nor polled; its tab already says so.
+- **Nothing waits on it.** Events are read through tokio's reactor, never
+  by a blocking read, and setting up — a `statfs` or an `add_watch` on a
+  hard-mounted share whose server has gone does block — runs on the
+  blocking pool under a two-second bound, after which every folder is
+  polled.
+- `[behaviour] watch` turns it off, and `watch-network-every` sets the
+  interval (1 to 600 seconds, 3 by default); Preferences offers on/off and
+  1, 3 or 10 seconds, and shows a hand-written interval as chosen.
+
+The open/save dialog does not watch: it is open for seconds, and its
+listing is read when it opens.
+
+**The window reopens on last time's tabs** (`session.rs`), from
+`files-session.toml` — `{ tabs, active }`, written atomically 400ms after
+the tabs stop changing, the way the window size is, and at once when the
+last tab is closed, since the process ends before any timer could fire.
+Its own file rather than a field of `files.toml`, because that one is
+shared with the dialog, which has no tabs, and every writer of it rewrites
+the whole thing. One `update_and_remember` after every message compares
+the tabs with what was last seen, rather than a save call in each of the
+places a tab can move.
+
+- **A path on the command line wins**: `hyprforge-files ~/Downloads` is
+  someone asking for Downloads.
+- **A folder that is gone is skipped**, and the tab in front stays in
+  front, or its nearest surviving neighbour to the left takes its place.
+  Checking is bounded at 500ms on a thread of its own, so a share that has
+  stopped answering costs its tab, not the window opening.
+- **A tab inside an archive is kept as the folder holding it**: opening an
+  archive is done on purpose, and one with a password would ask for it
+  before the window had finished appearing.
+- **Missing is first run; unreadable is said** in the status bar, and the
+  window opens on one tab at home.
+- "Reopen last time's tabs" in Preferences is `restore_tabs` in
+  `files.toml`, on by default; off, nothing is written either.
+
 ## What to verify, not assume
 
 - Screenshot the real window against the mockup at the same size, and compare

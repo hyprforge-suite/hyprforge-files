@@ -58,6 +58,16 @@ gvfs's and the kernel's, and **Connect to Server** mounts an `smb://`,
 password when the server wants one. UDisks2 not running, or gvfs not
 installed, is said in the sidebar or the dialog rather than hidden.
 
+A folder on screen **keeps itself up to date**: a download finishing, a
+file saved from an editor or a build writing its output shows up without
+F5, the selection and the scroll position kept. A burst of changes —
+unpacking a tarball into the folder — is one re-read a quarter of a
+second after it goes quiet, not one per file. A network share cannot say
+when someone else changes it, so a folder on one is looked at again every
+few seconds while it is shown, and only then. The window **reopens on
+last time's tabs**, skipping any folder that has gone, unless it was
+started on a folder of its own. Both are switches in Preferences.
+
 Copies, moves and archive work run in the background through a
 **queue**: a control in the tab strip shows overall progress, its
 popover lists each job with its rate and estimate and why a waiting one
@@ -114,7 +124,9 @@ watching drives and shares (`devices.rs`): a stick can be opened, and
 saved to, from a file chooser too, though not ejected from one. The
 talking to UDisks2 and gvfs is `hyprforge-volumes`'. Quick Look's
 requests are coalesced by `quicklook.rs`, so a held arrow key decodes
-only the picture it stops on.
+only the picture it stops on. Keeping the folders on screen up to date is
+`watch.rs`, over inotify, and the tabs reopened at startup are
+`session.rs` — both the window's alone.
 
 ## Installing
 

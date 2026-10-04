@@ -20,6 +20,8 @@
 //! The Properties inspector's looking and changing (`properties`) and
 //! the Preferences sheet (`preferences`) are here too: both are the
 //! window's, and the open/save dialog has neither.
+//! So are keeping a folder on screen up to date as other programs
+//! change it (`watch`) and reopening last time's tabs (`session`).
 
 pub mod archive_jobs;
 pub mod bulk_rename;
@@ -37,6 +39,8 @@ pub mod preview;
 pub mod properties;
 pub mod quicklook;
 pub mod search_jobs;
+pub mod session;
 pub mod system_clipboard;
 pub mod tabstrip;
 pub mod transfers;
+pub mod watch;

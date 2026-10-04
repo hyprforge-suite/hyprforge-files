@@ -122,6 +122,13 @@ serde_json = "1"
 toml = "1.1"
 thiserror = "2"
 tracing = "0.1"
+# Live folder updates — see `watch.rs`. `stream` so the watch is read
+# through tokio's reactor in the subscription that owns it, never by a
+# blocking read on any thread a window waits on.
+inotify = { version = "0.11", default-features = false, features = ["stream"] }
+# `statfs`, to tell a network filesystem — on which inotify hears only
+# this machine's own changes — from a local one. See `watch::is_remote`.
+libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Not a dev-dependency: a file opened out of an archive is unpacked to a
@@ -145,3 +152,6 @@ hyprforge-fileops = { version = "0.1", features = ["mock"] }
 # a busy unmount or an unplugged stick is tested without touching a real
 # one.
 hyprforge-volumes = { version = "0.1", features = ["mock"] }
+# Paused time, so the folder watch's debounce is tested in virtual
+# milliseconds rather than by sleeping through real ones.
+tokio = { version = "1.53", features = ["test-util"] }

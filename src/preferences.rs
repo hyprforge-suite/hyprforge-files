@@ -23,6 +23,7 @@ use hyprforge_files_core::preferences::{
     binding_rows, conflict_label, group, plan_binding, BehaviourSetting, BindingRow, Capture, Plan, Setting,
     CONFLICT_POLICIES, GROUPS,
 };
+use hyprforge_files_core::preferences::{seconds_label, watch_network_choices};
 use hyprforge_files_core::prefs::{Prefs, SidebarPref, ViewMode};
 use hyprforge_ui::theme::{spacing, surface, FontScale, BASE_TEXT_SIZE};
 use hyprforge_ui::widgets::{
@@ -433,6 +434,8 @@ impl Preferences {
             browsing,
             section_label("File operations", scale),
             operations,
+            section_label("Tabs and live updates", scale),
+            self.live(config, prefs, scale),
             hint_text(
                 "Browsing is remembered in files.toml. File operations and key bindings are written to \
                  files-config.toml one line at a time, so anything you wrote there by hand stays; its \
@@ -442,6 +445,56 @@ impl Preferences {
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
         ]
         .spacing(spacing::MD)
+        .into()
+    }
+
+    /// Reopening tabs (`files.toml`, like Browsing) and watching folders
+    /// (`files-config.toml`, like File operations) — one section because
+    /// both are about what the window shows without being asked.
+    fn live<'a>(&'a self, config: &'a Config, prefs: &'a Prefs, scale: FontScale) -> Element<'a, Message> {
+        let writable = self.writable();
+        let behaviour = &config.behaviour;
+        let mut watch = toggle(behaviour.watch, scale);
+        if writable {
+            watch = watch.on_toggle(|on| Message::Behaviour(BehaviourSetting::Watch(on)));
+        }
+        let every: Element<'a, Message> = if writable {
+            segmented_choice(
+                &watch_network_choices(behaviour.watch_network_every),
+                Some(&behaviour.watch_network_every),
+                |s| seconds_label(*s),
+                |s| Message::Behaviour(BehaviourSetting::WatchNetworkEvery(s)),
+                scale,
+            )
+        } else {
+            config_line(seconds_label(behaviour.watch_network_every), scale).into()
+        };
+        setting_list([
+            setting_row(
+                0,
+                "Reopen last time's tabs",
+                Some(hint_text("Not when Files is started on a folder. A folder that is gone is skipped.", scale).into()),
+                toggle(prefs.restore_tabs, scale).on_toggle(|on| Message::Browsing(Setting::RestoreTabs(on))),
+                scale,
+            ),
+            setting_row(
+                1,
+                "Update folders as they change",
+                Some(hint_text("Off, a folder shows what other programs did only when you press F5.", scale).into()),
+                watch,
+                scale,
+            ),
+            setting_row(
+                2,
+                "Check network folders every",
+                Some(
+                    hint_text("A share can't say when someone else changes it, so it is asked while it is shown.", scale)
+                        .into(),
+                ),
+                every,
+                scale,
+            ),
+        ])
         .into()
     }
 
@@ -697,6 +750,44 @@ mod tests {
                 &config
             ),
             Effect::None
+        );
+    }
+
+    /// Live updates go to `files-config.toml` a line at a time; reopening
+    /// tabs is the window's own state, in `files.toml`, like the toolbar's.
+    #[test]
+    fn the_live_update_switches_write_their_line_and_restoring_tabs_is_adopted() {
+        let mut sheet = ready();
+        let config = Config::default();
+        assert_eq!(
+            sheet.update(Message::Behaviour(BehaviourSetting::WatchNetworkEvery(10)), &config),
+            Effect::Write(vec![Edit::Behaviour(
+                "watch-network-every",
+                hyprforge_files_core::config_edit::BehaviourValue::Number(10)
+            )])
+        );
+        let mut sheet = ready();
+        assert_eq!(sheet.update(Message::Behaviour(BehaviourSetting::Watch(true)), &config), Effect::None, "already on");
+        assert_eq!(
+            sheet.update(Message::Browsing(Setting::RestoreTabs(false)), &config),
+            Effect::Adopt(Setting::RestoreTabs(false))
+        );
+    }
+
+    /// Through the real file: a hand-written comment and line survive
+    /// the sheet's edit, and the edit is the one line it claims.
+    #[test]
+    fn switching_live_updates_off_keeps_what_was_written_by_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files-config.toml");
+        std::fs::write(&path, "[behaviour]\n# slow link\nwatch-network-every = 30\n").unwrap();
+        let (config, _, problems) = write(&path, &[BehaviourSetting::Watch(false).edit()]).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!config.behaviour.watch);
+        assert_eq!(config.behaviour.watch_network_every, 30);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[behaviour]\n# slow link\nwatch-network-every = 30\nwatch = false\n"
         );
     }
 

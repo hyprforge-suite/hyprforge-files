@@ -168,13 +168,26 @@ fn main() -> iced::Result {
     );
     let last_window_size = (prefs.window_width, prefs.window_height);
 
-    // Tab restoration (re-opening the tabs that were open last time) is
-    // deferred: it needs a field on `Prefs`, and another agent is working
-    // on `hyprforge-files-core::prefs` at the same time this crate was
-    // built — see this crate's task report for why that edit was left
-    // for reconciliation rather than made here. So the window always
-    // starts with exactly one tab, at `start_dir`, same as before tabs
-    // existed.
+    // Last time's tabs, unless a folder was asked for on the command line
+    // or the person switched restoring off — see `hyprforge_files::session`.
+    // Checking that each saved folder is still there is bounded, so a
+    // share that has stopped answering costs its tab, not the window.
+    let session_path = hyprforge_paths::files_session_toml_path();
+    let (restored, session_status) = hyprforge_files::session::starting_tabs(
+        std::env::args().nth(1).is_some(),
+        prefs.restore_tabs,
+        &session_path,
+        backend.clone(),
+    );
+    let prefs_status = [prefs_status, session_status].into_iter().flatten().reduce(|a, b| format!("{a} \u{00B7} {b}"));
+    let (start_dir, more_tabs, restored_active) = match restored {
+        Some(session) => {
+            let mut tabs = session.tabs.into_iter();
+            let first = tabs.next().expect("a restored session has at least one tab");
+            (first, tabs.collect::<Vec<_>>(), session.active)
+        }
+        None => (start_dir, Vec::new(), 0),
+    };
     let (mut browser, outcome) =
         Browser::new(Mode::App, prefs.clone(), start_dir, sidebar_items.clone());
     browser.set_config(config.clone());
@@ -191,6 +204,8 @@ fn main() -> iced::Result {
         status: startup_status(prefs_status, &config_problems),
         last_window_size,
         resize_generation: 0,
+        // Replaced below, once the restored tabs are open.
+        session: Default::default(),
         clipboard: Arc::new(hyprforge_files::system_clipboard::SystemClipboard::new()),
         drag: Arc::new(hyprforge_files::dnd::Dnd::new()),
         // A handful of small files, read once before the window opens —
@@ -242,7 +257,13 @@ fn main() -> iced::Result {
     // otherwise the window opens showing nothing at all, forever, for
     // the same reason CLAUDE.md's "a five-second gap" rule exists: an
     // outcome nobody satisfies is silent, not merely slow.
-    let boot_task = Task::batch([app.handle_outcome(0, outcome), app.load_pinned(), app.attach_drag()]);
+    let first_read = app.handle_outcome(0, outcome);
+    // The rest of last time's tabs, then the one that was in front put
+    // back in front — `open_tab` brings each new one forward.
+    let restoring: Vec<Task<Message>> = more_tabs.into_iter().map(|dir| app.open_tab(dir)).collect();
+    app.active = restored_active.min(app.tabs.len() - 1);
+    app.session = hyprforge_files::session::Keeper::new(Some(session_path), app.session_now());
+    let boot_task = Task::batch([first_read, Task::batch(restoring), app.load_pinned(), app.attach_drag()]);
 
     // `iced::application` calls this closure exactly once; a `RefCell`
     // lets `main` build the real starting state above (which needs I/O)
@@ -252,7 +273,7 @@ fn main() -> iced::Result {
 
     iced::application(
         move || boot.borrow_mut().take().expect("hyprforge-files boots once"),
-        App::update,
+        App::update_and_remember,
         App::view,
     )
     .title(App::title)
@@ -426,6 +447,13 @@ enum Message {
     /// a drag that is still going can ignore it. See
     /// [`App::resize_generation`].
     WindowSettled(u64),
+    /// Something changed a folder a tab is showing — see
+    /// `hyprforge_files::watch`. Already one per burst, not per change.
+    DirChanged(PathBuf),
+    /// The tabs have stopped changing: the generation the save was armed
+    /// with, the same guard as [`Message::WindowSettled`].
+    SessionSettled(u64),
+    SessionSaved(Result<(), String>),
     DismissStatus,
     /// The titlebar's `+`. `Ctrl+T` is `Action::NewTab`.
     NewTab,
@@ -721,6 +749,9 @@ struct App {
     /// reason: a stale answer has to be recognisable as stale rather
     /// than raced against.
     resize_generation: u64,
+    /// The tabs as last seen, and the save waiting for them to settle —
+    /// see `hyprforge_files::session` and [`App::update_and_remember`].
+    session: hyprforge_files::session::Keeper,
     /// Which modifiers are held right now.
     ///
     /// A row click has to know, because ctrl-click toggles and
@@ -2926,6 +2957,18 @@ impl App {
         match neighbour_after_close(self.tabs.len(), index) {
             TabCloseOutcome::NoSuchTab => Task::none(),
             TabCloseOutcome::WindowShouldClose => {
+                // Written now rather than after the usual pause: the
+                // process ends with this message, before any timer could
+                // fire. One small local file, the same budget the
+                // window's own startup spends reading it.
+                if self.last_prefs.restore_tabs {
+                    if let Some((path, session)) = self.session.now() {
+                        let session = keep_as(session);
+                        if let Err(e) = hyprforge_files::session::save_to(&path, &session) {
+                            tracing::warn!("{e}");
+                        }
+                    }
+                }
                 self.tabs.clear();
                 // A one-window process: closing its only tab closes the
                 // window by closing the whole application, same as the
@@ -3782,6 +3825,16 @@ impl App {
                     Message::PrefsSaved,
                 )
             }
+            Message::DirChanged(dir) => self.refresh_dirs(&[dir]),
+            Message::SessionSettled(generation) => {
+                let Some((path, session)) = self.session.settled(generation) else { return Task::none() };
+                Task::perform(save_session(path, session), Message::SessionSaved)
+            }
+            Message::SessionSaved(Ok(())) => Task::none(),
+            Message::SessionSaved(Err(e)) => {
+                self.status = Some(e);
+                Task::none()
+            }
             Message::DismissStatus => {
                 self.status = None;
                 Task::none()
@@ -4043,7 +4096,74 @@ impl App {
             // UDisks2 or gvfs says something changed, a burst at a time.
             Subscription::run_with(self.devices.backends.clone(), hyprforge_files::devices::watch)
                 .map(Message::Devices),
+            self.watch_folders(),
         ])
+    }
+
+    /// Live updates for the folders on screen. Keyed on the distinct
+    /// folders across every tab, so iced starts a new watch when a tab
+    /// navigates and drops the old one — see `hyprforge_files::watch`.
+    /// Pure: no I/O here, since this runs after every message.
+    fn watch_folders(&self) -> Subscription<Message> {
+        match self.watched() {
+            Some(watched) => Subscription::run_with(watched, hyprforge_files::watch::watch).map(Message::DirChanged),
+            None => Subscription::none(),
+        }
+    }
+
+    /// What [`App::watch_folders`] is keyed on; `None` for no watch.
+    fn watched(&self) -> Option<hyprforge_files::watch::Watched> {
+        let behaviour = &self.config.behaviour;
+        if !behaviour.watch {
+            return None;
+        }
+        let devices = self.devices.snapshot();
+        let dirs: std::collections::BTreeSet<PathBuf> = self
+            .tabs
+            .iter()
+            // Already known to be inside an archive: not a folder on
+            // disk. One not yet listed is caught by the watch's own check.
+            .filter(|tab| !tab.browser.in_archive())
+            .map(|tab| tab.browser.current_dir().to_path_buf())
+            .collect();
+        if dirs.is_empty() {
+            return None;
+        }
+        let shares = dirs.iter().filter(|dir| devices.share_holding(dir).is_some()).cloned().collect();
+        Some(hyprforge_files::watch::Watched {
+            dirs,
+            shares,
+            poll_every: Duration::from_secs(behaviour.watch_network_every),
+        })
+    }
+
+    /// [`App::update`], then a look at whether the tabs changed — opened,
+    /// closed, switched or navigated — and if so a save of the session
+    /// armed for when they settle. One place after every message rather
+    /// than a call in each of the dozens of places a tab can move.
+    fn update_and_remember(&mut self, message: Message) -> Task<Message> {
+        let task = self.update(message);
+        match self.session.changed(self.session_now(), self.last_prefs.restore_tabs) {
+            Some(generation) => Task::batch([
+                task,
+                Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(RESIZE_SETTLE)).await;
+                        generation
+                    },
+                    Message::SessionSettled,
+                ),
+            ]),
+            None => task,
+        }
+    }
+
+    /// The tabs as `files-session.toml` keeps them.
+    fn session_now(&self) -> hyprforge_files::session::Session {
+        hyprforge_files::session::Session {
+            tabs: self.tabs.iter().map(|tab| tab.browser.current_dir().to_path_buf()).collect(),
+            active: self.active,
+        }
     }
 }
 
@@ -5089,6 +5209,22 @@ fn merge_tab_prefs(on_disk: &Prefs, mut from_tab: Prefs) -> Prefs {
 /// function's own doc for why a read-modify-write beats saving a copy
 /// loaded earlier (two processes, the app and the portal dialog, can
 /// each have their own idea of what the file last said).
+/// A session as written: each tab inside an archive kept as the folder
+/// holding it — see `session::kept_as`. Blocking.
+fn keep_as(session: hyprforge_files::session::Session) -> hyprforge_files::session::Session {
+    hyprforge_files::session::Session {
+        tabs: session.tabs.iter().map(|dir| hyprforge_files::session::kept_as(dir)).collect(),
+        ..session
+    }
+}
+
+/// Writes the session off the UI thread.
+async fn save_session(path: PathBuf, session: hyprforge_files::session::Session) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || hyprforge_files::session::save_to(&path, &keep_as(session)))
+        .await
+        .unwrap_or_else(|e| Err(format!("couldn't save your tabs: {e}")))
+}
+
 async fn save_prefs(mutate: impl FnOnce(&mut Prefs) + Send + 'static) -> Result<Prefs, String> {
     match tokio::task::spawn_blocking(move || hyprforge_files_core::prefs::update(mutate)).await {
         Ok(Ok(prefs)) => Ok(prefs),
@@ -5250,6 +5386,8 @@ mod tests {
             status: None,
             last_window_size: (900, 600),
             resize_generation: 0,
+            // No path: a test never writes the real session file.
+            session: Default::default(),
             clipboard: Arc::new(MemoryClipboard::new()),
             // Never attached: no window, so every drag is refused.
             drag: Arc::new(hyprforge_files::dnd::Dnd::new()),
@@ -7467,6 +7605,61 @@ mod tests {
         // `None`, which becomes `ItemCount::Unreadable` — never
         // `Some(0)`, which would render as "0 items".
         assert_eq!(counts[1], (PathBuf::from("/dir/locked"), None));
+    }
+
+    /// A change to a folder re-reads every tab showing it and no other —
+    /// through the same generation guard as F5, so a slower earlier read
+    /// cannot land on top of it.
+    #[test]
+    fn a_folder_that_changed_is_re_read_in_every_tab_showing_it_and_only_there() {
+        let mut app = app_for_test(&["/one", "/two", "/one"]);
+        let before: Vec<u64> = app.tabs.iter().map(|t| t.read_generation).collect();
+        let _ = app.update(Message::DirChanged(PathBuf::from("/one")));
+        let after: Vec<u64> = app.tabs.iter().map(|t| t.read_generation).collect();
+        assert_eq!(after, vec![before[0] + 1, before[1], before[2] + 1]);
+    }
+
+    /// The watch is keyed on the distinct folders across the tabs, so it
+    /// follows a tab that navigates, and it stops when switched off.
+    #[test]
+    fn the_watched_folders_are_the_distinct_folders_on_screen() {
+        let mut app = app_for_test(&["/one", "/two", "/one"]);
+        let watched = app.watched().unwrap();
+        assert_eq!(watched.dirs, [PathBuf::from("/one"), PathBuf::from("/two")].into());
+        assert!(watched.shares.is_empty());
+        assert_eq!(watched.poll_every, Duration::from_secs(3));
+
+        let _ = app.open_tab(PathBuf::from("/three"));
+        assert!(app.watched().unwrap().dirs.contains(Path::new("/three")), "a new tab is watched");
+
+        let mut config = (*app.config).clone();
+        config.behaviour.watch = false;
+        app.config = Arc::new(config);
+        assert_eq!(app.watched(), None);
+    }
+
+    /// Switching, opening, closing and navigating all arm one save of the
+    /// session, after the update that did it — never a write per message.
+    #[test]
+    fn changing_the_tabs_arms_a_save_of_the_session() {
+        let mut app = app_for_test(&["/one", "/two"]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files-session.toml");
+        app.session = hyprforge_files::session::Keeper::new(Some(path.clone()), app.session_now());
+
+        let _ = app.update_and_remember(Message::SwitchTab(1));
+        let (to, saved) = app.session.settled(1).expect("a save is armed");
+        assert_eq!(to, path);
+        assert_eq!(saved.tabs, vec![PathBuf::from("/one"), PathBuf::from("/two")]);
+        assert_eq!(saved.active, 1);
+
+        let _ = app.update_and_remember(Message::DismissStatus);
+        assert!(app.session.settled(1).is_some(), "nothing changed, nothing re-armed");
+
+        // Switched off: what the tabs do is no longer anybody's business.
+        app.last_prefs.restore_tabs = false;
+        let _ = app.update_and_remember(Message::SwitchTab(0));
+        assert!(app.session.settled(1).is_some() && app.session.settled(2).is_none());
     }
 
     // The Trash's own listing behaviour — that it shows original names
