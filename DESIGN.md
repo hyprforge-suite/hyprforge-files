@@ -295,9 +295,13 @@ card through `hyprforge-ui`'s new `scrim`):
 
 Measured in a nested Hyprland on a 36-megapixel JPEG (debug build): the
 card's decode peaked at 107MB over the window's resident size — the one
-full-size decode `hyprforge-image` makes before shrinking, now never two
+full-size decode `hyprforge-image` made before shrinking, now never two
 at once — and kept about 42MB more resident afterwards, the 1336-pixel
-picture with the renderer's copy of it.
+picture with the renderer's copy of it. Since then `hyprforge-image`
+decodes a JPEG wanted at under half its size at a quarter or an eighth
+of it directly: the same 1336-pixel decode of a 37-megapixel phone
+photograph peaks at 19MB rather than 117MB in a process of its own, and
+a grid thumbnail at 9MB rather than 116MB.
 
 Not built: **playing video.** The card shows a video's frame, length and
 size. Playing it means libmpv, a player thread and a `shader` primitive
