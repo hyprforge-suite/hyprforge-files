@@ -36,7 +36,8 @@ they are on disk.
 the way Explorer does it: one ladder from Compact details through
 Details to Small, Medium, Large and Extra large icons, crossing from
 the list to the grid on the way, with the status bar naming where you
-are.
+are. The toolbar's view buttons jump straight to the most-used ones:
+Details, Large icons and Columns.
 
 **Quick Look** (Space) shows the focused entry large, over the window —
 the same readers as the preview pane, with the picture decoded for the

@@ -232,7 +232,11 @@ both views — Compact details, Details, Small icons, Medium icons,
 Large icons, Extra large icons (`prefs::LADDER`) — so a notch down from
 Small icons is Details and the view changes where the ladder crosses,
 as Explorer's does; Ctrl+0 is the view's own size. The status bar names
-the preset, as Explorer's shows its view. Nothing new is stored for it:
+the preset, as Explorer's shows its view. The toolbar's view buttons
+are presets too — Details, Large icons (Explorer's own two status-bar
+buttons, the sizes used most) and Columns — so the grid button opens
+Large icons whatever size the grid was last at; each lights while its
+view shows, whichever rung it is on. Nothing new is stored for it:
 a preset is a view and that view's zoom step, both already in
 `files.toml` (`view_mode`, `[zoom]`). Column view, which Explorer has
 nothing like, keeps a plain zoom from 75% to 200% and says its
