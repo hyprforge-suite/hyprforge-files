@@ -13,7 +13,7 @@
 //! through an archive, which `archive_jobs` runs the same way `jobs`
 //! runs a paste — and the parts that need the window's own connection
 //! or a disk: reading what the preview pane and the thumbnails show
-//! (`preview`), the Wayland clipboard (`system_clipboard`) and dragging
+//! (`preview`) and what Quick Look shows (`quicklook`), the Wayland clipboard (`system_clipboard`) and dragging
 //! files out to other applications and taking drops from them (`dnd`).
 //! The Properties inspector's looking and changing (`properties`) and
 //! the Preferences sheet (`preferences`) are here too: both are the
@@ -29,6 +29,7 @@ pub mod portal_service;
 pub mod preferences;
 pub mod preview;
 pub mod properties;
+pub mod quicklook;
 pub mod search_jobs;
 pub mod system_clipboard;
 pub mod tabstrip;

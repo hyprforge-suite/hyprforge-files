@@ -136,6 +136,7 @@ fn run_dialog() -> Answer {
         browser,
         backend,
         mime: Arc::new(hyprforge_mime::MimeDb::load()),
+        quick_look: Default::default(),
         config: Arc::new(config),
         font_scale: FontScale(hyprforge_ui::theme::active().font_scale),
         width: DIALOG_SIZE.width,
@@ -191,6 +192,8 @@ struct Dialog {
     browser: Browser,
     backend: Arc<dyn FsBackend>,
     mime: Arc<hyprforge_mime::MimeDb>,
+    /// Quick Look's requests, newest only — see `hyprforge_files::quicklook`.
+    quick_look: hyprforge_files::quicklook::Coalescer,
     config: Arc<hyprforge_files_core::config::Config>,
     font_scale: FontScale,
     width: f32,
@@ -430,6 +433,17 @@ impl Dialog {
                 build_preview(path, self.mime.clone(), self.backend.clone()),
                 |(path, preview)| Message::Browser(BrowserMessage::PreviewLoaded(path, preview)),
             ),
+            // A file chooser is where looking before choosing matters
+            // most; the card is bounded here exactly as in the window.
+            Outcome::LoadQuickLook(path) => hyprforge_files::quicklook::task(
+                &self.quick_look,
+                path,
+                self.mime.clone(),
+                self.backend.clone(),
+                (self.width, self.height),
+                self.font_scale,
+                |path, found| Message::Browser(BrowserMessage::QuickLookLoaded(path, found)),
+            ),
             Outcome::LoadIcons(keys) => Task::perform(resolve_icons(keys, self.mime.clone()), |icons| {
                 Message::Browser(BrowserMessage::IconsLoaded(icons))
             }),
@@ -567,10 +581,16 @@ impl Dialog {
         }
         // Escape with nothing to back out of closes the dialog, the way
         // every dialog does. With a search typed, it clears the search.
-        if press.key == Key::Escape && self.browser.search_query().is_empty() && !self.browser.menu_open() {
+        // Quick Look is something to back out of: Escape closes the card,
+        // not the dialog behind it.
+        if press.key == Key::Escape
+            && self.browser.search_query().is_empty()
+            && !self.browser.menu_open()
+            && !self.browser.quick_look_open()
+        {
             return self.finish(Answer::Cancelled);
         }
-        match self.config.keymap.resolve(&press) {
+        match self.config.keymap.resolve_typing(&press, self.browser.typing_under_way()) {
             Some(Resolved::Action(action)) if action.scope() == Scope::Window => Task::none(),
             // Enter on a file in an Open dialog is accept; on a folder it
             // goes in, which `Open` already does.

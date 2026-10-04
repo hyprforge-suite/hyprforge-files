@@ -28,6 +28,13 @@ the costly ones kept in the freedesktop thumbnail cache every other
 file manager and viewer already shares. Files can be copied and pasted with other
 applications, and dragged out of the window into them.
 
+**Quick Look** (Space) shows the focused entry large, over the window —
+the same readers as the preview pane, with the picture decoded for the
+card's size on your output's scale. The arrows move through the folder
+with it open, Enter opens the file, and Space or Escape puts it away.
+A Space typed between two words of a search still types a space. It
+works in the open/save dialog too.
+
 Copies, moves and archive work run in the background through a
 **queue**: a control in the tab strip shows overall progress, its
 popover lists each job with its rate and estimate and why a waiting one
@@ -65,7 +72,9 @@ deliberately does not have: launching what you double-click, file
 operations, the transfers popover and queue view, the archive jobs, the system clipboard,
 and drag and drop with other applications. Reading what the listing,
 the preview pane and the thumbnails show is `host.rs`, shared with the
-dialog — the second binary here, `hyprforge-files-portal`.
+dialog — the second binary here, `hyprforge-files-portal` — and Quick
+Look's requests are coalesced by `quicklook.rs`, so a held arrow key
+decodes only the picture it stops on.
 
 ## Installing
 
