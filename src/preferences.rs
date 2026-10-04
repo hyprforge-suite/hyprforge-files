@@ -20,7 +20,7 @@ use hyprforge_files_core::config::{Config, ConfigProblem};
 use hyprforge_files_core::config_edit::{Edit, EditError, FileState};
 use hyprforge_files_core::keymap::Combo;
 use hyprforge_files_core::preferences::{
-    binding_rows, conflict_label, group, plan_binding, BehaviourSetting, BindingRow, Capture, Plan, Setting,
+    binding_rows, conflict_label, group, plan_binding, BehaviourSetting, BindingRow, Capture, Plan, Setting, SidebarSetting,
     CONFLICT_POLICIES, GROUPS,
 };
 use hyprforge_files_core::preferences::{seconds_label, watch_network_choices};
@@ -75,6 +75,11 @@ pub struct Preferences {
     saving: bool,
     /// Narrows the key bindings list.
     filter: String,
+    /// What the last Clear Recent did, said beside its button. `None`
+    /// while one is running, too: [`Self::clearing`] says that.
+    cleared: Option<String>,
+    /// A Clear Recent on its way.
+    clearing: bool,
 }
 
 /// What a write came back with: the configuration as it now loads, what
@@ -104,6 +109,12 @@ pub enum Message {
     /// did not happen.
     Saved(Box<Written>),
     Filter(String),
+    /// One of `[sidebar]`'s Recent and Starred switches.
+    Sidebar(SidebarSetting),
+    /// The Clear Recent button.
+    ClearRecent,
+    /// What Clear Recent did, in a sentence — the window's answer.
+    RecentCleared(String),
 }
 
 /// What the window should do after the sheet has updated.
@@ -116,6 +127,9 @@ pub enum Effect {
     Write(Vec<Edit>),
     /// Apply this to every tab and save it to `files.toml`.
     Adopt(Setting),
+    /// Forget what Files recorded in Recent, and answer with
+    /// [`Message::RecentCleared`].
+    ClearRecent,
 }
 
 impl Preferences {
@@ -130,6 +144,8 @@ impl Preferences {
             note: None,
             saving: false,
             filter: String::new(),
+            cleared: None,
+            clearing: false,
         }
     }
 
@@ -222,6 +238,27 @@ impl Preferences {
             }
             Message::Filter(text) => {
                 self.filter = text;
+                Effect::None
+            }
+            Message::Sidebar(setting) => {
+                if setting.holds_in(&config.sidebar) {
+                    return Effect::None;
+                }
+                self.write(vec![setting.edit()])
+            }
+            // Not a `files-config.toml` write, so not held back by one:
+            // it edits another file entirely. Held back only by itself.
+            Message::ClearRecent => {
+                if self.clearing {
+                    return Effect::None;
+                }
+                self.clearing = true;
+                self.cleared = None;
+                Effect::ClearRecent
+            }
+            Message::RecentCleared(said) => {
+                self.clearing = false;
+                self.cleared = Some(said);
                 Effect::None
             }
         }
@@ -429,9 +466,41 @@ impl Preferences {
             ),
         ]);
 
+        // Recent and Starred: whether each has a row at the top of
+        // Places, and a way to forget what Files itself put in Recent.
+        // Only Files' own entries — the list is the desktop's, and what
+        // a browser or an editor recorded there is theirs to keep.
+        let sidebar_config = &config.sidebar;
+        let mut clear = secondary_button(if self.clearing { "Clearing\u{2026}" } else { "Clear Recent" });
+        if !self.clearing {
+            clear = clear.on_press(Message::ClearRecent);
+        }
+        let clear_hint = self.cleared.clone().unwrap_or_else(|| {
+            "Forgets the files Files opened. What other applications opened stays in their Recent.".to_string()
+        });
+        let sidebar = setting_list([
+            setting_row(
+                0,
+                "Recent in the sidebar",
+                Some(hint_text("What was opened lately, by Files and every other application.", scale).into()),
+                config_switch(sidebar_config.show_recent, |on| Message::Sidebar(SidebarSetting::ShowRecent(on))),
+                scale,
+            ),
+            setting_row(
+                1,
+                "Starred in the sidebar",
+                Some(hint_text("Star a file or folder from its menu.", scale).into()),
+                config_switch(sidebar_config.show_starred, |on| Message::Sidebar(SidebarSetting::ShowStarred(on))),
+                scale,
+            ),
+            setting_row(2, "Files' recent history", Some(hint_text(clear_hint, scale).into()), clear, scale),
+        ]);
+
         column![
             section_label("Browsing", scale),
             browsing,
+            section_label("Sidebar", scale),
+            sidebar,
             section_label("File operations", scale),
             operations,
             section_label("Tabs and live updates", scale),
@@ -789,6 +858,58 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "[behaviour]\n# slow link\nwatch-network-every = 30\nwatch = false\n"
         );
+    }
+
+    /// Each sidebar switch writes exactly its own `[sidebar]` line, and
+    /// through the real file the person's other lines stay as written.
+    #[test]
+    fn each_sidebar_switch_writes_exactly_its_line() {
+        use hyprforge_files_core::config_edit::BehaviourValue;
+        let mut sheet = ready();
+        let config = Config::default();
+        assert_eq!(
+            sheet.update(Message::Sidebar(SidebarSetting::ShowRecent(false)), &config),
+            Effect::Write(vec![Edit::Sidebar("show-recent", BehaviourValue::Switch(false))])
+        );
+        let mut sheet = ready();
+        assert_eq!(
+            sheet.update(Message::Sidebar(SidebarSetting::ShowStarred(false)), &config),
+            Effect::Write(vec![Edit::Sidebar("show-starred", BehaviourValue::Switch(false))])
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files-config.toml");
+        let mine = "# mine\n[sidebar]\nshow-trash = false\n";
+        std::fs::write(&path, mine).unwrap();
+        let (config, _, problems) = write(&path, &[SidebarSetting::ShowRecent(false).edit()]).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!config.sidebar.show_recent && !config.sidebar.show_trash && config.sidebar.show_starred);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{mine}show-recent = false\n"));
+    }
+
+    /// A line written by hand is what the sheet shows: choosing the value
+    /// it already says writes nothing.
+    #[test]
+    fn a_hand_written_sidebar_line_shows_in_the_sheet() {
+        let mut sheet = ready();
+        let (config, _) =
+            hyprforge_files_core::config::parse("[sidebar]\nshow-starred = false\n", std::path::Path::new("x"));
+        assert!(!config.sidebar.show_starred);
+        assert_eq!(sheet.update(Message::Sidebar(SidebarSetting::ShowStarred(false)), &config), Effect::None);
+    }
+
+    /// Clear Recent asks the window once, says what it did, and is not a
+    /// `files-config.toml` write — so a file that will not parse does not
+    /// stop it.
+    #[test]
+    fn clear_recent_asks_once_and_says_what_it_did() {
+        let mut sheet = Preferences::new(PathBuf::from("/tmp/x.toml"), Page::Behaviour);
+        let config = Config::default();
+        assert_eq!(sheet.update(Message::ClearRecent, &config), Effect::ClearRecent);
+        assert_eq!(sheet.update(Message::ClearRecent, &config), Effect::None, "one at a time");
+        sheet.update(Message::RecentCleared("Cleared 2 files".into()), &config);
+        assert_eq!(sheet.cleared.as_deref(), Some("Cleared 2 files"));
+        assert_eq!(sheet.update(Message::ClearRecent, &config), Effect::ClearRecent);
     }
 
     #[test]

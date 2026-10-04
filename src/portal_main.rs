@@ -241,7 +241,8 @@ enum Message {
     DirLoaded(PathBuf, Result<Vec<Entry>, DirError>),
     PathResolved(String, Vec<hyprforge_files_core::jump::Candidate>),
     Searched(hyprforge_files::search_jobs::Event),
-    /// A saved search was written, or could not be.
+    /// A saved search, or a change to the stars, was written to
+    /// `files.toml` — or could not be.
     SearchesSaved(Result<(), String>),
     KeyPressed(hyprforge_files_core::keymap::KeyPress),
     ModifiersChanged(keyboard::Modifiers),
@@ -571,6 +572,57 @@ impl Dialog {
                 Some(start) => self.spawn_search(start),
                 None => Task::none(),
             },
+            // Recent and Starred, read-only, the way GTK's own chooser
+            // offers Recent: the file you just saved from one program is
+            // the one you are about to open in the next. The dialog
+            // records nothing in Recent — the application that asked for
+            // the file is the one that opens it.
+            Outcome::ReadRecent => {
+                let backend = self.backend.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            hyprforge_files_core::recent::read_entries(
+                                backend.as_ref(),
+                                &hyprforge_files_core::recent::path(),
+                            )
+                            .map_err(|e| e.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Reading Recent was interrupted: {e}")))
+                    },
+                    |answer| Message::Browser(BrowserMessage::RecentRead(answer)),
+                )
+            }
+            Outcome::ReadStarred(paths) => {
+                let backend = self.backend.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            hyprforge_files_core::starred::read_starred(backend.as_ref(), &paths)
+                        })
+                        .await
+                        .unwrap_or_default()
+                    },
+                    |(entries, missing)| Message::Browser(BrowserMessage::StarredRead { entries, missing }),
+                )
+            }
+            // "Unstar them" in the Starred view: the same read-modify-write
+            // as a saved search from here, so Files sees it next time.
+            Outcome::Stars(change) => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        hyprforge_files_core::prefs::update(|p| {
+                            p.starred = hyprforge_files_core::starred::apply_star_change(&p.starred, &change)
+                        })
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Saving the stars was interrupted: {e}")))
+                },
+                Message::SearchesSaved,
+            ),
             _ => {
                 self.status = Some("That isn't something this dialog does — open Files for it.".to_string());
                 Task::none()

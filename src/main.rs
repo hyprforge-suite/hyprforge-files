@@ -200,6 +200,7 @@ fn main() -> iced::Result {
         sidebar_items,
         last_prefs: prefs,
         pinned_items: Vec::new(),
+        recent_file: Some(hyprforge_files_core::recent::path()),
         font_scale: FontScale(hyprforge_ui::theme::active().font_scale),
         status: startup_status(prefs_status, &config_problems),
         last_window_size,
@@ -531,6 +532,16 @@ enum Message {
     /// A bulk rename finished: the tab it was asked from, and what was
     /// renamed — or where a failure left everything.
     BulkRenamed(u64, Result<Vec<(PathBuf, PathBuf)>, Box<hyprforge_fileops::batch::Failure>>),
+    /// An answer for the browser of the tab with this id — Recent or
+    /// Starred, read off the UI thread.
+    Collected(u64, BrowserMessage),
+    /// Opening a file was recorded in Recent, or could not be.
+    RecentRecorded(Result<(), String>),
+    /// Preferences' Clear Recent finished: how many files it forgot.
+    RecentCleared(Result<usize, String>),
+    /// An undo finished that moved things back: the moves it made, for
+    /// stars to follow, then what [`Message::Undone`] carries.
+    UndoneMoves(Vec<(PathBuf, PathBuf)>, Vec<PathBuf>, Vec<String>),
     /// What the drives-and-shares watch heard — see
     /// `hyprforge_files::devices`.
     Devices(hyprforge_files::devices::Event),
@@ -646,6 +657,11 @@ struct App {
     /// list; this is what it looked like on disk, for a new tab to show
     /// straight away.
     pinned_items: Vec<PinnedItem>,
+    /// `recently-used.xbel`, which Recent reads and opening a file
+    /// records in — see `hyprforge_files_core::recent`. `None` turns
+    /// both off; only a test window has none, so no test run writes to
+    /// the recent files of whoever runs it.
+    recent_file: Option<PathBuf>,
     /// One line shown at the bottom of the window: what
     /// `launch::open`/trashing/saving preferences said, if anything did.
     /// Pillar 3 — every error reaching the user is a sentence here, never
@@ -1606,7 +1622,10 @@ impl App {
                 }
                 let opened = (self.opener.open)(&path);
                 self.status = opened.message(&path);
-                Task::none()
+                match opened {
+                    hyprforge_files::launch::Opened::Spawned => self.record_recent(path, mime),
+                    _ => Task::none(),
+                }
             }
             Outcome::OpenWith(path) => {
                 let mime = self.mime.type_of(&path).map(str::to_string);
@@ -1633,6 +1652,9 @@ impl App {
                 Message::PrefsSaved,
             ),
             Outcome::Pins(change) => self.change_pins(&change),
+            Outcome::Stars(change) => self.change_stars(&change),
+            Outcome::ReadRecent => self.read_recent(tab_index),
+            Outcome::ReadStarred(paths) => self.read_starred(tab_index, paths),
             Outcome::Search(ask) => self.search(tab_index, ask),
             Outcome::Devices(ask) => self.ask_devices(tab_index, ask),
             Outcome::LoadThumbnails(paths) => Task::run(thumbnail_stream(paths), |(path, handle)| {
@@ -2019,6 +2041,7 @@ impl App {
                 tasks.push(Task::perform(save_prefs(move |p: &mut Prefs| setting.apply(p)), Message::PrefsSaved));
                 Task::batch(tasks)
             }
+            Effect::ClearRecent => self.clear_recent(),
         }
     }
 
@@ -2638,9 +2661,19 @@ impl App {
         Task::batch([self.spawn_read_dir(index, dir), noticed])
     }
 
+    /// Everything that follows something done: stars move with what was
+    /// renamed or moved, and the undo history remembers it. Stars first,
+    /// and whatever the undo settings say — an undo depth of 0 turns off
+    /// taking things back, not keeping track of what is starred.
+    fn record(&mut self, done: hyprforge_files_core::undo::Undoable) -> Task<Message> {
+        let stars = self.follow_stars(done.moves());
+        let remembered = self.remember(done);
+        Task::batch([stars, remembered])
+    }
+
     /// Remembers something Ctrl+Z can take back, and offers it in the
     /// status bar for `undo-notice-seconds`.
-    fn record(&mut self, done: hyprforge_files_core::undo::Undoable) -> Task<Message> {
+    fn remember(&mut self, done: hyprforge_files_core::undo::Undoable) -> Task<Message> {
         if done.is_empty() || self.config.behaviour.undo_depth == 0 {
             return Task::none();
         }
@@ -2680,13 +2713,16 @@ impl App {
                     self.status = Some("There's nothing to undo.".to_string());
                     return Task::none();
                 };
+                // Stars follow an undone rename or move back — once it
+                // has happened, which is why the moves ride along.
+                let moves = done.undo_moves();
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || jobs::undo(done))
                             .await
                             .unwrap_or_else(|e| (Vec::new(), vec![format!("Undo was interrupted: {e}")]))
                     },
-                    |(dirs, errors)| Message::Undone(dirs, errors),
+                    move |(dirs, errors)| Message::UndoneMoves(moves.clone(), dirs, errors),
                 )
             }
             Action::NewTab => self.open_tab(self.home_dir.clone()),
@@ -2745,6 +2781,112 @@ impl App {
             Message::PrefsSaved,
         );
         Task::batch([save, self.load_pinned()])
+    }
+
+    /// Stars, unstars or moves stars — for every tab at once, and on
+    /// disk. The same shape as `change_pins`, with one difference: the
+    /// change is applied to the list *on disk* when it is saved, not
+    /// written over it, so a star made from another Files window since
+    /// this one read the file is not lost.
+    fn change_stars(&mut self, change: &hyprforge_files_core::starred::StarChange) -> Task<Message> {
+        let starred = hyprforge_files_core::starred::apply_star_change(&self.last_prefs.starred, change);
+        if starred == self.last_prefs.starred {
+            return Task::none();
+        }
+        self.last_prefs.starred = starred.clone();
+        let mut tasks = Vec::with_capacity(self.tabs.len() + 1);
+        for index in 0..self.tabs.len() {
+            // A tab with Starred open reads it again.
+            let outcome = self.tabs[index].browser.set_stars(starred.clone());
+            tasks.push(self.handle_outcome(index, outcome));
+        }
+        let change = change.clone();
+        tasks.push(Task::perform(
+            save_prefs(move |p: &mut Prefs| p.starred = hyprforge_files_core::starred::apply_star_change(&p.starred, &change)),
+            Message::PrefsSaved,
+        ));
+        Task::batch(tasks)
+    }
+
+    /// Stars follow what was just renamed or moved inside Files — see
+    /// `hyprforge_files_core::starred::follow`. Nothing for anything else
+    /// that was done, or when no star was on what moved.
+    fn follow_stars(&mut self, moves: Vec<(PathBuf, PathBuf)>) -> Task<Message> {
+        if moves.is_empty() {
+            return Task::none();
+        }
+        let followed = hyprforge_files_core::starred::follow(&self.last_prefs.starred, &moves);
+        if followed == self.last_prefs.starred {
+            return Task::none();
+        }
+        self.change_stars(&hyprforge_files_core::starred::StarChange::Follow(moves))
+    }
+
+    /// Reads Recent for one tab, off the UI thread.
+    fn read_recent(&self, tab_index: usize) -> Task<Message> {
+        let tab_id = self.tabs[tab_index].id;
+        let Some(file) = self.recent_file.clone() else {
+            return Task::done(Message::Collected(tab_id, BrowserMessage::RecentRead(Ok(Vec::new()))));
+        };
+        let backend = self.backend.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    hyprforge_files_core::recent::read_entries(backend.as_ref(), &file).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Reading Recent was interrupted: {e}")))
+            },
+            move |answer| Message::Collected(tab_id, BrowserMessage::RecentRead(answer)),
+        )
+    }
+
+    /// Looks up each star for one tab, off the UI thread — a star can be
+    /// on a drive that is slow to answer.
+    fn read_starred(&self, tab_index: usize, paths: Vec<PathBuf>) -> Task<Message> {
+        let tab_id = self.tabs[tab_index].id;
+        let backend = self.backend.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || hyprforge_files_core::starred::read_starred(backend.as_ref(), &paths))
+                    .await
+                    // Interrupted: nothing found and nothing called
+                    // missing, rather than every star reported gone.
+                    .unwrap_or_default()
+            },
+            move |(entries, missing)| Message::Collected(tab_id, BrowserMessage::StarredRead { entries, missing }),
+        )
+    }
+
+    /// Records a file Files just opened in Recent, off the UI thread.
+    fn record_recent(&self, path: PathBuf, mime: Option<String>) -> Task<Message> {
+        let Some(file) = self.recent_file.clone() else { return Task::none() };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    hyprforge_files_core::recent::record_in(&file, &path, mime.as_deref()).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Recording it in Recent was interrupted: {e}")))
+            },
+            Message::RecentRecorded,
+        )
+    }
+
+    /// Preferences' Clear Recent: forgets what Files recorded, and
+    /// nothing any other application did.
+    fn clear_recent(&self) -> Task<Message> {
+        let Some(file) = self.recent_file.clone() else { return Task::done(Message::RecentCleared(Ok(0))) };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    hyprforge_files_core::recent::forget_ours_in(&file).map_err(|e| e.to_string())
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Clearing Recent was interrupted: {e}")))
+            },
+            Message::RecentCleared,
+        )
     }
 
     /// Joins the window's Wayland connection so files can be dragged out
@@ -3330,6 +3472,43 @@ impl App {
             }
             Message::PasteFrom(into, clip) => self.paste_into(into, clip),
             Message::TrashTidied => Task::none(),
+            // Only an undo that went through: one that could not put
+            // something back left it — and its star — where it was.
+            Message::UndoneMoves(moves, dirs, errors) => {
+                let stars = if errors.is_empty() { self.follow_stars(moves) } else { Task::none() };
+                Task::batch([stars, self.update(Message::Undone(dirs, errors))])
+            }
+            Message::Collected(tab_id, message) => {
+                let Some(index) = self.tab_index(tab_id) else { return Task::none() };
+                let outcome = self.tabs[index].browser.update(message);
+                self.handle_outcome(index, outcome)
+            }
+            Message::RecentRecorded(Ok(())) => Task::none(),
+            // Said, because a Recent that silently stopped keeping track
+            // looks exactly like one nobody has used.
+            Message::RecentRecorded(Err(why)) => {
+                self.status = Some(format!("Couldn't add it to Recent: {why}"));
+                Task::none()
+            }
+            Message::RecentCleared(result) => {
+                let said = match &result {
+                    Ok(0) => "Recent had nothing Files had opened.".to_string(),
+                    Ok(1) => "Cleared 1 file Files had opened from Recent.".to_string(),
+                    Ok(n) => format!("Cleared {n} files Files had opened from Recent."),
+                    Err(why) => why.clone(),
+                };
+                if let Some(sheet) = &mut self.preferences {
+                    let _ = sheet.update(hyprforge_files::preferences::Message::RecentCleared(said), &self.config);
+                }
+                // A Recent on screen anywhere is now out of date.
+                let mut tasks = Vec::new();
+                for index in 0..self.tabs.len() {
+                    if self.tabs[index].browser.collection() == Some(hyprforge_files_core::starred::Collection::Recent) {
+                        tasks.push(self.read_recent(index));
+                    }
+                }
+                Task::batch(tasks)
+            }
             Message::Undone(dirs, errors) => {
                 if !errors.is_empty() {
                     self.status = Some(format!("Couldn't undo everything: {}", errors.join(" ")));
@@ -3494,8 +3673,12 @@ impl App {
                 // doc. The pinned list is the window's own, and newer
                 // than a save that may have started before it changed.
                 let pinned = std::mem::take(&mut self.last_prefs.pinned);
+                // The stars too: a save that started before the latest
+                // star must not hand back a list without it.
+                let starred = std::mem::take(&mut self.last_prefs.starred);
                 self.last_prefs = prefs;
                 self.last_prefs.pinned = pinned;
+                self.last_prefs.starred = starred;
                 Task::none()
             }
             Message::ChooseApp(id) => {
@@ -5200,6 +5383,7 @@ fn merge_tab_prefs(on_disk: &Prefs, mut from_tab: Prefs) -> Prefs {
     // The window's list, like the pins: a tab's copy is never the one
     // written.
     from_tab.searches = on_disk.searches.clone();
+    from_tab.starred = on_disk.starred.clone();
     from_tab.window_width = on_disk.window_width;
     from_tab.window_height = on_disk.window_height;
     from_tab
@@ -5382,6 +5566,9 @@ mod tests {
             home_dir: PathBuf::from("/home/alex"),
             last_prefs: Prefs::default(),
             pinned_items: vec![],
+            // Never the real one: a test that opens a file must not
+            // write to the recent-files list of whoever runs it.
+            recent_file: None,
             font_scale: FontScale::default(),
             status: None,
             last_window_size: (900, 600),
@@ -7440,6 +7627,37 @@ mod tests {
         let _ = app.update(Message::Undone(dirs, errors));
         assert!(a.exists() && !b.exists());
         assert!(app.status.is_none());
+    }
+
+    /// A star follows a rename made in Files — in the window's list and
+    /// every tab's — and an undo of the rename takes it back with it.
+    #[test]
+    fn a_star_follows_a_rename_and_its_undo() {
+        let mut app = app_for_test(&["/dir", "/elsewhere"]);
+        let (a, b) = (PathBuf::from("/dir/a.txt"), PathBuf::from("/dir/b.txt"));
+        let _ = app.handle_outcome(0, Outcome::Stars(hyprforge_files_core::starred::StarChange::Star(vec![a.clone()])));
+        let _ = app.update(Message::Renamed(app.tabs[0].id, a.clone(), b.clone(), Ok(())));
+        assert_eq!(app.last_prefs.starred, std::slice::from_ref(&b));
+        for tab in &app.tabs {
+            assert_eq!(tab.browser.prefs().starred, std::slice::from_ref(&b), "every tab follows");
+        }
+        let _ = app.update(Message::UndoneMoves(vec![(b.clone(), a.clone())], vec![], vec![]));
+        assert_eq!(app.last_prefs.starred, std::slice::from_ref(&a));
+        // An undo that could not put it back leaves the star where the
+        // file still is.
+        let _ = app.update(Message::Renamed(app.tabs[0].id, a.clone(), b.clone(), Ok(())));
+        let _ = app.update(Message::UndoneMoves(vec![(b.clone(), a.clone())], vec![], vec!["busy".into()]));
+        assert_eq!(app.last_prefs.starred, [b]);
+    }
+
+    /// A rename with nothing starred on it changes no stars and asks for
+    /// no save of them.
+    #[test]
+    fn a_rename_of_something_unstarred_leaves_the_stars_alone() {
+        let mut app = app_for_test(&["/dir"]);
+        let _ = app.handle_outcome(0, Outcome::Stars(hyprforge_files_core::starred::StarChange::Star(vec!["/dir/s".into()])));
+        let _ = app.update(Message::Renamed(app.tabs[0].id, "/dir/x".into(), "/dir/y".into(), Ok(())));
+        assert_eq!(app.last_prefs.starred, [PathBuf::from("/dir/s")]);
     }
 
     /// The notice's button is the action, so it still undoes when Ctrl+Z
