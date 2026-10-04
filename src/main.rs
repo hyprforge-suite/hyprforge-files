@@ -105,6 +105,12 @@ fn main() -> iced::Result {
                 tracing::debug!(removed, "thumbnails of deleted files removed");
             }
         }
+        // Copies left by earlier drags out of archives — see
+        // `hyprforge_files::drag_out` for why they outlive the drag.
+        let removed = hyprforge_files::drag_out::sweep(&hyprforge_files::drag_out::root(), std::time::SystemTime::now());
+        if removed > 0 {
+            tracing::debug!(removed, "old drags' unpacked files removed");
+        }
     });
 
     // One backend, held for the life of the window and handed to every
@@ -215,6 +221,7 @@ fn main() -> iced::Result {
         drop_probe: (false, None),
         drag_over: false,
         from_drops: std::collections::HashSet::new(),
+        archive_drag: None,
         config: config.clone(),
         #[cfg(debug_assertions)]
         debug_show: DebugShow::from_env(),
@@ -431,6 +438,10 @@ enum Message {
     ClipboardCleared,
     /// How starting a drag out of the window went — see `dnd`.
     DragResult(Result<(), String>),
+    /// How unpacking a drag out of an archive went — see `drag_out`.
+    /// `Err` is a sentence, or empty when the drag ended untaken and
+    /// there is nothing to say.
+    DragUnpacked(Result<(), String>),
     /// A drag over the window — see `dnd`.
     Dnd(hyprforge_files::dnd::DropEvent),
     /// Which folder a point is over, as the layout answered — and, for a
@@ -718,6 +729,9 @@ struct App {
     /// the clipboard only when the clipboard's own cut was what moved —
     /// a drag never touched it, and found by review emptying it anyway.
     from_drops: std::collections::HashSet<JobId>,
+    /// The latest drag out of an archive, so it can be recognised if it
+    /// is dropped back where it came from — see `drag_out::OwnDrag`.
+    archive_drag: Option<hyprforge_files::drag_out::OwnDrag>,
     /// Debug builds only: what to put on screen for a screenshot. See
     /// [`DebugShow`].
     #[cfg(debug_assertions)]
@@ -2725,6 +2739,11 @@ impl App {
             ctrl: self.modifiers.control(),
             shift: self.modifiers.shift(),
         };
+        if let (hyprforge_files_core::drop::DropFrom::Outside(paths), Some(own)) = (&from, &self.archive_drag) {
+            if own.returned_home(paths, &into, held.ctrl) {
+                return Task::none();
+            }
+        }
         let trash = hyprforge_files_core::trash_path();
         Task::perform(
             async move {
@@ -2743,16 +2762,89 @@ impl App {
     /// Hands `paths` to the compositor as a drag. On the event loop's
     /// thread, through `window::run`, because that is where the window's
     /// surface can be named.
-    fn start_drag(&self, paths: Vec<PathBuf>) -> Task<Message> {
+    fn start_drag(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
         if paths.is_empty() {
             return Task::none();
+        }
+        if let Some((archive, _)) = paths.first().and_then(|p| hyprforge_files_core::archive::split(p)) {
+            return self.start_archive_drag(archive, paths);
         }
         let drag = self.drag.clone();
         let offers = hyprforge_files_core::clipboard::drag_offers(&paths);
         window::latest().and_then(move |id| {
             let (drag, paths, offers) = (drag.clone(), paths.clone(), offers.clone());
-            window::run(id, move |w| drag.start(w, paths, offers)).map(Message::DragResult)
+            window::run(id, move |w| drag.start(w, Some(paths), offers, None)).map(Message::DragResult)
         })
+    }
+
+    /// A drag out of an archive: starts at once, offering where the
+    /// members *will* be, and unpacks them beside it — see
+    /// `hyprforge_files::drag_out` for the whole arrangement and its
+    /// bounds.
+    ///
+    /// The one thing done here on the UI thread is making the drag's
+    /// directory, a single `mkdir`: the paths it offers have to be known
+    /// before the drag can start, and the drag has to start while the
+    /// button is still down.
+    fn start_archive_drag(&mut self, archive: PathBuf, paths: Vec<PathBuf>) -> Task<Message> {
+        use hyprforge_files::drag_out;
+        // Every row of one listing is inside the same archive; a member
+        // of a different one (impossible today) is left out rather than
+        // unpacked from the wrong file.
+        let members: Vec<String> = paths
+            .iter()
+            .filter_map(|p| hyprforge_files_core::archive::split(p))
+            .filter(|(a, m)| *a == archive && !m.is_empty())
+            .map(|(_, m)| m)
+            .collect();
+        if members.is_empty() {
+            return Task::none();
+        }
+        let dir = match drag_out::make_dir(&drag_out::root()) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.status = Some(format!("There's nowhere to unpack them for the drag: {e}"));
+                return Task::none();
+            }
+        };
+        let plan = drag_out::plan(&dir, &members);
+        self.archive_drag = paths[0]
+            .parent()
+            .map(|from| drag_out::OwnDrag { dir: dir.clone(), from: from.to_path_buf() });
+        let gate = drag_out::Gate::new(dir);
+        let offers = hyprforge_files_core::clipboard::drag_offers(&plan.lands);
+        let unlock = self.keyring.unlock_for(&archive);
+        self.status = Some(drag_out::unpacking_line(members.len()));
+
+        let drag = self.drag.clone();
+        let start_gate = gate.clone();
+        let started = window::latest().and_then(move |id| {
+            let (drag, offers, gate) = (drag.clone(), offers.clone(), start_gate.clone());
+            // No paths of this window's own: a member's path is nothing
+            // a paste can read, so a drop back onto this window goes
+            // through the compositor and waits for the files like any
+            // other receiver.
+            window::run(id, move |w| drag.start(w, None, offers, Some(gate))).map(Message::DragResult)
+        });
+        let unpacked = Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    // Old drags are cleared as new ones begin, so a
+                    // window left open for a week does not keep a
+                    // week of them.
+                    drag_out::sweep(&drag_out::root(), std::time::SystemTime::now());
+                    let deadline = std::time::Instant::now() + drag_out::DEADLINE;
+                    let result =
+                        drag_out::unpack(&hyprforge_archive::StdArchives, &archive, &plan, &unlock, &gate, deadline);
+                    gate.finish(result.clone());
+                    result
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Unpacking for the drag was interrupted: {e}")))
+            },
+            Message::DragUnpacked,
+        );
+        Task::batch([started, unpacked])
     }
 
     /// Reads each pinned folder off the UI thread — a pin can be on a
@@ -3189,6 +3281,17 @@ impl App {
                 }
             },
             Message::DragResult(Ok(())) => Task::none(),
+            Message::DragUnpacked(result) => {
+                // Only the line the drag put up is taken down: anything
+                // said since is newer news.
+                let ours = self.status.as_deref().is_some_and(hyprforge_files::drag_out::is_unpacking_line);
+                match result {
+                    Err(why) if !why.is_empty() => self.status = Some(why),
+                    _ if ours => self.status = None,
+                    _ => {}
+                }
+                Task::none()
+            }
             Message::DragResult(Err(why)) => {
                 self.status = Some(why);
                 Task::none()
@@ -5100,6 +5203,7 @@ mod tests {
             drop_probe: (false, None),
             drag_over: false,
             from_drops: std::collections::HashSet::new(),
+        archive_drag: None,
             config: Arc::new(hyprforge_files_core::config::Config::default()),
             #[cfg(debug_assertions)]
             debug_show: DebugShow::default(),

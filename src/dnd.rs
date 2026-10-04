@@ -28,6 +28,12 @@
 //!   for as long as a drag can last, and a drop that is never answered
 //!   is a receiver that hangs.
 //!
+//! A drag out of an archive offers paths that do not exist yet: the
+//! members are being unpacked beside the drag, and the answer to a
+//! receiver's request waits until they are there — see
+//! [`crate::drag_out`], which owns that wait, its bounds, and when the
+//! copies are removed.
+//!
 //! Only `copy` is offered. A receiver asked to *move* is entitled to
 //! expect the source to delete what it dropped, and deleting someone's
 //! files because another program accepted a drop is not a decision this
@@ -57,6 +63,7 @@
 //! clipboard does: on X11, or a compositor with no data device, a drag
 //! is a status-bar line and nothing else is lost.
 
+use crate::drag_out::{self, Gate};
 use hyprforge_files_core::clipboard::{clip_from, URI_LIST};
 use hyprforge_files_core::drop::DropFrom;
 use iced::futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
@@ -196,22 +203,48 @@ impl Dnd {
         }
     }
 
-    /// Starts dragging `paths`, offered as `offers` — `(type, content)`
-    /// pairs, most specific first — out of `window`. Must be called while
-    /// the left button that began the drag is still held.
+    /// Starts dragging, offered as `offers` — `(type, content)` pairs,
+    /// most specific first — out of `window`. Must be called while the
+    /// left button that began the drag is still held.
+    ///
+    /// `paths` are this window's own names for what is dragged, so a
+    /// drop back onto it can skip the compositor; `None` when they are
+    /// not paths a paste can read (members of an archive), which sends
+    /// such a drop through the compositor like anyone else's. `gate`,
+    /// when given, holds every answer back until the files the offers
+    /// name have been made — and is abandoned here if the drag never
+    /// starts, so its files do not outlive it.
     pub fn start(
         &self,
         window: &dyn iced::window::Window,
-        paths: Vec<PathBuf>,
+        paths: Option<Vec<PathBuf>>,
         offers: Vec<(&'static str, String)>,
+        gate: Option<Arc<Gate>>,
     ) -> Result<(), String> {
+        let started = self.start_inner(window, paths, offers, gate.clone());
+        if !matches!(started, Ok(true)) {
+            if let Some(gate) = gate {
+                gate.abandon();
+            }
+        }
+        started.map(|_| ())
+    }
+
+    /// [`Self::start`], answering whether a drag actually began.
+    fn start_inner(
+        &self,
+        window: &dyn iced::window::Window,
+        paths: Option<Vec<PathBuf>>,
+        offers: Vec<(&'static str, String)>,
+        gate: Option<Arc<Gate>>,
+    ) -> Result<bool, String> {
         let Some(ready) = self.ready.get() else {
             return Err("Dragging out needs a Wayland compositor with drag-and-drop.".to_string());
         };
         let Some(serial) = *self.press.lock().unwrap_or_else(|p| p.into_inner()) else {
             // The button came up before the drag could start — a flick
             // too quick to be a drag after all. Nothing to say.
-            return Ok(());
+            return Ok(false);
         };
         let surface = match window.window_handle().map(|h| h.as_raw()) {
             Ok(RawWindowHandle::Wayland(h)) => h.surface.as_ptr(),
@@ -227,8 +260,8 @@ impl Dnd {
 
         let offer: Arc<Vec<(String, Vec<u8>)>> =
             Arc::new(offers.into_iter().map(|(mime, text)| (mime.to_string(), text.into_bytes())).collect());
-        let source = ready.manager.create_data_source(&ready.queue, Offer(offer.clone()));
-        *self.outgoing.lock().unwrap_or_else(|p| p.into_inner()) = Some(paths);
+        let source = ready.manager.create_data_source(&ready.queue, Offer { types: offer.clone(), gate: gate.clone() });
+        *self.outgoing.lock().unwrap_or_else(|p| p.into_inner()) = paths;
         for (mime, _) in offer.iter() {
             source.offer(mime.clone());
         }
@@ -240,9 +273,23 @@ impl Dnd {
         // No icon surface: the compositor draws its own drag cursor, and
         // a picture of the files is a nicety a drag works without.
         ready.device.start_drag(Some(&source), &surface, None, serial);
+        if let Some(gate) = gate {
+            // A selection the unpacking refuses — too big, locked —
+            // ends the drag rather than leaving it looking droppable
+            // with nothing behind it. Destroying the source is the
+            // protocol's way to cancel a drag in flight. Twice is
+            // harmless: a request on a destroyed proxy is dropped.
+            let (source, connection, outgoing) = (source.clone(), ready.connection.clone(), self.outgoing.clone());
+            gate.on_fail(move || {
+                *outgoing.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                source.destroy();
+                let _ = connection.flush();
+            });
+        }
         ready
             .connection
             .flush()
+            .map(|()| true)
             .map_err(|e| format!("The drag could not be sent to the compositor: {e}"))
     }
 }
@@ -294,8 +341,12 @@ fn run_worker(
 }
 
 /// What a data source carries: every type it offered and the bytes for
-/// each, answered from here whenever a receiver asks.
-struct Offer(Arc<Vec<(String, Vec<u8>)>>);
+/// each, answered from here whenever a receiver asks — once the gate,
+/// if there is one, says the files they name exist.
+struct Offer {
+    types: Arc<Vec<(String, Vec<u8>)>>,
+    gate: Option<Arc<Gate>>,
+}
 
 struct State {
     press: Arc<Mutex<Option<u32>>>,
@@ -488,22 +539,41 @@ impl Dispatch<WlDataSource, Offer> for State {
     fn event(state: &mut Self, source: &WlDataSource, event: wl_data_source::Event, offer: &Offer, _: &Connection, _: &QueueHandle<Self>) {
         match event {
             wl_data_source::Event::Send { mime_type, fd } => {
-                let Some(bytes) = offer.0.iter().find(|(m, _)| *m == mime_type).map(|(_, b)| b.clone()) else {
+                let Some(bytes) = offer.types.iter().find(|(m, _)| *m == mime_type).map(|(_, b)| b.clone()) else {
                     return; // dropping `fd` closes it: an empty answer
                 };
+                let gate = offer.gate.clone();
                 // On a thread of its own: a pipe holds 64KiB, a long
                 // selection's URI list can be more, and a receiver that
                 // is slow to read must not stop this worker answering
                 // everyone else. The write ends, and the pipe closes,
                 // when the receiver has it all or goes away.
+                //
+                // The same thread waits for an archive drag's files: the
+                // receiver holds its end of the pipe meanwhile, and an
+                // unpacking that fails or runs out of time closes it
+                // with nothing written — an empty list, never a list of
+                // files that are not there.
                 let _ = std::thread::Builder::new().name("files-drag-send".into()).spawn(move || {
+                    if gate.is_some_and(|gate| !gate.wait(drag_out::DEADLINE)) {
+                        return;
+                    }
                     if let Err(e) = std::fs::File::from(fd).write_all(&bytes) {
                         tracing::info!(error = %e, "a drop's receiver stopped reading");
                     }
                 });
             }
             // Over either way: dropped nowhere, or dropped and taken.
+            // Only the first frees an archive drag's files — and only if
+            // no receiver was handed them (`Gate::abandon`). A finished
+            // drop keeps them: the receiver has read the list, and may
+            // only now be starting to copy what it names.
             wl_data_source::Event::Cancelled | wl_data_source::Event::DndFinished => {
+                if matches!(event, wl_data_source::Event::Cancelled) {
+                    if let Some(gate) = &offer.gate {
+                        gate.abandon();
+                    }
+                }
                 *state.outgoing.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 source.destroy();
             }
