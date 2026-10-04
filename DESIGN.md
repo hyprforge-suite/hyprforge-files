@@ -521,6 +521,15 @@ Decisions, and what changed since "partly built":
 - **Shared pieces** went to `hyprforge-ui`: `progress_line` (the bar, in
   the foreground colour — iced's default fills with the accent, which
   means selected) and `popover_card`.
+- **Keys.** Ctrl+Shift+Y opens and closes the popover (Firefox's key
+  for its downloads), Ctrl+Shift+J the queue view (Chrome's, with the
+  Shift that keeps it off plain Ctrl+J, which this crate's config tests
+  use as a key nothing holds). Both are window actions — `transfers`
+  and `transfer-queue` in `files-config.toml` — so the open/save dialog
+  has neither, and both are in the palette as Show Transfers and Show
+  Transfer Queue. Each key also closes what it opened: the popover lets
+  any other key through after closing, which would have reopened it,
+  and the queue view keeps the keyboard, which would have swallowed it.
 
 Still not built, each for its reason:
 
@@ -541,13 +550,39 @@ Still not built, each for its reason:
   because it would write what another job is writing — where starting it
   early is the data loss the queue exists to prevent. A button that is
   only sometimes safe is worse than no button.
-- **A keybinding for the popover.** It would be a new `Action`, and the
-  action list is shared with the dialog and the palette; the control is a
-  click away and the failure panel's Details opens the view.
 
 Found and left alone, because it is `hyprforge-fileops`' and published:
 a file that cannot be *read* is reported as "you don't have permission to
 write to" its source path.
+
+Clicked through in the nested compositor (2026-10-03), with a virtual
+pointer and a virtual keyboard, over copies of a scratch tree — a 24 GiB
+and a 16 GiB sparse file and 3,000 small ones — into three folders at
+once, the third read-only: the strip control, the popover with two
+running and one waiting ("Waiting for a running job to finish"), a row's
+Cancel, Cancel all, Show all, the queue view's Show (it went to the
+folder with what landed selected), Retry after making the folder
+writable (it finished the copy), Clear finished, Close, both keys and
+both palette commands. All of it did what it says. Two things were
+fixed on the way:
+
+- **A one-file copy read "5.9 GiB of 0 B"** and its bar could not fill:
+  `fileops` counted the size of every file under a folder it walked, and
+  never the root's own when the root *is* a file. Fixed there, with a
+  test; until that is released the row says only what is done rather
+  than a total smaller than it.
+- **A cancel that arrived after a file's last chunk** left the whole
+  file on disk and the window saying it stopped one item earlier than it
+  had — so Show and Undo did not know about the file either. Cancel at
+  23.9 of 24 GiB found it. A cancelled item whose one file landed whole
+  now counts as placed; a folder cut short still does not.
+
+Seen and not changed: Cancel on a 10 GiB half-copy took one to three
+seconds to show, under heavy writeback (the rate had fallen to
+90 MiB/s). Not measured further, so not changed — the likely cost is
+removing the partial file, which the cancel waits for. And when a job
+finishes, the rows below it move up, so a second click where a Cancel
+was can land on the next job's; noted, not redesigned.
 
 The queue serialises on *conflict* first and a count second. Two jobs that
 rewrite the same archive never run together, whatever else is going on,
@@ -745,6 +780,96 @@ A drag that starts in Files and ends over it does reach the source:
 Moving files on that ambiguity was not built. It waits on Hyprland
 sending drags to every device a client has, or on iced's clipboard
 accepting them.
+
+## Dragging members out of an archive — built
+
+A member's path is `~/x.zip/notes.txt`, which nothing outside this app
+can open, and a drag has to start while the button is still held — far
+too soon to unpack a large selection first, the way Copy does. What
+makes it possible is the order the protocol does things in: a drag
+announces only *types* when it starts, and the `text/uri-list` itself is
+asked for when something accepts the drop, written into a pipe the
+receiver reads at its own pace. So (`src/drag_out.rs`, wired in
+`dnd.rs` and the window's `start_archive_drag`):
+
+- **The drag starts at once**, naming where the members *will* be: a
+  directory of its own per drag under `$XDG_CACHE_HOME/hyprforge-files/drags`,
+  each member at its top under its own name (two of one name, from a
+  search inside the archive, go in `2/`). Making that directory is the
+  only thing done on the UI thread.
+- **They are unpacked beside it**, one extraction per folder dragged
+  from, through `hyprforge_archive` (which pins the archive, so the bytes
+  are the file that was dragged from). The status bar says
+  "Unpacking 3 items to drag…" — the pointer is busy being the drag.
+- **The answer waits for the files.** The receiver's request is
+  answered on a thread of its own, which waits on a gate until the
+  unpacking is over: it gets every path once they all exist, or an empty
+  list. Never a list of files that are not there yet.
+- **Bounded.** Past 2 GiB unpacked it is refused before anything is
+  written — "That's 2.1 GiB to unpack before it can be dropped — more
+  than a drag carries. Copy or Extract it instead." — because a drag
+  has nowhere to show progress, and Copy and Extract do the same work in
+  the transfers queue where it can be watched. Two minutes is the most
+  the unpacking may run and the most a receiver waits.
+- **Locked archives** use the password already given this session, the
+  one Copy uses; with none, the drag is refused in words ("… is
+  encrypted — open a file in it once to unlock it, then drag."). A drag
+  has no room for a prompt.
+- **A refusal ends the drag** rather than leaving it looking droppable:
+  destroying the data source is the protocol's way to cancel a drag in
+  flight.
+
+**When the copies go** is the one real decision. Not on `dnd_finished`:
+that means the receiver has *read the list*, and a file manager
+receiving a drop starts its copy afterwards, which can run for minutes.
+Not when this window closes, for the same reason — dropping into
+another window and closing this one is ordinary. So:
+
+- a drag that was not taken (`cancelled`, and no receiver was ever
+  handed the list) is removed at once, as is anything a refused or
+  failed unpack wrote;
+- one that was handed over is left, and swept: at startup and at the
+  start of every drag out of an archive, anything older than a day goes,
+  and past the eight most recent anything older than an hour.
+
+On disk under the cache rather than in `/tmp`, which is a RAM-backed
+tmpfs on most of the machines this suite runs on.
+
+A drag let go over the archive listing it came from does nothing, as any
+drag let go where it started does. Such a drop arrives as the copies'
+paths, through the compositor like anyone else's (the members' own
+paths are nothing a paste could read), so the window remembers its
+latest archive drag to recognise it — `OwnDrag::returned_home`. Found
+live: without it the members were added back into their own archive.
+
+Checked in the nested compositor, into a GTK4 window whose only drop
+handling is `Gtk.DropTarget` for a `Gdk.FileList` — someone else's
+implementation — recording each path and whether it existed when the
+drop arrived:
+
+- a folder (`docs`, two members deep) arrived with both files in it;
+- a 5 MB member arrived whole;
+- a 1 GiB member: the drop arrived four seconds after the button came
+  up, with the file complete — the receiver had waited for it;
+- a 2.1 GiB member was refused in words and nothing was dropped;
+- an encrypted zip's member, with no password given, was refused in
+  words and nothing was dropped;
+- dropped on a GTK window that takes no drops: `cancelled`, and the
+  drag's directory was gone.
+
+Not checked live: unlocking with a remembered password, because typing
+it means opening a member, and opening one launches the desktop's
+editor, which can attach to the real session over D-Bus. The unit test
+unpacks the encrypted member with the password and without.
+
+**One thing the rig taught.** The first run dropped a member back onto
+Files and it *arrived* — `enter`, `drop`, `dnd_drop_performed` on this
+crate's own data device — which looked like Hyprland delivering to every
+device after all. It was the rig: with no keyboard in the nested
+compositor, iced's clipboard had made no data device, so this crate's
+was the client's first. With a virtual keyboard present the clipboard's
+device was first again, the drag entered *it*, and the source got
+`cancelled`, exactly as "Dropping onto Files" above says.
 
 ## What to verify, not assume
 
