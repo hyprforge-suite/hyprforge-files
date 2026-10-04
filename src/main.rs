@@ -194,6 +194,10 @@ fn main() -> iced::Result {
         mime: Arc::new(hyprforge_mime::MimeDb::load()),
         chooser: None,
         preferences: None,
+        // UDisks2 and gvfs, connected to on first use: a machine with
+        // neither still opens a window, and says so in the sidebar.
+        devices: hyprforge_files::devices::DeviceHost::new(hyprforge_files::devices::Backends::system(), true),
+        connecting: None,
         compressing: None,
         unlocking: None,
         keyring,
@@ -481,6 +485,13 @@ enum Message {
     ),
     /// The Preferences sheet — see `hyprforge_files::preferences`.
     Preferences(hyprforge_files::preferences::Message),
+    /// What the drives-and-shares watch heard — see
+    /// `hyprforge_files::devices`.
+    Devices(hyprforge_files::devices::Event),
+    /// A mount, unmount, eject or disconnect finished.
+    DeviceDone(hyprforge_files::devices::Done),
+    /// The Connect to Server dialog — see `devices_view`.
+    Connect(ConnectMessage),
 }
 
 /// One open directory tree view, with the state that makes it a tab
@@ -615,6 +626,12 @@ struct App {
     chooser: Option<Chooser>,
     /// The Preferences sheet, when it is open.
     preferences: Option<hyprforge_files::preferences::Preferences>,
+    /// Drives and network shares: the one state every tab's Devices and
+    /// Remote sections draw, and the backends that change it — see
+    /// `hyprforge_files::devices` and `devices_view`.
+    devices: hyprforge_files::devices::DeviceHost,
+    /// The Connect to Server dialog, while it is open.
+    connecting: Option<devices_view::Connecting>,
     /// An open "Compress\u{2026}" dialog.
     compressing: Option<Compressing>,
     /// An open password prompt for an encrypted archive.
@@ -1561,6 +1578,7 @@ impl App {
             ),
             Outcome::Pins(change) => self.change_pins(&change),
             Outcome::Search(ask) => self.search(tab_index, ask),
+            Outcome::Devices(ask) => self.ask_devices(tab_index, ask),
             Outcome::LoadThumbnails(paths) => Task::run(thumbnail_stream(paths), |(path, handle)| {
                 Message::Browser(BrowserMessage::ThumbnailLoaded(path, handle))
             }),
@@ -2627,6 +2645,7 @@ impl App {
                 self.handle_outcome(self.active, outcome)
             }
             Action::Preferences => self.open_preferences(),
+            Action::ConnectToServer => self.open_connect(),
             // A browser action has no business here; `Browser::perform`
             // never hands one back. Doing nothing is the safe reading.
             _ => Task::none(),
@@ -3199,7 +3218,15 @@ impl App {
             Message::EscapeInField if self.preferences.is_some() => {
                 self.update(Message::Preferences(hyprforge_files::preferences::Message::Close))
             }
+            Message::Devices(event) => self.heard_devices(event),
+            Message::DeviceDone(done) => self.device_done(done),
+            Message::Connect(message) => self.connect_update(message),
             Message::EscapeInField => {
+                // The Connect to Server dialog's fields keep Escape: it
+                // stops an attempt, or closes the dialog.
+                if self.connecting.is_some() {
+                    return self.connect_update(ConnectMessage::Cancel);
+                }
                 let browser = &mut self.active_tab_mut().browser;
                 let renamed = browser.update(BrowserMessage::RenameCancel);
                 let pathed = browser.update(BrowserMessage::PathCancel);
@@ -3774,6 +3801,10 @@ impl App {
         if let Some(unlocking) = &self.unlocking {
             return iced::widget::stack![window, unlock_dialog(unlocking, scale)].into();
         }
+        if let Some(open) = &self.connecting {
+            return iced::widget::stack![window, devices_view::connect_dialog(open, self.devices.gvfs(), scale)]
+                .into();
+        }
         if let Some(compressing) = &self.compressing {
             return iced::widget::stack![window, compress_dialog(compressing, scale)].into();
         }
@@ -3841,6 +3872,10 @@ impl App {
             pointer::track(),
             iced::event::listen_with(field_escape),
             Subscription::run(hyprforge_files::dnd::events).map(Message::Dnd),
+            // Drives and shares: listed at once, then again whenever
+            // UDisks2 or gvfs says something changed, a burst at a time.
+            Subscription::run_with(self.devices.backends.clone(), hyprforge_files::devices::watch)
+                .map(Message::Devices),
         ])
     }
 }
@@ -4402,6 +4437,8 @@ fn field_escape(event: iced::Event, status: iced::event::Status, _window: window
 /// reason: this process has one window — closing its last tab exits.
 mod transfers_view;
 use transfers_view::{Transfers, TransfersMessage};
+mod devices_view;
+use devices_view::ConnectMessage;
 
 mod pointer {
     use iced::{event, mouse, Event, Subscription};
@@ -5055,6 +5092,19 @@ mod tests {
             mime: Arc::default(),
             chooser: None,
             preferences: None,
+            // Mocks, never the machine's: a test must not mount, or even
+            // list, the drives of whoever runs it.
+            devices: hyprforge_files::devices::DeviceHost::new(
+                hyprforge_files::devices::Backends {
+                    volumes: Arc::new(hyprforge_volumes::backend::mock::MockVolumes::new(vec![])),
+                    shares: Arc::new(hyprforge_volumes::backend::mock::MockShares::new(
+                        hyprforge_volumes::Gvfs::Absent("not in tests".into()),
+                        vec![],
+                    )),
+                },
+                true,
+            ),
+            connecting: None,
             compressing: None,
             unlocking: None,
             keyring: Arc::new(hyprforge_archive::Keyring::new()),

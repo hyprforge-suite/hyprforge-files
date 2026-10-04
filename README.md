@@ -28,6 +28,18 @@ the costly ones kept in the freedesktop thumbnail cache every other
 file manager and viewer already shares. Files can be copied and pasted with other
 applications, and dragged out of the window into them.
 
+**Drives and servers** are in the sidebar. Devices lists removable
+drives and disk images, mounted or not: a click on one that is not
+mounted mounts it — over UDisks2, with no root, polkit deciding — and
+goes there, and the eject mark or its menu unmounts, ejects or powers it
+off, saying in words why when it cannot (something still has a file
+open on it; the system's policy said no). Plugging a stick in or pulling
+it out shows at once. Remote lists the network shares that are mounted,
+gvfs's and the kernel's, and **Connect to Server** mounts an `smb://`,
+`sftp://` or `ftp://` address through gvfs, asking for a name and
+password when the server wants one. UDisks2 not running, or gvfs not
+installed, is said in the sidebar or the dialog rather than hidden.
+
 Copies, moves and archive work run in the background through a
 **queue**: a control in the tab strip shows overall progress, its
 popover lists each job with its rate and estimate and why a waiting one
@@ -63,9 +75,13 @@ branch on which host it is in.
 What this crate owns is the window around it, and the things a dialog
 deliberately does not have: launching what you double-click, file
 operations, the transfers popover and queue view, the archive jobs, the system clipboard,
-and drag and drop with other applications. Reading what the listing,
+drag and drop with other applications, and connecting to a server
+(`connect.rs`). Reading what the listing,
 the preview pane and the thumbnails show is `host.rs`, shared with the
-dialog — the second binary here, `hyprforge-files-portal`.
+dialog — the second binary here, `hyprforge-files-portal` — and so is
+watching drives and shares (`devices.rs`): a stick can be opened, and
+saved to, from a file chooser too, though not ejected from one. The
+talking to UDisks2 and gvfs is `hyprforge-volumes`'.
 
 ## Installing
 
@@ -84,6 +100,11 @@ where the Settings app has never been installed.
 a video or a song previews as the details the listing already knows and
 a sentence naming what to install, and a PDF or a video gets no
 thumbnail.
+
+So are UDisks2 and gvfs. Without UDisks2 the Devices section says it
+isn't running; without gvfs (and `gvfs-smb` for Windows shares) the
+Connect to Server dialog says what to install. Network shares mounted
+some other way — an fstab line, `sshfs` — are listed either way.
 
 ## The open/save dialog
 

@@ -20,6 +20,8 @@
 //! window's, and the open/save dialog has neither.
 
 pub mod archive_jobs;
+pub mod connect;
+pub mod devices;
 pub mod dnd;
 pub mod host;
 pub mod jobs;

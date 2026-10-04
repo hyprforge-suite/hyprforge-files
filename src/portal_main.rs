@@ -149,6 +149,9 @@ fn run_dialog() -> Answer {
         remembered,
         clicks: ClickTracker::new(),
         modifiers: keyboard::Modifiers::default(),
+        // Drives and shares, so a stick can be saved to. No Connect to
+        // Server: a file chooser does not change the session's mounts.
+        devices: hyprforge_files::devices::DeviceHost::new(hyprforge_files::devices::Backends::system(), false),
     };
     dialog.apply_filter();
     let boot = Task::batch([dialog.handle(first), Task::done(Message::Settle)]);
@@ -222,6 +225,9 @@ struct Dialog {
     /// Files window does.
     clicks: ClickTracker,
     modifiers: keyboard::Modifiers,
+    /// Drives and network shares — the Files window's arrangement
+    /// (`hyprforge_files::devices`), without Connect to Server.
+    devices: hyprforge_files::devices::DeviceHost,
 }
 
 #[derive(Debug, Clone)]
@@ -247,6 +253,10 @@ enum Message {
     Resized(Size),
     /// The window has mapped: let it be resized.
     Settle,
+    /// What the drives-and-shares watch heard.
+    Devices(hyprforge_files::devices::Event),
+    /// A mount the dialog asked for finished.
+    DeviceDone(hyprforge_files::devices::Done),
 }
 
 /// An entry in a dropdown: shown by name, found again by index.
@@ -389,6 +399,37 @@ impl Dialog {
                 self.height = size.height;
                 Task::none()
             }
+            Message::Devices(event) => {
+                if !self.devices.heard(event) {
+                    return Task::none();
+                }
+                let mut outcome = self.browser.update(BrowserMessage::DevicesChanged(self.devices.snapshot()));
+                // Standing on a stick that was just pulled out: the Files
+                // window's rule, home.
+                let gone = self.devices.take_gone();
+                if gone.iter().any(|g| self.browser.current_dir().starts_with(g)) {
+                    let home = self.backend.home_dir();
+                    outcome = hyprforge_files_core::Outcome::Many(vec![
+                        outcome,
+                        self.browser.update(BrowserMessage::Navigate(home)),
+                    ]);
+                }
+                self.handle(outcome)
+            }
+            Message::DeviceDone(done) => {
+                let finished = self.devices.done(done);
+                let mut outcome = self.browser.update(BrowserMessage::DevicesChanged(self.devices.snapshot()));
+                if let Some(status) = finished.status {
+                    self.status = Some(status);
+                }
+                if let Some((_, point)) = finished.open {
+                    outcome = hyprforge_files_core::Outcome::Many(vec![
+                        outcome,
+                        self.browser.update(BrowserMessage::Navigate(point)),
+                    ]);
+                }
+                self.handle(outcome)
+            }
             Message::Settle => window::latest().and_then(|id| {
                 Task::batch([
                     window::set_resizable(id, true),
@@ -480,6 +521,16 @@ impl Dialog {
                 self.handle(outcome)
             }
             Outcome::PrefsChanged(_) | Outcome::Pins(_) | Outcome::Window(_) => Task::none(),
+            // Only a click on a drive reaches here — the dialog's menus
+            // offer no drive actions — and it mounts, so the stick can
+            // be opened and saved to.
+            Outcome::Devices(ask) => match self.devices.ask(ask, 0) {
+                Some(work) => {
+                    let outcome = self.browser.update(BrowserMessage::DevicesChanged(self.devices.snapshot()));
+                    Task::batch([self.handle(outcome), Task::perform(work, Message::DeviceDone)])
+                }
+                None => Task::none(),
+            },
             // A search somebody chose to save is saved from here too, by
             // the same read-modify-write the window uses, so a search
             // saved in a file chooser is in Files' sidebar next time.
@@ -783,6 +834,8 @@ impl Dialog {
             iced::event::listen_with(field_escape),
             window::resize_events().map(|(_, size)| Message::Resized(size)),
             pointer::track(),
+            Subscription::run_with(self.devices.backends.clone(), hyprforge_files::devices::watch)
+                .map(Message::Devices),
         ])
     }
 }

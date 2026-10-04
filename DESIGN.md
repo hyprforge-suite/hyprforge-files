@@ -162,7 +162,8 @@ section is the first thing that will want it and the role should exist before
 the first consumer rather than arrive with it.
 
 *Built.* Titlebar tabs, the density pass, and a sidebar of Places, Pinned
-(with item counts) and Trash; `hyprforge-look` carries `info`.
+(with item counts) and Trash; `hyprforge-look` carries `info`. Devices and
+Remote arrived with phase I, the second drawn in `info` as planned.
 
 **B — the fuzzy path bar.** `~/pr/hy/src → ~/projects/hyprsuite/src`, resolving
 as you type. The single best idea in the document and the thing neither Finder
@@ -611,6 +612,116 @@ that works the way it has to: archive jobs report the same `JobEvent` as a
 paste, so they appear in phase G's popover and queue view with no code of
 their own.
 
+*Devices and network shares: built.* Two sidebar sections between the
+user's own lists and the Trash, **Devices** and **Remote** — the
+second is the "Remote" phase A left absent, in the `info` role it
+reserved. The talking is a new library crate, `hyprforge-volumes`,
+built in the D-Bus module order CLAUDE.md lays down: plain data, pure
+decisions, backend traits with mocks, then the clients, and a read-only
+`check.sh` tier against the real UDisks2.
+
+- **Which drives.** UDisks2's own hints decide, the way GNOME's volume
+  monitor reads them: a filesystem (or a locked encrypted container),
+  not `HintIgnore`, and not `HintSystem` unless it is mounted under
+  `/run/media`. A disk image shows only when this user attached it
+  (`SetupByUID`) — snap's and flatpak's loop devices never do. Named by
+  the hint, then the label, then the size in the decimal units drives
+  are sold in ("1.0 TB Volume").
+- **Mounted or not.** An unmounted drive is a row like any other; a
+  click mounts it and goes there in the tab that clicked. No root:
+  UDisks2 mounts for the session user under polkit, interaction left on
+  so a policy that wants a password can ask through the session's agent
+  (the mount's bound, two minutes, allows for typing it). Mounted, the
+  row is a place — a drop target, a folder's menu — with an eject mark.
+- **What is happening, and what went wrong.** The row says
+  *Mounting…*, *Unmounting…*, *Ejecting…* in every tab at once (the
+  window owns one state and hands every tab the same copy), and a second
+  click while it runs asks nothing. A refusal is a sentence on the status
+  line, one per kind: something has a file open on it; the system's
+  policy said no; the password prompt was cancelled; it is not there any
+  more; it is encrypted. An unmount that runs past five minutes says not
+  to unplug yet — that one must never sound like success. Eject says
+  "can be removed" when it is.
+- **Eject** unmounts everything on the same drive first, then powers a
+  stick off, opens a tray, or detaches a disk image.
+- **Plugged and unplugged.** Every signal UDisks2 sends from under its
+  root, and the bus's word when UDisks2 itself starts or stops, means
+  *look again*. A burst — dozens for one stick — settles for 300 ms
+  (never longer than two seconds) and is one listing. A tab standing on
+  a drive that is unmounted, ejected or pulled out goes home.
+- **UDisks2 not running** is a sentence in the Devices section, never an
+  empty list, and the watch tries again every fifteen seconds, so
+  starting it clears the sentence without a restart.
+- **Remote** lists what is mounted: gvfs's shares, read from its FUSE
+  directory's names, and the kernel's network filesystems (`cifs`,
+  `nfs4`, `fuse.sshfs`, …) from `/proc/self/mountinfo`, which reports a
+  change to whoever polls it — so a share mounted by another program
+  arrives with nothing polled. gvfs's mount tracker signal covers its
+  own. **Disconnect** is `gio mount -u` for gvfs, `fusermount3 -u` for
+  a FUSE mount and `umount` for the rest, whose refusal is passed on in
+  its own words.
+- **Connect to Server** (a window action, so in the palette too) is a
+  dialog over the window. The mechanism is gvfs's `gio mount`, decided
+  after looking at this machine: gvfs is running for any GTK program,
+  has the SMB, SFTP and FTP backends, and every share it mounts is a
+  real directory under `$XDG_RUNTIME_DIR/gvfs` — so a mounted share is
+  browsed with exactly the code a home folder is. `gio`'s command line
+  is gvfs's published interface; its D-Bus protocol is private. The
+  hint names only the schemes this machine's gvfs can reach (here:
+  no `dav://`, whose backend is packaged separately), an address it
+  cannot reach is refused with that reason, and gvfs missing is said in
+  the dialog rather than the row vanishing.
+- **Credentials.** `gio mount` asks for a name and password by printing
+  a prompt and reading a line. The runner reads those prompts (`gio`
+  started with `LC_ALL=C.UTF-8`, so they are the English words it
+  matches) and answers each from what the dialog was given; a prompt it
+  has no answer for stops the attempt and the dialog asks. A second
+  prompt after an answer means it was refused: the attempt stops rather
+  than spend a server's lockout attempts in a loop, and the dialog says
+  so with the password cleared. A server's question (an unknown host
+  key) comes back as its choices, as buttons. The password is a
+  `hyprforge_secret::Secret` from the keystroke on, and the only place
+  it is read out is the line written to `gio`'s standard input.
+- **Bounded and cancellable.** An attempt is bounded at a minute; Stop
+  aborts it, and the `gio` it was running dies with the future
+  (`kill_on_drop`).
+- **The open/save dialog** has both sections' drives and shares — a
+  stick you cannot open is one you cannot save to — and mounts a drive
+  that is clicked; it has no drive menu, no eject mark and no Connect to
+  Server, which are the session's mounts and not a file chooser's
+  business. That is data the host sets (`Devices::manages_mounts`), so
+  the view still cannot tell which host it is in.
+
+Checked live, in a nested Hyprland, against a 32 MB FAT image attached
+with `udisksctl loop-setup` — no drive of the user's was mounted,
+unmounted or ejected: a click mounting it and opening it; Unmount with
+a shell standing in it, refused with "is in use"; the eject mark
+unmounting and detaching it, the tab going home and "can be removed";
+attaching it again, the row arriving without a click; unmounting it
+from outside, the tab standing on it going home; `localtest:///` (gvfs's
+test backend) connected through the dialog, opened, and disconnected
+from its row; mounted and unmounted with `gio` outside the window, the
+row following; `dav://` refused as unreachable and `smb://127.0.0.1`
+failing with the server's own "Connection refused"; the open/save
+dialog mounting the image on a click, with no eject mark. Not checked
+live: a password prompt (no server here wants one — the conversation is
+tested against a stand-in `gio` that asks as the real one does), a
+polkit password, UDisks2 stopped, and a kernel network mount.
+
+Left out, each for its reason:
+
+- **Unlocking an encrypted drive.** It shows, marked *Locked*, and says
+  so when clicked. Unlocking is a passphrase prompt and a second
+  device to clean up after; worth doing, and its own piece.
+- **Browsing the network for servers** (gvfs's `network://`). A list of
+  whatever answered a broadcast is a different feature from "connect
+  to this address".
+- **Remembered servers.** A connection lasts as long as gvfs keeps it;
+  nothing is written down, so there is no saved password to protect.
+- **Formatting, partitioning, safely removing a whole multi-drive
+  enclosure.** Disks utility work, not a file manager's.
+- **The terminal drawer (`1i`)** — still deferred; see below.
+
 ## Deferred, and what that costs
 
 Named so nothing here is mistaken for an oversight:
@@ -632,8 +743,8 @@ currently *wrong* rather than merely unfinished: it shows a stored filename
 where the user expects the name their file had. Everything else is honest
 about being incomplete.
 
-A, D, B, H, C, E, F and G have since been built;
-see each phase above.
+A, D, B, H, C, E, F, G and I (but for the terminal drawer) have since
+been built; see each phase above.
 
 The portal open/save dialog is not a phase — it inherits every one of these for
 free, because it renders the same view. That is the payoff for the `Mode` seam.
