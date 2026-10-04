@@ -622,12 +622,19 @@ fn job_detail(job: &RunningJob) -> String {
             if !several {
                 parts.push(format!("{entries_done} of {total}"));
             }
-            if let Some(bytes_total) = bytes_total {
-                parts.push(format!(
+            // A total below what is already done is no total. fileops
+            // up to 0.1.5 said 0 for a copy of one file (fixed in the
+            // monorepo's copy, found live), which read "5.9 GiB of
+            // 0 B"; against a published copy that predates the fix,
+            // only what is done is said.
+            match bytes_total.filter(|t| *t >= *bytes_done && *t > 0) {
+                Some(bytes_total) => parts.push(format!(
                     "{} of {}",
                     hyprforge_files_core::human_readable_size(*bytes_done),
-                    hyprforge_files_core::human_readable_size(*bytes_total)
-                ));
+                    hyprforge_files_core::human_readable_size(bytes_total)
+                )),
+                None if *bytes_done > 0 => parts.push(hyprforge_files_core::human_readable_size(*bytes_done)),
+                None => {}
             }
         }
         _ => parts.push("counting\u{2026}".to_string()),
