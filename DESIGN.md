@@ -225,6 +225,22 @@ SVGs in both, PDFs and videos in the grid — through the shared freedesktop
 cache, and a preview pane shows the selected file (`hyprforge-files-core`'s
 `preview`, read by the app's `preview.rs`).
 
+**Zoom — built** (asked for by the person using it: Ctrl+scroll did
+nothing). Ctrl+wheel over the listing, or Ctrl+= / Ctrl+- / Ctrl+0,
+draws it larger or smaller in seven steps from 75% to 200%, per view
+and remembered in `files.toml`'s `[zoom]` — the grid zoomed in for
+pictures and the list out for rows don't undo each other, the way
+Nautilus and Dolphin keep it. Only the listing scales: the zoom
+multiplies the `FontScale` it is drawn at, and rows, icons, names and
+grid cells all follow that already, so one multiplication sizes them
+together and the header, sidebar and status bar stay put. Ctrl+wheel
+needed a widget of its own (`hyprforge-ui`'s `wheel_zoom`): the listing
+is a scrollable, which takes the wheel before a `mouse_area` around it
+ever hears it, so the wrapper looks first and passes a plain wheel
+through; a touchpad's pixels are added up so a swipe is a few steps,
+not all of them. Not yet: thumbnails are decoded for the unzoomed
+size, so at 200% a picture is drawn larger than it was decoded.
+
 **Quick Look — built** (it was on the vision doc's deferred list, not a
 mockup artboard). Space shows the keyboard's focused entry on a card over
 the dimmed window (`hyprforge-files-core/src/browser/quicklook.rs`, the
