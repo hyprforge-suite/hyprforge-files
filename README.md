@@ -28,7 +28,9 @@ contents, a PDF's first page, a video's frame or a song's cover — and
 the grid draws real thumbnails of pictures, SVGs, PDFs and videos,
 the costly ones kept in the freedesktop thumbnail cache every other
 file manager and viewer already shares. Files can be copied and pasted with other
-applications, and dragged out of the window into them.
+applications, and dragged out of the window into them — members of an
+archive too, unpacked while the drag is under way and handed over once
+they are on disk.
 
 **Quick Look** (Space) shows the focused entry large, over the window —
 the same readers as the preview pane, with the picture decoded for the
@@ -42,6 +44,8 @@ Copies, moves and archive work run in the background through a
 popover lists each job with its rate and estimate and why a waiting one
 waits, and a queue view keeps the session's finished jobs, their
 failures, and a Retry wherever running the work again is safe.
+Ctrl+Shift+Y opens the popover and Ctrl+Shift+J the queue view, and
+both are in the Ctrl+K palette.
 
 **Properties** (Alt+Enter, or the bottom of any right-click menu) docks
 in the preview pane's place: General, with a folder's size walked in the

@@ -13,8 +13,10 @@
 //! through an archive, which `archive_jobs` runs the same way `jobs`
 //! runs a paste — and the parts that need the window's own connection
 //! or a disk: reading what the preview pane and the thumbnails show
-//! (`preview`) and what Quick Look shows (`quicklook`), the Wayland clipboard (`system_clipboard`) and dragging
-//! files out to other applications and taking drops from them (`dnd`).
+//! (`preview`) and what Quick Look shows (`quicklook`), the Wayland
+//! clipboard (`system_clipboard`) and dragging files out to other
+//! applications and taking drops from them (`dnd`, with `drag_out`
+//! unpacking what is dragged out of an archive).
 //! The Properties inspector's looking and changing (`properties`) and
 //! the Preferences sheet (`preferences`) are here too: both are the
 //! window's, and the open/save dialog has neither.
@@ -22,6 +24,7 @@
 pub mod archive_jobs;
 pub mod bulk_rename;
 pub mod dnd;
+pub mod drag_out;
 pub mod host;
 pub mod jobs;
 pub mod launch;

@@ -247,12 +247,26 @@ fn run(
                     } else if !report.failed.is_empty() && !report.cancelled {
                         summary.partly += 1;
                     }
+                    let whole = report.cancelled && landed_whole_file(&report);
                     summary.failed.extend(report.failed.into_iter().map(|(_, message)| message));
                     if let Some(message) = report.source_removal_failed {
                         summary.failed.push(message);
                     }
                     if report.cancelled {
                         summary.cancelled = true;
+                        // A cancel that arrives after a file's last chunk
+                        // (fileops checks it again before finishing the
+                        // item) leaves the whole file in place. Found
+                        // live: Cancel at 23.9 of 24 GiB, the file there
+                        // in full, and the window saying it stopped
+                        // after one item fewer than it had put down — so
+                        // Show and Undo knew nothing of it either. A
+                        // folder cut short is not counted: half of it is
+                        // not the item that was asked for.
+                        if whole {
+                            summary.done += 1;
+                            summary.placed.push((step.source.clone(), report.dest));
+                        }
                         break 'items;
                     }
                     if report.succeeded.is_empty() && !report.skipped.is_empty() {
@@ -267,6 +281,15 @@ fn run(
         }
     }
     summary
+}
+
+/// Whether a cancelled item nonetheless put its one file down whole:
+/// the destination itself is among what succeeded, nothing failed, and
+/// it is a file rather than a folder that may be half-filled.
+fn landed_whole_file(report: &hyprforge_fileops::Report) -> bool {
+    report.failed.is_empty()
+        && report.succeeded.iter().any(|p| p.as_path() == report.dest.as_path())
+        && std::fs::symlink_metadata(&report.dest).is_ok_and(|m| m.is_file())
 }
 
 /// Renames `from` to `to` in one go — a rename is a single `rename(2)`
@@ -438,7 +461,7 @@ mod tests {
     use hyprforge_fileops::OpKind;
     use iced::futures::channel::mpsc::TryRecvError;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// Collects a job's events, answering each collision with `answer`.
     /// Bounded: a job that never finishes fails the test instead of
@@ -858,5 +881,27 @@ mod tests {
         assert_eq!(summary.done, 1);
         assert_eq!(summary.failed.len(), 1, "{summary:?}");
         assert!(!summary.complete());
+    }
+
+    /// A cancel that lands after a file's last byte still leaves the file
+    /// there, and the summary has to say so — while a folder cut short,
+    /// or an item that failed, is not counted as put down.
+    #[test]
+    fn a_file_finished_before_the_cancel_landed_is_counted_as_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.img");
+        fs::write(&file, b"all of it").unwrap();
+        let report = |dest: &Path, failed: Vec<(PathBuf, String)>| hyprforge_fileops::Report {
+            succeeded: vec![dest.to_path_buf()],
+            failed,
+            cancelled: true,
+            dest: dest.to_path_buf(),
+            ..Default::default()
+        };
+        assert!(landed_whole_file(&report(&file, Vec::new())));
+        assert!(!landed_whole_file(&report(dir.path(), Vec::new())), "a folder may be half-filled");
+        assert!(!landed_whole_file(&report(&file, vec![(file.clone(), "no".into())])));
+        let elsewhere = hyprforge_fileops::Report { succeeded: vec![dir.path().join("x")], ..report(&file, Vec::new()) };
+        assert!(!landed_whole_file(&elsewhere), "only the item itself counts");
     }
 }
