@@ -86,6 +86,16 @@ ever written over, and a failure halfway puts everything back and says
 exactly where anything it could not put back now is. One Ctrl+Z undoes
 the lot. Inside an archive it is a single rewrite.
 
+**Open Terminal Here** is F4, or the folder and empty-space menus: your
+terminal, in that folder — the one chosen in Preferences, else whatever
+`xdg-terminal-exec` or `$TERMINAL` names, else the first of ghostty,
+kitty, foot, alacritty, wezterm, konsole, gnome-terminal and xterm that
+is installed. **Your own commands** go in the same menus and the Ctrl+K
+palette, offered only on the file types you name, as `[[action]]` blocks
+in `files-config.toml` or from Preferences' "Terminal & actions" page.
+The selected files are added to the command as arguments of their own;
+nothing is ever run through a shell.
+
 It can also be **every application's Open and Save dialog**, through
 xdg-desktop-portal — the same browser, path bar and previews, not a
 smaller copy. See "The open/save dialog" below.
@@ -165,6 +175,26 @@ The package installs the `.portal` descriptor where xdg-desktop-portal
 looks for one (`/usr/share/xdg-desktop-portal/portals`, the only place
 it does) and a D-Bus activation file, so the service starts when an
 application asks and at no other time.
+
+## Showing files for other applications
+
+```
+hyprforge-files [PATH…] [--select PATH…] [--properties PATH…]
+```
+
+Several paths open a tab each. `--select` opens each path's folder with
+it selected — several in one folder are one tab — and `--properties`
+does the same with Properties open. Paths may be `file://` URIs.
+
+`hyprforge-files --dbus-service` serves `org.freedesktop.FileManager1`,
+which is what a browser's "Show in Folder" and an editor's "Reveal in
+File Manager" call: `ShowItems` is `--select`, `ShowFolders` opens the
+folders, `ShowItemProperties` is `--properties`. It is started by the
+session bus when something asks and exits after five minutes idle.
+`./hyprforge --install` claims the name in your own D-Bus services
+directory, where it wins over another file manager's file in
+`/usr/share`, and `--uninstall` gives it back; the Arch package installs
+an activation file too.
 
 ## Licence
 

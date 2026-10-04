@@ -145,3 +145,9 @@ hyprforge-fileops = { version = "0.1", features = ["mock"] }
 # a busy unmount or an unplugged stick is tested without touching a real
 # one.
 hyprforge-volumes = { version = "0.1", features = ["mock"] }
+# The FileManager1 service's interface, called over a real D-Bus
+# connection in its tests — peer to peer on a socket pair, so no bus is
+# joined and no caller on the machine can reach it. `p2p` is what lets a
+# connection be its own server; `net` is tokio's socket pair.
+zbus = { version = "5.18", default-features = false, features = ["tokio", "p2p"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net"] }

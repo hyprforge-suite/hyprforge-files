@@ -203,6 +203,26 @@ pub fn open_with_app(entry: &Path, path: &Path) -> Opened {
     }
 }
 
+/// What a file is, for the person's own actions' `types` — see
+/// `hyprforge_files_core::custom::TypeOf`: its type by name, then every
+/// type that one is a kind of, from the shared MIME database.
+///
+/// By name, never by reading the file: this runs as a menu opens, on the
+/// UI thread, once per selected row, and a name is what an action's
+/// author means by "pictures" anyway. The database is the window's copy;
+/// a later reload (after a default application is set) changes what
+/// opens a type, never what a type is, so a tab keeping the copy it was
+/// given is no staler than it needs to be.
+pub fn type_of(mime: std::sync::Arc<hyprforge_mime::MimeDb>) -> hyprforge_files_core::custom::TypeOf {
+    hyprforge_files_core::custom::TypeOf::new(move |path| {
+        let Some(kind) = mime.type_of(path) else { return Vec::new() };
+        let kind = mime.canonical(kind).to_string();
+        let mut all = mime.lookup().types.ancestors(&kind);
+        all.insert(0, kind);
+        all
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
