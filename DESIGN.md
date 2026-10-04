@@ -224,6 +224,64 @@ SVGs in both, PDFs and videos in the grid — through the shared freedesktop
 cache, and a preview pane shows the selected file (`hyprforge-files-core`'s
 `preview`, read by the app's `preview.rs`).
 
+**Quick Look — built** (it was on the vision doc's deferred list, not a
+mockup artboard). Space shows the keyboard's focused entry on a card over
+the dimmed window (`hyprforge-files-core/src/browser/quicklook.rs`, the
+card through `hyprforge-ui`'s new `scrim`):
+
+- **The pane's pipeline at a bigger size, not a second one.** The card is
+  a `Preview` from the same `preview::build`, asked with its own
+  `Outcome::LoadQuickLook` and decoded for `quick_look_edge`: the card's
+  picture box in physical pixels, from the window's size and the output's
+  scale factor (asked of the window per request). A picture is drawn
+  `ScaleDown`, so a small icon is not smeared across the card. Text is
+  the pane's excerpt, monospace at the listing's size, never wrapped,
+  scrollable both ways; a folder or archive is its first names; anything
+  else is its icon and the facts.
+- **Its own slot, the pane's rule.** The card shows the *focus*, the pane
+  the *selection*; an answer for any entry but the one on show is dropped.
+  While the card is up the pane asks for nothing — two full-size decodes
+  of one photograph at once is the peak to avoid — and catches up when it
+  closes.
+- **A held arrow decodes nothing it passes.** The browser asks on every
+  move; the host (`src/quicklook.rs`) numbers each request the moment it
+  is asked, makes one that follows another within 120ms wait that long,
+  runs only the newest and only one at a time. Found live: numbered
+  inside the async task instead, an older request could take the newest
+  number and leave the entry on show reading forever.
+- **Keys.** Arrows move (column view's Left and Right step through the
+  folder rather than leaving it), Enter closes and opens, Space or Escape
+  closes, and any other key closes the card and then does its job, as the
+  transfers popover does. A window key (a tab switch) closes it first.
+- **Space and type-to-search.** Space is the one bare text key that may be
+  bound (`hyprforge-keys`' `would_swallow_typing` now exempts it): no
+  search begins with a space, and one typed between two words of a query
+  typed at the listing still reaches it (`Keymap::resolve_typing` with
+  `Browser::typing_under_way`). Any action or click ends "typing", after
+  which Space is Quick Look again — on the results.
+- **In the open/save dialog too.** Browser scope and in `DIALOG_ACTIONS`:
+  looking before choosing is a file chooser's whole job, and the dialog
+  already reads previews through `host.rs`. Escape there closes the card,
+  not the dialog.
+- **Inside an archive** nothing is asked: a member has no path another
+  program can read, so the card shows what the listing knows.
+
+Measured in a nested Hyprland on a 36-megapixel JPEG (debug build): the
+card's decode peaked at 107MB over the window's resident size — the one
+full-size decode `hyprforge-image` makes before shrinking, now never two
+at once — and kept about 42MB more resident afterwards, the 1336-pixel
+picture with the renderer's copy of it.
+
+Not built: **playing video.** The card shows a video's frame, length and
+size. Playing it means libmpv, a player thread and a `shader` primitive
+(`hyprforge-media/src/film.rs`) in a card that closes on any key — not
+cheap, and a frame answers "which video is this". No 3D models either:
+an STL previews as its icon and facts. And the vision doc's "shared
+component multiple apps call into" is not this yet: the card lives in
+`hyprforge-files-core` and its readers in this crate, so Files and its
+open/save dialog share it and Media does not. Media's viewer already is
+the large view of a file; the piece worth sharing later is the readers.
+
 Column view (`hyprforge-files-core`'s `columns`) puts a pane for each
 folder on the way here to the left of the folder in view, from home when
 you are under it and from `/` otherwise, as many as the window has room

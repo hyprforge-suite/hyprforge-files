@@ -192,6 +192,7 @@ fn main() -> iced::Result {
         // is not the per-double-click cost it would be if a chooser
         // loaded it each time.
         mime: Arc::new(hyprforge_mime::MimeDb::load()),
+        quick_look: Default::default(),
         chooser: None,
         preferences: None,
         compressing: None,
@@ -617,6 +618,8 @@ struct App {
     /// and a clone of the whole database per folder would be the cost of
     /// a reload every time the listing changed.
     mime: Arc<hyprforge_mime::MimeDb>,
+    /// Quick Look's requests, newest only — see `hyprforge_files::quicklook`.
+    quick_look: hyprforge_files::quicklook::Coalescer,
     /// An open "which application?" chooser.
     chooser: Option<Chooser>,
     /// The Preferences sheet, when it is open.
@@ -1575,6 +1578,15 @@ impl App {
             Outcome::LoadPreview(path) => Task::perform(
                 build_preview(path, self.mime.clone(), self.backend.clone()),
                 |(path, preview)| Message::Browser(BrowserMessage::PreviewLoaded(path, preview)),
+            ),
+            Outcome::LoadQuickLook(path) => hyprforge_files::quicklook::task(
+                &self.quick_look,
+                path,
+                self.mime.clone(),
+                self.backend.clone(),
+                (self.last_window_size.0 as f32, self.last_window_size.1 as f32),
+                self.font_scale,
+                |path, found| Message::Browser(BrowserMessage::QuickLookLoaded(path, found)),
             ),
             Outcome::LoadIcons(keys) => Task::perform(resolve_icons(keys, self.mime.clone()), |icons| {
                 Message::Browser(BrowserMessage::IconsLoaded(icons))
@@ -3013,10 +3025,19 @@ impl App {
                 let outcome = self.active_tab_mut().browser.update(BrowserMessage::PathComplete);
                 self.handle_outcome(self.active, outcome)
             }
-            Message::KeyPressed(press) => match self.config.keymap.resolve(&press) {
+            // A Space between two words of a search typed at the listing is
+            // the search's, not Quick Look's — see `typing_under_way`.
+            Message::KeyPressed(press) => match self
+                .config
+                .keymap
+                .resolve_typing(&press, self.active_tab().browser.typing_under_way())
+            {
                 // Window actions never reach the browser, which the
-                // dialog host also renders and which has no tabs.
+                // dialog host also renders and which has no tabs. Quick
+                // Look closes first: it is a glance at this tab, and a
+                // new tab or the inspector is somewhere else to look.
                 Some(Resolved::Action(action)) if action.scope() == Scope::Window => {
+                    self.active_tab_mut().browser.close_quick_look();
                     self.perform_window(action)
                 }
                 Some(Resolved::Action(action)) => {
@@ -5078,6 +5099,7 @@ mod tests {
             // none of their business. Tests that need a database build
             // one.
             mime: Arc::default(),
+            quick_look: Default::default(),
             chooser: None,
             preferences: None,
             compressing: None,
@@ -5944,6 +5966,64 @@ mod tests {
             text: Some('q'),
         }));
         assert_eq!(app.active_tab().browser.rows().len(), 1, "no search was typed");
+    }
+
+    fn space() -> Message {
+        Message::KeyPressed(keymap::KeyPress {
+            key: keymap::Key::Space,
+            mods: keymap::Modifiers::default(),
+            text: Some(' '),
+        })
+    }
+
+    /// Space on a focused row opens Quick Look and asks for the card's
+    /// picture; Space again closes it.
+    #[test]
+    fn space_opens_and_closes_quick_look() {
+        let mut app = app_for_test(&["/dir"]);
+        let _ = app.update(Message::Browser(BrowserMessage::DirLoaded(
+            PathBuf::from("/dir"),
+            Ok(vec![entry_named("a.txt"), entry_named("b.txt")]),
+        )));
+        let _ = app.update(key("Down"));
+        let _ = app.update(space());
+        assert!(app.active_tab().browser.quick_look_open());
+        let _ = app.update(space());
+        assert!(!app.active_tab().browser.quick_look_open());
+    }
+
+    /// A Space between two words of a search typed at the listing is the
+    /// search's: "my notes" finds `my notes.txt`, and no card opens.
+    #[test]
+    fn a_space_mid_search_types_into_the_search() {
+        let mut app = app_for_test(&["/dir"]);
+        let _ = app.update(Message::Browser(BrowserMessage::DirLoaded(
+            PathBuf::from("/dir"),
+            Ok(vec![entry_named("my notes.txt"), entry_named("my.txt")]),
+        )));
+        for c in "my".chars() {
+            let _ = app.update(typed(c));
+        }
+        let _ = app.update(space());
+        let _ = app.update(typed('n'));
+        assert_eq!(app.active_tab().browser.search_query(), "my n");
+        assert!(!app.active_tab().browser.quick_look_open());
+    }
+
+    /// Switching tabs is a key the browser never sees, and must not
+    /// leave a card up over a tab nobody is looking at.
+    #[test]
+    fn a_window_key_closes_quick_look_first() {
+        let mut app = app_for_test(&["/dir", "/b"]);
+        let _ = app.update(Message::Browser(BrowserMessage::DirLoaded(
+            PathBuf::from("/dir"),
+            Ok(vec![entry_named("a.txt")]),
+        )));
+        let _ = app.update(key("Down"));
+        let _ = app.update(space());
+        assert!(app.active_tab().browser.quick_look_open());
+        let _ = app.update(key("Ctrl+Tab"));
+        assert!(!app.tabs[0].browser.quick_look_open());
     }
 
     // --- ctrl/shift click ---------------------------------------------------
