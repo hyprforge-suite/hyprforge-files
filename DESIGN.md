@@ -226,11 +226,17 @@ cache, and a preview pane shows the selected file (`hyprforge-files-core`'s
 `preview`, read by the app's `preview.rs`).
 
 **Zoom — built** (asked for by the person using it: Ctrl+scroll did
-nothing). Ctrl+wheel over the listing, or Ctrl+= / Ctrl+- / Ctrl+0,
-draws it larger or smaller in seven steps from 75% to 200%, per view
-and remembered in `files.toml`'s `[zoom]` — the grid zoomed in for
-pictures and the list out for rows don't undo each other, the way
-Nautilus and Dolphin keep it. Only the listing scales: the zoom
+nothing, and then asked for Explorer's way of it). Ctrl+wheel over the
+listing, or Ctrl+= / Ctrl+-, climbs one ladder of named presets across
+both views — Compact details, Details, Small icons, Medium icons,
+Large icons, Extra large icons (`prefs::LADDER`) — so a notch down from
+Small icons is Details and the view changes where the ladder crosses,
+as Explorer's does; Ctrl+0 is the view's own size. The status bar names
+the preset, as Explorer's shows its view. Nothing new is stored for it:
+a preset is a view and that view's zoom step, both already in
+`files.toml` (`view_mode`, `[zoom]`). Column view, which Explorer has
+nothing like, keeps a plain zoom from 75% to 200% and says its
+percentage when it is not at its own size. Only the listing scales: the zoom
 multiplies the `FontScale` it is drawn at, and rows, icons, names and
 grid cells all follow that already, so one multiplication sizes them
 together and the header, sidebar and status bar stay put. Ctrl+wheel

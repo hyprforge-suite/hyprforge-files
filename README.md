@@ -32,9 +32,11 @@ applications, and dragged out of the window into them — members of an
 archive too, unpacked while the drag is under way and handed over once
 they are on disk.
 
-**Zoom** with Ctrl+scroll over the listing, or Ctrl+= / Ctrl+- / Ctrl+0
-— remembered per view, so a zoomed-in grid and a compact list keep
-their own sizes.
+**Zoom** with Ctrl+scroll over the listing, or Ctrl+= / Ctrl+- / Ctrl+0,
+the way Explorer does it: one ladder from Compact details through
+Details to Small, Medium, Large and Extra large icons, crossing from
+the list to the grid on the way, with the status bar naming where you
+are.
 
 **Quick Look** (Space) shows the focused entry large, over the window —
 the same readers as the preview pane, with the picture decoded for the
