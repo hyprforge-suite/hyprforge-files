@@ -20,8 +20,8 @@ use hyprforge_files_core::config::{Config, ConfigProblem};
 use hyprforge_files_core::config_edit::{Edit, EditError, FileState};
 use hyprforge_files_core::keymap::Combo;
 use hyprforge_files_core::preferences::{
-    binding_rows, conflict_label, group, plan_binding, BehaviourSetting, BindingRow, Capture, Plan, Setting,
-    CONFLICT_POLICIES, GROUPS,
+    binding_rows, cap_label, conflict_label, group, plan_binding, source_label, BehaviourSetting, BindingRow, Capture,
+    Plan, Setting, ThumbnailSetting, CONFLICT_POLICIES, GRID_NAME_LINES, GROUPS, THUMBNAIL_CAPS, THUMBNAIL_SOURCES,
 };
 use hyprforge_files_core::prefs::{Prefs, SidebarPref, ViewMode};
 use hyprforge_ui::theme::{spacing, surface, FontScale, BASE_TEXT_SIZE};
@@ -98,6 +98,8 @@ pub enum Message {
     Reset(Action),
     Browsing(Setting),
     Behaviour(BehaviourSetting),
+    /// One of `[thumbnails]`' settings.
+    Thumbnails(ThumbnailSetting),
     /// A write finished: the configuration as it now loads, what the file
     /// now says, and what the load complained about — or why the write
     /// did not happen.
@@ -115,6 +117,41 @@ pub enum Effect {
     Write(Vec<Edit>),
     /// Apply this to every tab and save it to `files.toml`.
     Adopt(Setting),
+}
+
+/// "1 line", "2 lines".
+fn lines_label(n: u8) -> String {
+    if n == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{n} lines")
+    }
+}
+
+/// The line under a thumbnail source: what it costs, and for other
+/// programs' thumbnailers, which ones this machine has — a switch for
+/// "things installed elsewhere" means nothing until it names them.
+fn source_hint<'a>(
+    source: hyprforge_files_core::preview::Source,
+    scale: FontScale,
+) -> Option<Element<'a, Message>> {
+    use hyprforge_files_core::preview::Source;
+    let text = match source {
+        Source::Picture | Source::Svg => "Photos, drawings and SVGs, in the list as well as the grid.".to_string(),
+        Source::Pdf => "The first page, in the grid. Uses poppler's pdftoppm.".to_string(),
+        Source::Video => "A frame from the start, in the grid. Uses ffmpeg.".to_string(),
+        Source::Model => "STL, 3MF and OBJ, drawn in the grid.".to_string(),
+        Source::System => {
+            let found: Vec<&str> =
+                crate::preview::system_thumbnailers().all().iter().map(|t| t.name.as_str()).collect();
+            if found.is_empty() {
+                "None are installed.".to_string()
+            } else {
+                format!("For any other type, in the grid. Found: {}.", found.join(", "))
+            }
+        }
+    };
+    Some(hint_text(text, scale).wrapping(iced::widget::text::Wrapping::WordOrGlyph).into())
 }
 
 impl Preferences {
@@ -202,6 +239,12 @@ impl Preferences {
             Message::Browsing(setting) => Effect::Adopt(setting),
             Message::Behaviour(setting) => {
                 if setting.holds_in(&config.behaviour) {
+                    return Effect::None;
+                }
+                self.write(vec![setting.edit()])
+            }
+            Message::Thumbnails(setting) => {
+                if setting.holds_in(&config.thumbnails) {
                     return Effect::None;
                 }
                 self.write(vec![setting.edit()])
@@ -433,6 +476,8 @@ impl Preferences {
             browsing,
             section_label("File operations", scale),
             operations,
+            section_label("Thumbnails and names", scale),
+            self.thumbnails(config, scale),
             hint_text(
                 "Browsing is remembered in files.toml. File operations and key bindings are written to \
                  files-config.toml one line at a time, so anything you wrote there by hand stays; its \
@@ -443,6 +488,60 @@ impl Preferences {
         ]
         .spacing(spacing::MD)
         .into()
+    }
+
+    /// `[thumbnails]` and the grid's name length: which kinds of file are
+    /// drawn as a picture of themselves, the size past which none is, and
+    /// how much of a long name a grid cell shows.
+    fn thumbnails<'a>(&'a self, config: &'a Config, scale: FontScale) -> Element<'a, Message> {
+        let writable = self.writable();
+        let lines = config.behaviour.grid_name_lines;
+        let names: Element<'a, Message> = if writable {
+            segmented_choice(
+                &GRID_NAME_LINES,
+                Some(&lines),
+                |n| lines_label(*n),
+                |n| Message::Behaviour(BehaviourSetting::GridNameLines(n)),
+                scale,
+            )
+        } else {
+            config_line(lines_label(lines), scale).into()
+        };
+        let mut rows = vec![setting_row(
+            0,
+            "Names in the grid",
+            Some(hint_text("Longer names end in \u{2026}; the selected one is shown whole.", scale).into()),
+            names,
+            scale,
+        )];
+        for (i, source) in THUMBNAIL_SOURCES.into_iter().enumerate() {
+            let on = config.thumbnails.allows(source);
+            let mut t = toggle(on, scale);
+            if writable {
+                t = t.on_toggle(move |on| Message::Thumbnails(ThumbnailSetting::Source(source, on)));
+            }
+            rows.push(setting_row(i + 1, source_label(source), source_hint(source, scale), t, scale));
+        }
+        let cap = config.thumbnails.max_file_mb;
+        let caps: Element<'a, Message> = if writable {
+            segmented_choice(
+                &THUMBNAIL_CAPS,
+                THUMBNAIL_CAPS.contains(&cap).then_some(&cap),
+                |mb| cap_label(*mb),
+                |mb| Message::Thumbnails(ThumbnailSetting::MaxFileMb(mb)),
+                scale,
+            )
+        } else {
+            config_line(cap_label(cap), scale).into()
+        };
+        rows.push(setting_row(
+            THUMBNAIL_SOURCES.len() + 1,
+            "Skip files larger than",
+            Some(hint_text("A bigger file keeps its icon.", scale).into()),
+            caps,
+            scale,
+        ));
+        setting_list(rows).into()
     }
 
     fn keys<'a>(&'a self, config: &'a Config, scale: FontScale) -> Element<'a, Message> {
@@ -685,6 +784,26 @@ mod tests {
         assert_eq!(sheet.update(Message::Clear(Action::Copy), &config), Effect::None);
         sheet.update(Message::Saved(Box::new(Ok((config.clone(), FileState::default(), Vec::new())))), &config);
         assert!(matches!(sheet.update(Message::Clear(Action::Copy), &config), Effect::Write(_)));
+    }
+
+    #[test]
+    fn the_thumbnail_and_grid_name_controls_write_their_own_edit() {
+        use hyprforge_files_core::config_edit::BehaviourValue;
+        use hyprforge_files_core::preview::Source;
+        let config = Config::default();
+        let mut sheet = ready();
+        let effect = sheet.update(Message::Thumbnails(ThumbnailSetting::Source(Source::Video, false)), &config);
+        assert_eq!(effect, Effect::Write(vec![Edit::Thumbnails("videos", BehaviourValue::Switch(false))]));
+        let mut sheet = ready();
+        let effect = sheet.update(Message::Thumbnails(ThumbnailSetting::MaxFileMb(50)), &config);
+        assert_eq!(effect, Effect::Write(vec![Edit::Thumbnails("max-file-mb", BehaviourValue::Number(50))]));
+        let mut sheet = ready();
+        let effect = sheet.update(Message::Behaviour(BehaviourSetting::GridNameLines(3)), &config);
+        assert_eq!(effect, Effect::Write(vec![Edit::Behaviour("grid-name-lines", BehaviourValue::Number(3))]));
+        // Already so: nothing to write.
+        let mut sheet = ready();
+        assert_eq!(sheet.update(Message::Thumbnails(ThumbnailSetting::Source(Source::Pdf, true)), &config), Effect::None);
+        assert_eq!(sheet.update(Message::Behaviour(BehaviourSetting::GridNameLines(2)), &config), Effect::None);
     }
 
     #[test]

@@ -91,9 +91,17 @@ const PREVIEW_EDGE: u32 = (hyprforge_files_core::browser::PREVIEW_WIDTH as u32) 
 /// about, not only the result. Sequential keeps the peak at one picture
 /// however many there are; streaming keeps the first ones on screen
 /// arriving first.
+///
+/// Each is made at the freedesktop size covering `edge`, and comes back
+/// with the size it was made at — the browser keeps the old picture until
+/// a bigger one arrives. `allowed` is `[thumbnails]`: which sources are
+/// on, and the size cap only the host can apply, since it reads sizes.
 pub fn thumbnail_stream(
     paths: Vec<PathBuf>,
-) -> impl iced::futures::Stream<Item = (PathBuf, hyprforge_files_core::preview::Picture)> {
+    edge: u32,
+    mime: Arc<hyprforge_mime::MimeDb>,
+    allowed: hyprforge_files_core::config::Thumbnails,
+) -> impl iced::futures::Stream<Item = (PathBuf, hyprforge_files_core::preview::Picture, u32)> {
     // The freedesktop cache every other program shares — a thumbnail is
     // made once per version of a file, and a picture another program
     // already thumbnailed costs nothing here. See `preview::thumbnail`.
@@ -103,15 +111,16 @@ pub fn thumbnail_stream(
         for path in paths {
             let for_task = path.clone();
             let cache = cache.clone();
+            let mime = mime.clone();
             let handle = tokio::task::spawn_blocking(move || {
-                crate::preview::thumbnail(&for_task, cache.as_ref())
+                crate::preview::thumbnail(&for_task, edge, cache.as_ref(), &mime, &allowed)
             })
                 .await
                 .ok()
                 .flatten();
-            if let Some(handle) = handle {
+            if let Some((handle, made)) = handle {
                 // A closed channel means the window moved on; stop.
-                if out.send((path, handle)).await.is_err() {
+                if out.send((path, handle, made)).await.is_err() {
                     return;
                 }
             }

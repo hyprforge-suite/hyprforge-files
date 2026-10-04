@@ -221,9 +221,20 @@ thumbnails, which is the preview crate from the original plan. Column view
 (`1c`) is new: cascading panes plus a metadata rail.
 
 *Built.* The grid and the list draw real thumbnails — pictures and
-SVGs in both, PDFs and videos in the grid — through the shared freedesktop
-cache, and a preview pane shows the selected file (`hyprforge-files-core`'s
-`preview`, read by the app's `preview.rs`).
+SVGs in both; PDFs, videos, 3D models (STL, 3MF, OBJ, drawn by
+`hyprforge-mesh` as the viewer draws them) and anything an installed
+`*.thumbnailer` claims (glycin's AVIF, HEIF and JPEG XL here) in the grid —
+through the shared freedesktop cache, and a preview pane shows the
+selected file (`hyprforge-files-core`'s `preview`, read by the app's
+`preview.rs`). Which files are asked about is decided by MIME type: the
+host installs one answer per process (`preview::ThumbnailTypes`, from the
+MIME database's globs and the thumbnailers found), because the browser
+does no I/O. The built-in readers come first — measured and bounded here —
+and somebody else's thumbnailer only for what none of them reads, run
+under the usual timeout into a private temporary directory and read back
+through the cache's own size caps (`hyprforge_thumbnails::thumbnailers`).
+Each source can be switched off, and a size cap set, in `[thumbnails]` —
+both in Preferences.
 
 **Zoom — built** (asked for by the person using it: Ctrl+scroll did
 nothing, and then asked for Explorer's way of it). Ctrl+wheel over the
@@ -248,8 +259,35 @@ needed a widget of its own (`hyprforge-ui`'s `wheel_zoom`): the listing
 is a scrollable, which takes the wheel before a `mouse_area` around it
 ever hears it, so the wrapper looks first and passes a plain wheel
 through; a touchpad's pixels are added up so a swipe is a few steps,
-not all of them. Not yet: thumbnails are decoded for the unzoomed
-size, so at 200% a picture is drawn larger than it was decoded.
+not all of them.
+
+Thumbnails follow the zoom. The browser works out the physical pixels a
+cell's picture is drawn across — the grid icon at the zoom, times the
+font scale, times the output's scale factor, which the host sends as
+`Message::ScaleFactor` on startup and on every resize (a window moved to
+another output is resized by the move) — and asks for the smallest of
+the cache's `normal`, `large` and `x-large` (128, 256, 512) that covers
+it. Zooming past what a picture was made at asks again, and the old
+picture stays drawn until the bigger one replaces it. A 512-pixel
+thumbnail is a megabyte of pixels, so the bigger ones are bounded by
+memory, not only count: the first 128MB worth in display order are made
+at the zoom's size and the rest at 128 — softer, never an icon.
+
+Long names. At Extra large a name was cut off: its box was exactly two
+lines and clipped, so a third line was sliced through its letters or
+simply missing with nothing to say so; and on a narrow pane a cell
+(132 × the scale, plus gaps) could be wider than the pane, the row was
+squeezed, and names wrapped into a narrower column than their cell. Now
+names go through `hyprforge-ui`'s `clamped_text`, which measures with
+the real font in layout and ends a name that does not fit in "…", cut
+between graphemes — two lines in the grid by default
+(`[behaviour] grid-name-lines`, one to three, in Preferences) and one
+in the list. The selected cell the keyboard is on shows its whole name,
+that one cell growing, Explorer's way. Cells are never squeezed: when
+not even one fits across the pane at the zoom, the grid is drawn at the
+largest scale that fits, and the status bar says the size was made
+smaller to fit. The cell's padding and spacing scale with it, as the
+height it is checked against always assumed.
 
 **Quick Look — built** (it was on the vision doc's deferred list, not a
 mockup artboard). Space shows the keyboard's focused entry on a card over

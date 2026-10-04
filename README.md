@@ -25,9 +25,11 @@ interrupted edit never leaves a truncated archive.
 A **preview pane** beside the listing shows the selected file — a
 picture, the first lines of a text file, a folder's or an archive's
 contents, a PDF's first page, a video's frame or a song's cover — and
-the grid draws real thumbnails of pictures, SVGs, PDFs and videos,
-the costly ones kept in the freedesktop thumbnail cache every other
-file manager and viewer already shares. Files can be copied and pasted with other
+the grid draws real thumbnails of pictures, SVGs, PDFs, videos, 3D
+models and anything an installed thumbnailer reads (AVIF, HEIF and
+JPEG XL through glycin), sized for the zoom and the screen, the costly
+ones kept in the freedesktop thumbnail cache every other file manager
+and viewer already shares. Files can be copied and pasted with other
 applications, and dragged out of the window into them — members of an
 archive too, unpacked while the drag is under way and handed over once
 they are on disk.
