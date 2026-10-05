@@ -24,6 +24,7 @@ use hyprforge_files_core::preferences::{
     Plan, Setting, SidebarSetting, ThumbnailSetting, CONFLICT_POLICIES, GRID_NAME_LINES, GROUPS, THUMBNAIL_CAPS,
     THUMBNAIL_SOURCES,
 };
+use hyprforge_files_core::preferences::{typing_label, TYPING_CHOICES};
 use hyprforge_files_core::preferences::{seconds_label, watch_network_choices};
 use hyprforge_files_core::prefs::{Prefs, SidebarPref, ViewMode};
 use hyprforge_ui::theme::{spacing, surface, FontScale, BASE_TEXT_SIZE};
@@ -495,6 +496,23 @@ impl Preferences {
                     |pref| Message::Browsing(Setting::Sidebar(pref)),
                     scale,
                 ),
+                scale,
+            ),
+            setting_row(
+                5,
+                "Typing in a folder",
+                Some(hint_text("Jump moves to the first name you type; Ctrl+F searches either way.", scale).into()),
+                if writable {
+                    segmented_choice(
+                        &TYPING_CHOICES,
+                        Some(&config.behaviour.typing),
+                        |t| typing_label(*t).to_string(),
+                        |t| Message::Behaviour(BehaviourSetting::Typing(t)),
+                        scale,
+                    )
+                } else {
+                    config_line(typing_label(config.behaviour.typing), scale).into()
+                },
                 scale,
             ),
         ]);

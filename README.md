@@ -50,6 +50,24 @@ with it open, Enter opens the file, and Space or Escape puts it away.
 A Space typed between two words of a search still types a space. It
 works in the open/save dialog too.
 
+**Selecting** by dragging a box across empty space — beside a short
+list, or between and below the grid's icons — selects everything it
+touches, scrolling the listing when it reaches an edge; Ctrl or Shift
+adds the box to what was already selected, and a click on empty space
+clears it. **Typing** at a folder searches it, as it always has; set
+**Typing in a folder** to *Jump to name* in Preferences and typed
+letters move to the first name they begin instead, the way Explorer,
+Finder and Dolphin do, with Ctrl+F (in either mode) putting the keyboard
+in the search field. The status bar says how much **free space** is left
+on the folder's disk, and refreshes after a paste or a delete.
+
+**Undo** shows what it is holding: the notice after an operation has a
+History button, and so do the palette and the empty-space menu ("Undo
+History"), listing everything Ctrl+Z can still take back, newest first.
+Only the newest can be undone from there — each undo checks the folder
+is as that record left it, and taking an older one first would check
+against a state the newer one has since changed.
+
 **Drives and servers** are in the sidebar. Devices lists removable
 drives and disk images, mounted or not: a click on one that is not
 mounted mounts it — over UDisks2, with no root, polkit deciding — and

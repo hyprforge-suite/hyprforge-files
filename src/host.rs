@@ -79,6 +79,47 @@ pub async fn count_folders(
     .unwrap_or_default()
 }
 
+/// The answer to `Outcome::MeasureSpace`: how much room `path`'s
+/// filesystem has left, or `None` when it would not say.
+///
+/// Bounded, because `statvfs` on a network share whose server has gone
+/// away blocks in the kernel for as long as the mount's own timeout
+/// allows, which for a hard NFS mount is forever. The blocking thread
+/// cannot be taken back, but the status bar stops waiting for it after
+/// [`hyprforge_process::TIMEOUT`] and says nothing about space — the same
+/// as for a filesystem that answered with an error.
+pub async fn measure_space(path: PathBuf) -> Option<hyprforge_files_core::space::Space> {
+    let ask = tokio::task::spawn_blocking(move || statvfs(&path));
+    match tokio::time::timeout(hyprforge_process::TIMEOUT, ask).await {
+        Ok(Ok(space)) => space,
+        _ => None,
+    }
+}
+
+fn statvfs(path: &std::path::Path) -> Option<hyprforge_files_core::space::Space> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call,
+    // and `buf` is a properly sized, writable `statvfs` the kernel fills
+    // in; it is read only when the call says it succeeded.
+    if unsafe { libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `statvfs` returned 0, so it wrote the whole struct.
+    let stat = unsafe { buf.assume_init() };
+    // `f_frsize` is the unit both counts are in (`f_bsize` is only the
+    // preferred I/O size, and differs from it on some filesystems), and
+    // `f_bavail` rather than `f_bfree` — see `Space::free`.
+    #[allow(clippy::unnecessary_cast)] // the field types differ by ABI.
+    let unit = stat.f_frsize as u64;
+    #[allow(clippy::unnecessary_cast)]
+    Some(hyprforge_files_core::space::Space {
+        free: (stat.f_bavail as u64).saturating_mul(unit),
+        total: (stat.f_blocks as u64).saturating_mul(unit),
+    })
+}
+
 /// The preview pane's picture, in physical pixels: twice the pane's
 /// widest, for a 2x display.
 const PREVIEW_EDGE: u32 = (hyprforge_files_core::browser::PREVIEW_WIDTH as u32) * 2;
@@ -231,4 +272,27 @@ pub async fn resolve_icons(
     })
     .await
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Asked of a real filesystem, the answer is a real one: a size, and
+    /// no more free than that. A unit mix-up (`f_bsize` for `f_frsize`)
+    /// or `f_bfree` for `f_bavail` would still pass a mock; only the
+    /// kernel can say this.
+    #[tokio::test]
+    async fn the_filesystem_holding_a_folder_reports_a_size_and_room_within_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let space = measure_space(dir.path().to_path_buf()).await.expect("a temp folder answers statvfs");
+        assert!(space.total > 0);
+        assert!(space.free <= space.total);
+    }
+
+    /// A path that does not exist is "would not say", never "full".
+    #[tokio::test]
+    async fn a_missing_folder_says_nothing_about_space() {
+        assert_eq!(measure_space(PathBuf::from("/no/such/folder/anywhere")).await, None);
+    }
 }

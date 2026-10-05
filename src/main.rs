@@ -46,7 +46,7 @@
 
 use hyprforge_files::archive_jobs;
 use hyprforge_files::transfers;
-use hyprforge_files::host::{build_preview, count_folders, read_dir_task, resolve_icons, thumbnail_stream};
+use hyprforge_files::host::{build_preview, count_folders, measure_space, read_dir_task, resolve_icons, thumbnail_stream};
 use hyprforge_files::jobs::{self, JobControl, JobEvent, JobId, JobSummary};
 use hyprforge_files::launch::{self, Opened};
 use hyprforge_files_core::backend::FsBackend;
@@ -265,6 +265,7 @@ fn main() -> iced::Result {
         undo: hyprforge_files_core::undo::UndoHistory::new(config.behaviour.undo_depth as usize),
         notice: None,
         next_notice: 0,
+        undo_history_open: false,
         next_job_id: 1,
         modifiers: keyboard::Modifiers::default(),
         clicks: ClickTracker::new(),
@@ -544,6 +545,8 @@ enum Message {
     Undone(Vec<PathBuf>, Vec<String>),
     /// The undo notice with this number has been up long enough.
     NoticeExpired(u64),
+    /// Open (`true`) or close the undo history popover.
+    UndoHistory(bool),
     /// One of the person's own actions ended — `Err` is the sentence
     /// for the status bar. See `hyprforge_files::terminal::run_custom`.
     CustomFinished(Result<(), String>),
@@ -866,6 +869,8 @@ struct App {
     /// timer must not take the newer notice down with it.
     notice: Option<(u64, String)>,
     next_notice: u64,
+    /// Whether the undo history popover is open — see `undo_view`.
+    undo_history_open: bool,
     next_job_id: JobId,
     last_window_size: (u32, u32),
     /// Bumped by every resize event, so only the *last* one in a drag
@@ -1844,6 +1849,10 @@ impl App {
             Outcome::LoadIcons(keys) => Task::perform(resolve_icons(keys, self.mime.clone()), move |icons| {
                 Message::Answer(pane_id, BrowserMessage::IconsLoaded(icons))
             }),
+            Outcome::MeasureSpace(path) => {
+                let at = path.clone();
+                Task::perform(measure_space(path), move |space| Message::Answer(pane_id, BrowserMessage::SpaceMeasured(at, space)))
+            }
             Outcome::CountFolders(folders) => {
                 Task::perform(count_folders(self.backend.clone(), folders), move |counts| {
                     Message::Answer(pane_id, BrowserMessage::CountsLoaded(counts))
@@ -2896,6 +2905,10 @@ impl App {
         match action {
             Action::Undo => {
                 self.notice = None;
+                // The history's own Undo button lands here too; what it
+                // listed is about to change, so it closes rather than
+                // showing a row that is being taken back.
+                self.undo_history_open = false;
                 let Some(done) = self.undo.pop() else {
                     self.status = Some("There's nothing to undo.".to_string());
                     return Task::none();
@@ -2911,6 +2924,10 @@ impl App {
                     },
                     move |(dirs, errors)| Message::UndoneMoves(moves.clone(), dirs, errors),
                 )
+            }
+            Action::UndoHistory => {
+                self.undo_history_open = !self.undo_history_open;
+                Task::none()
             }
             Action::NewTab => self.open_tab(self.home_dir.clone()),
             Action::CloseTab => self.close_tab(self.active),
@@ -3700,6 +3717,17 @@ impl App {
             // — it closes and the key does what it would have. Found
             // live: Ctrl+K opened the palette *under* the popover, and
             // the letters typed for it went to the search box instead.
+            // The undo history is a glance, like the transfers popover:
+            // Escape closes it, its own key toggles it, and any other key
+            // closes it and then does what it would have.
+            Message::KeyPressed(press) if self.undo_history_open => {
+                self.undo_history_open = false;
+                match self.config.keymap.resolve(&press) {
+                    Some(Resolved::Action(Action::UndoHistory)) => Task::none(),
+                    _ if press.key == keymap::Key::Escape => Task::none(),
+                    _ => self.update(Message::KeyPressed(press)),
+                }
+            }
             Message::KeyPressed(press) if self.transfers.is_open() => {
                 // Its own key closes what it opened. Without this the
                 // popover's "close, then let the key act" would open it
@@ -3757,7 +3785,7 @@ impl App {
                 }
                 Some(Resolved::Text(c)) => {
                     let at = self.focused();
-                    let outcome = self.pane_mut(at).browser.update(BrowserMessage::TypeToSearch(c));
+                    let outcome = self.pane_mut(at).browser.update(BrowserMessage::Typed(c, std::time::Instant::now()));
                     self.handle_outcome(at, outcome)
                 }
                 None => Task::none(),
@@ -3902,6 +3930,10 @@ impl App {
                     self.status = Some(format!("Couldn't undo everything: {}", errors.join(" ")));
                 }
                 self.refresh_dirs(&dirs)
+            }
+            Message::UndoHistory(open) => {
+                self.undo_history_open = open;
+                Task::none()
             }
             Message::NoticeExpired(id) => {
                 if self.notice.as_ref().is_some_and(|(current, _)| *current == id) {
@@ -4629,6 +4661,9 @@ impl App {
         if let Some(layer) = transfers_view::overlay(self, scale) {
             return iced::widget::stack![window, layer].into();
         }
+        if let Some(layer) = undo_view::overlay(self, scale) {
+            return iced::widget::stack![window, layer].into();
+        }
         // The pane with the keyboard is the one a menu can be open in: a
         // right click chooses its pane before it opens anything.
         let pane = tab.pane();
@@ -4850,6 +4885,9 @@ fn undo_notice<'a>(text: &str, scale: FontScale) -> Element<'a, Message> {
         // The action, not its key: Ctrl+Z may have been rebound, and a
         // button that sent the default key would quietly stop working.
         secondary_button("Undo").on_press(Message::Browser(BrowserMessage::Perform(Action::Undo))),
+        // What else undo is holding — the notice only ever names the
+        // newest, and is gone in a few seconds.
+        secondary_button("History").on_press(Message::UndoHistory(true)),
     ]
     .spacing(spacing::SM)
     .align_y(iced::Alignment::Center)
@@ -5372,6 +5410,7 @@ fn field_escape(event: iced::Event, status: iced::event::Status, _window: window
 /// reason: this process has one window — closing its last tab exits.
 mod bulk_rename_window;
 mod transfers_view;
+mod undo_view;
 use transfers_view::{Transfers, TransfersMessage};
 mod devices_view;
 use devices_view::ConnectMessage;
@@ -6097,6 +6136,7 @@ mod tests {
             undo: hyprforge_files_core::undo::UndoHistory::new(20),
             notice: None,
             next_notice: 0,
+            undo_history_open: false,
             next_job_id: 1,
             modifiers: keyboard::Modifiers::default(),
             clicks: ClickTracker::new(),
@@ -8196,6 +8236,47 @@ mod tests {
         assert!(!app.undo.is_empty());
         let _ = app.update(Message::Browser(BrowserMessage::Perform(Action::Undo)));
         assert!(app.undo.is_empty(), "the button's message undid it");
+    }
+
+    /// The notice's History button opens the list; Escape closes it
+    /// without doing anything else.
+    #[test]
+    fn the_undo_history_opens_from_the_notice_and_escape_only_closes_it() {
+        let mut app = app_for_test(&["/dir"]);
+        let _ = app.update(Message::FolderCreated(0, "/dir/one".into(), Ok(())));
+        let _ = app.update(Message::UndoHistory(true));
+        assert!(app.undo_history_open);
+        let _ = app.update(key("Escape"));
+        assert!(!app.undo_history_open);
+        assert_eq!(app.undo.len(), 1, "closing the list undid nothing");
+    }
+
+    /// Any other key closes the list *and* does what it would have — the
+    /// transfers popover's rule, found live there: a key that only closed
+    /// the glance made the person press it twice.
+    #[test]
+    fn a_key_pressed_over_the_undo_history_closes_it_and_still_acts() {
+        let mut app = app_for_test(&["/dir"]);
+        let _ = app.update(Message::FolderCreated(0, "/dir/one".into(), Ok(())));
+        let _ = app.update(Message::UndoHistory(true));
+        let _ = app.update(key("Ctrl+Z"));
+        assert!(!app.undo_history_open);
+        assert!(app.undo.is_empty(), "Ctrl+Z still undid the newest record");
+    }
+
+    /// The list's Undo button is the ordinary undo, and the list closes
+    /// rather than showing the row that is being taken back.
+    #[test]
+    fn undoing_from_the_history_takes_the_newest_and_closes_the_list() {
+        let mut app = app_for_test(&["/dir"]);
+        let _ = app.update(Message::FolderCreated(0, "/dir/one".into(), Ok(())));
+        let _ = app.update(Message::FolderCreated(0, "/dir/two".into(), Ok(())));
+        let _ = app.update(Message::Browser(BrowserMessage::Perform(Action::UndoHistory)));
+        assert!(app.undo_history_open);
+        let _ = app.update(Message::Browser(BrowserMessage::Perform(Action::Undo)));
+        assert!(!app.undo_history_open);
+        assert_eq!(app.undo.len(), 1);
+        assert!(app.undo.newest_first().next().unwrap().describe().contains("one"));
     }
 
     /// Ctrl+Z with nothing to take back says so.

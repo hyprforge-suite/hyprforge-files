@@ -459,7 +459,8 @@ decisions in `hyprforge-files-core`'s `preferences`). It has two pages.
   Change, Add, Clear, and Reset for a line the file holds. A key another
   action holds is named and asked about first; taking it rewrites that
   action's line without the key, so the file never holds a clash. A
-  bare letter is refused, because it types into search.
+  bare letter is refused, because it types into search — or jumps, with
+  `typing = "jump"`; it is the listing's either way.
 
 `files-config.toml` is written through `toml_edit`, one entry at a time.
 Comments, order and untouched lines survive. A file that will not parse
@@ -1560,6 +1561,55 @@ the tab beside it can stay one listing.
   restored tabs come back as they were saved.
 
 Not built: dragging the divider. The halves are equal.
+
+## Selection, typing, free space and undo history — built
+
+The first round of closing the gap with Dolphin, Finder and Explorer
+(the plan is in the suite's notes; the comparison found these four
+missing or hidden):
+
+- **Rubber band.** `hyprforge_ui::widgets::marquee` wraps the whole
+  listing body, not the rows — the band almost always starts where no
+  row is. It hands each press to its content first and starts only on
+  one nothing captured, so a press on a row is still that row's click,
+  double click and drag. Rows carry a container id only while a band is
+  in progress (`Browser::band_ids`, made once per row and reused), so an
+  ordinary frame allocates nothing for it — the cost `reveal.rs` was
+  written to avoid. The focused row keeps the id `Reveal` looks for and
+  the band names it by that. The focus moves to the first row met when
+  the band is let go, not while it moves: a focus change asks for a
+  reveal, and that scroll would fight the band's own near the edge. A
+  click on empty space clears the selection, which it never did. List
+  view rows fill the width, so a long list has little empty space to
+  start from — the margin and the space below the last row; the grid's
+  gaps are where it shines.
+- **Type-to-jump** is `[behaviour] typing = "jump"`, and search stays the
+  default: changing what every letter does under someone's hands is not
+  a default to change. `crate::typeahead` is pure — the host stamps each
+  key with `Instant::now()` (`Message::Typed`), as `click.rs` is handed
+  its clock. A search already in force keeps every letter whatever the
+  setting, so Ctrl+F then a word is a query, not five jumps. Ctrl+F
+  (`Action::Find`) focuses the search field by an id the field now has.
+- **Free space** comes from `statvfs` after every listing, a re-read
+  included, so a paste or a delete updates it without asking. `f_bavail`,
+  not `f_bfree`: root's reserved blocks are not room a paste can use.
+  Bounded by `TIMEOUT`, because `statvfs` on a hard NFS mount whose
+  server is gone blocks forever. Inside an archive the question goes to
+  the folder holding it; a filesystem answering zeroes says nothing
+  rather than "0 B free"; Recent and Starred show none, their rows being
+  from anywhere.
+- **Undo history.** The notice was the only sign of what undo held, and
+  it is gone in six seconds. `undo_view.rs` lists the history newest
+  first from the notice's History button, the palette and the
+  empty-space menu. Only the newest row is a button: each undo checks the
+  folder is as its record left it (`jobs::undo`), and an older one taken
+  first would be checked against a state the newer one changed. No redo
+  yet — Ctrl+Shift+Z is left unbound for it.
+
+Checked in a nested compositor at 1.25 scale with a virtual pointer: a
+band across the grid, the automatic scroll past the bottom edge with the
+anchor riding the content, a click clearing, the history popover from
+the palette, "ro" jumping to `romeo.txt` and Ctrl+F then searching.
 
 ## What to verify, not assume
 

@@ -19,7 +19,7 @@
 //! the application's choices, and the two buttons — drawn *around* the
 //! browser's own view, never inside it.
 
-use hyprforge_files::host::{build_preview, count_folders, read_dir_task, resolve_icons, thumbnail_stream};
+use hyprforge_files::host::{build_preview, count_folders, measure_space, read_dir_task, resolve_icons, thumbnail_stream};
 use hyprforge_files::portal::{self, Accept, Answer, Kind, OnScreen, Request};
 use hyprforge_files_core::browser::Message as BrowserMessage;
 use hyprforge_files_core::keymap::Resolved;
@@ -460,6 +460,10 @@ impl Dialog {
             Outcome::None => Task::none(),
             Outcome::ReadDir(path) => self.read(path),
             Outcome::Activated(path) => self.activated(path),
+            Outcome::MeasureSpace(path) => {
+                let at = path.clone();
+                Task::perform(measure_space(path), move |space| Message::Browser(BrowserMessage::SpaceMeasured(at, space)))
+            }
             Outcome::CountFolders(folders) => Task::perform(count_folders(self.backend.clone(), folders), |counts| {
                 Message::Browser(BrowserMessage::CountsLoaded(counts))
             }),
@@ -714,7 +718,7 @@ impl Dialog {
                 self.handle(outcome)
             }
             Some(Resolved::Text(c)) => {
-                let outcome = self.browser.update(BrowserMessage::TypeToSearch(c));
+                let outcome = self.browser.update(BrowserMessage::Typed(c, std::time::Instant::now()));
                 self.handle(outcome)
             }
             None => Task::none(),
