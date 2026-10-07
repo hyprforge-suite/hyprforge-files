@@ -1250,12 +1250,48 @@ filtered to data-device lines:
 - iced connects its clipboard before any of this crate's code runs, so
   this device can never be first.
 
-A drag that starts in Files and ends over it does reach the source:
-`cancelled`, then a pointer `enter` at the drop position. But no
-`dnd_drop_performed` comes first, so a release cannot be told from Escape.
-Moving files on that ambiguity was not built. It waits on Hyprland
-sending drags to every device a client has, or on iced's clipboard
-accepting them.
+Measured again on 2026-10-06, before building around it: iced's
+clipboard device was created 45–80ms before this crate's, and a drag from
+a GTK window entered it and left; this crate's device heard nothing, not
+even the selection.
+
+## Drags inside the window — built
+
+A drag between this window's own folders never becomes a Wayland drag
+(`src/inner_drag.rs`). A held button gives the window an implicit grab,
+so iced keeps hearing the pointer move; the window lights the folder
+under it with the same `drop::HitTest` a Wayland drop uses, and letting
+go drops through `drop::plan` and the ordinary paste. Escape abandons
+it.
+
+- **The compositor is told at the edge.** Within 4px of it the window
+  calls `start_drag` with the press serial it has held all along, and
+  from there it is an ordinary drag out. Inside the edge rather than
+  past it, because a drag is started against the surface the pointer is
+  over. Measured on Hyprland 0.56: under the grab, a single motion to
+  x = −346 still arrived on this window's surface, and `start_drag`
+  from there worked — so a pointer flung past the band is handed over
+  too.
+- **An archive's members** are not paths a paste can read, so dropped
+  on a folder they are extracted there (`ExtractMembers`, loose, as
+  Extract here does). Dropped inside another archive, or another folder
+  of the same one, they are refused in a sentence. A drag out of an
+  archive starts unpacking only when it is handed to the compositor.
+- **Spring-loaded folders.** A drag that rests on a folder for 700ms
+  opens it in the pane it is in, and the drag goes on into it. A
+  generation guards the timer, the way `read_generation` guards a
+  listing: moving to another folder, leaving or letting go makes the
+  timer's answer stale. Resting on the open folder's own background
+  arms nothing.
+
+Checked in a nested compositor with a virtual pointer and keyboard: a
+file dragged onto a folder row moved into it; one rested on a folder
+opened it and dropped inside; a folder dragged to a GTK4 drop target
+arrived there as a copy.
+
+A drag that has been handed over and comes back still cannot be dropped
+here: it is the compositor's by then, and goes to iced's clipboard
+device like any other.
 
 ## Dragging members out of an archive — built
 

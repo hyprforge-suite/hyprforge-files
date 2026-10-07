@@ -32,7 +32,9 @@ ones kept in the freedesktop thumbnail cache every other file manager
 and viewer already shares. Files can be copied and pasted with other
 applications, and dragged out of the window into them — members of an
 archive too, unpacked while the drag is under way and handed over once
-they are on disk.
+they are on disk. Dragged between folders of the window itself, they
+move (Ctrl copies), and a folder the drag rests on opens so it can go
+on deeper.
 
 **Zoom** with Ctrl+scroll over the listing, or Ctrl+= / Ctrl+- / Ctrl+0,
 the way Explorer does it: one ladder from Compact details through

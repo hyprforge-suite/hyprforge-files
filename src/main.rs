@@ -273,6 +273,8 @@ fn main() -> iced::Result {
         drag_over: false,
         from_drops: std::collections::HashSet::new(),
         archive_drag: None,
+        inner_drag: None,
+        spring: (0, None),
         config: config.clone(),
         #[cfg(debug_assertions)]
         debug_show: DebugShow::from_env(),
@@ -533,6 +535,12 @@ enum Message {
     DragUnpacked(Result<(), String>),
     /// A drag over the window — see `dnd`.
     Dnd(hyprforge_files::dnd::DropEvent),
+    /// The pointer or Escape, during a drag that has not left the window
+    /// — see `inner_drag`.
+    InnerDrag(hyprforge_files::inner_drag::DragEvent),
+    /// A drag has rested on one folder long enough to open it — the
+    /// generation it was armed with. See [`App::spring`].
+    SpringFired(u64),
     /// Which folder a point is over, in which pane, as the layout
     /// answered — and, for a drop, what was dropped there.
     DropHit(Option<(u64, PathBuf)>, Option<hyprforge_files_core::drop::DropFrom>),
@@ -930,6 +938,14 @@ struct App {
     /// The latest drag out of an archive, so it can be recognised if it
     /// is dropped back where it came from — see `drag_out::OwnDrag`.
     archive_drag: Option<hyprforge_files::drag_out::OwnDrag>,
+    /// A drag that started here and has not reached the window's edge —
+    /// see `hyprforge_files::inner_drag`.
+    inner_drag: Option<hyprforge_files::inner_drag::InnerDrag>,
+    /// The folder a drag has been resting on, and the generation of the
+    /// timer that opens it when the drag stays there — a spring-loaded
+    /// folder. Bumped whenever the drag moves to another folder or ends,
+    /// so a timer about a folder the drag has left is recognisably stale.
+    spring: (u64, Option<(u64, PathBuf)>),
     /// Debug builds only: what to put on screen for a screenshot. See
     /// [`DebugShow`].
     #[cfg(debug_assertions)]
@@ -2041,7 +2057,7 @@ impl App {
                 Task::none()
             }
             Outcome::CopyText(text) => iced::clipboard::write(text),
-            Outcome::DragOut(paths) => self.start_drag(paths),
+            Outcome::DragOut(paths) => self.begin_drag(paths),
             Outcome::Paste(into) => self.read_clipboard_for(into),
             Outcome::ToOtherPane(clip) => self.paste_in_other_pane(at, clip),
             Outcome::ResolvePath(request) => self.spawn_resolve(at, request),
@@ -3129,12 +3145,14 @@ impl App {
                 self.probe_drop((x, y), None)
             }
             DropEvent::Left => {
+                self.disarm_spring();
                 self.drag_over = false;
                 self.drop_probe.1 = None;
                 self.light_drop(None);
                 Task::none()
             }
             DropEvent::Dropped { x, y, from } => {
+                self.disarm_spring();
                 self.drag_over = false;
                 self.drop_probe.1 = None;
                 self.light_drop(None);
@@ -3168,6 +3186,51 @@ impl App {
             .map(move |hit| Message::DropHit(hit, dropped.clone()))
     }
 
+    /// Forgets the folder a drag was resting on: the drag ended.
+    fn disarm_spring(&mut self) {
+        self.spring.0 += 1;
+        self.spring.1 = None;
+    }
+
+    /// Starts the clock on a spring-loaded folder when a drag comes to a
+    /// new one, and stops it when the drag leaves. Resting on the
+    /// listing's own background arms nothing: that folder is open.
+    fn arm_spring(&mut self, hit: Option<(u64, PathBuf)>) -> Task<Message> {
+        if hit == self.spring.1 {
+            return Task::none();
+        }
+        self.spring.0 += 1;
+        let open = hit.filter(|(pane, path)| {
+            self.locate(*pane).is_some_and(|at| self.pane(at).browser.current_dir() != path.as_path())
+        });
+        let armed = open.is_some();
+        self.spring.1 = open;
+        if !armed {
+            return Task::none();
+        }
+        let generation = self.spring.0;
+        Task::perform(
+            async move {
+                tokio::time::sleep(SPRING_DELAY).await;
+                generation
+            },
+            Message::SpringFired,
+        )
+    }
+
+    /// The drag stayed on one folder: open it in the pane it is in, so
+    /// the drag can go on into it.
+    fn spring_fired(&mut self, generation: u64) -> Task<Message> {
+        if generation != self.spring.0 || !self.drag_over {
+            return Task::none();
+        }
+        let Some((pane, path)) = self.spring.1.take() else { return Task::none() };
+        self.spring.0 += 1;
+        let Some(at) = self.locate(pane).filter(|at| at.tab == self.active) else { return Task::none() };
+        self.light_drop(None);
+        self.browser_message(at, BrowserMessage::Navigate(path))
+    }
+
     /// Lights the folder a drag is over in the pane it is over, and
     /// unlights it in every other pane of the tab — `None` unlights all.
     fn light_drop(&mut self, hit: Option<(u64, PathBuf)>) {
@@ -3181,6 +3244,28 @@ impl App {
     /// each side is on, and whether the folder is inside an archive, are
     /// both questions only a `stat` answers.
     fn plan_drop(&mut self, into: PathBuf, from: hyprforge_files_core::drop::DropFrom) -> Task<Message> {
+        // An archive's members, dragged inside the window: not paths a
+        // paste can read, so they are extracted where they land.
+        if let hyprforge_files_core::drop::DropFrom::Inside(paths) = &from {
+            if paths.first().is_some_and(|p| hyprforge_files_core::archive::split(p).is_some()) {
+                use hyprforge_files::inner_drag::{members_drop, MembersDrop};
+                return match members_drop(paths, &into, hyprforge_files_core::archive::split) {
+                    MembersDrop::Extract { archive, members, prefix, into } => {
+                        self.start_archive_job(archive_jobs::Work::ExtractMembers {
+                            archive,
+                            members,
+                            strip_prefix: prefix,
+                            into,
+                        })
+                    }
+                    MembersDrop::Nothing => Task::none(),
+                    MembersDrop::Refused(why) => {
+                        self.status = Some(why);
+                        Task::none()
+                    }
+                };
+            }
+        }
         let held = hyprforge_files_core::drop::Held {
             ctrl: self.modifiers.control(),
             shift: self.modifiers.shift(),
@@ -3203,6 +3288,74 @@ impl App {
             },
             Message::DropPlanned,
         )
+    }
+
+    /// A drag starts here, in the window — see `inner_drag`. Nothing is
+    /// asked of the compositor until the pointer reaches the edge.
+    fn begin_drag(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
+        if paths.is_empty() {
+            return Task::none();
+        }
+        self.inner_drag = Some(hyprforge_files::inner_drag::InnerDrag::new(paths));
+        hyprforge_files::inner_drag::set_active(true);
+        self.drag_over = true;
+        Task::none()
+    }
+
+    /// Follows a drag that has not left the window: lights the folder
+    /// under it as a drop from outside would, drops it where it is let
+    /// go, and hands it to the compositor at the edge.
+    fn inner_drag_event(&mut self, event: hyprforge_files::inner_drag::DragEvent) -> Task<Message> {
+        use hyprforge_files::inner_drag::{step, DragEvent, Step};
+        let Some(drag) = self.inner_drag.as_mut() else {
+            // A last event from a listener that had not yet heard the
+            // drag was over.
+            hyprforge_files::inner_drag::set_active(false);
+            return Task::none();
+        };
+        match event {
+            DragEvent::Moved(at) => {
+                let window = Size::new(self.last_window_size.0 as f32, self.last_window_size.1 as f32);
+                match step(at, window) {
+                    Step::Over(at) => {
+                        drag.at = Some(at);
+                        self.drop_event(hyprforge_files::dnd::DropEvent::Over { x: at.x.into(), y: at.y.into() })
+                    }
+                    Step::HandOff => self.hand_off_drag(),
+                }
+            }
+            DragEvent::Left => self.hand_off_drag(),
+            DragEvent::Released => match self.end_inner_drag() {
+                Some(hyprforge_files::inner_drag::InnerDrag { paths, at: Some(at) }) => {
+                    self.probe_drop((at.x.into(), at.y.into()), Some(hyprforge_files_core::drop::DropFrom::Inside(paths)))
+                }
+                // Let go before it moved at all: nowhere to drop it.
+                _ => Task::none(),
+            },
+            DragEvent::Cancelled => {
+                self.end_inner_drag();
+                Task::none()
+            }
+        }
+    }
+
+    /// Ends a drag inside the window, unlighting whatever it was over.
+    fn end_inner_drag(&mut self) -> Option<hyprforge_files::inner_drag::InnerDrag> {
+        hyprforge_files::inner_drag::set_active(false);
+        self.disarm_spring();
+        self.drag_over = false;
+        self.drop_probe.1 = None;
+        self.light_drop(None);
+        self.inner_drag.take()
+    }
+
+    /// The drag reached the window's edge: from here it is the
+    /// compositor's, so another application can take it.
+    fn hand_off_drag(&mut self) -> Task<Message> {
+        match self.end_inner_drag() {
+            Some(drag) => self.start_drag(drag.paths),
+            None => Task::none(),
+        }
     }
 
     /// Hands `paths` to the compositor as a drag. On the event loop's
@@ -3958,17 +4111,21 @@ impl App {
                 tracing::debug!(?event, "drop event");
                 self.drop_event(event)
             }
+            Message::InnerDrag(event) => self.inner_drag_event(event),
             Message::DropHit(hit, None) => {
                 tracing::debug!(?hit, "a drag is over");
                 self.drop_probe.0 = false;
                 // An answer for a drag that has since left or been let go.
                 let hit = hit.filter(|_| self.drag_over);
-                self.light_drop(hit);
-                match self.drop_probe.1.take() {
+                self.light_drop(hit.clone());
+                let spring = self.arm_spring(hit);
+                let probe = match self.drop_probe.1.take() {
                     Some(at) => self.probe_drop(at, None),
                     None => Task::none(),
-                }
+                };
+                Task::batch([spring, probe])
             }
+            Message::SpringFired(generation) => self.spring_fired(generation),
             Message::DropHit(None, Some(_)) => {
                 self.status = Some("Drop files onto a folder, or onto the listing.".to_string());
                 Task::none()
@@ -4761,6 +4918,7 @@ impl App {
             pointer::track(),
             iced::event::listen_with(field_escape),
             Subscription::run(hyprforge_files::dnd::events).map(Message::Dnd),
+            hyprforge_files::inner_drag::events().map(Message::InnerDrag),
             // Drives and shares: listed at once, then again whenever
             // UDisks2 or gvfs says something changed, a burst at a time.
             Subscription::run_with(self.devices.backends.clone(), hyprforge_files::devices::watch)
@@ -5841,6 +5999,12 @@ fn tab_widget(index: usize, tab: &Tab, is_active: bool, scale: FontScale) -> Ele
 /// closing the window immediately still saves.
 const RESIZE_SETTLE: u64 = 400;
 
+/// How long a drag has to rest on a folder before it opens — a
+/// spring-loaded folder. Finder's default "medium" delay is about this;
+/// much shorter and passing over a folder on the way somewhere else
+/// opens it, much longer and the user has let go before it does.
+const SPRING_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+
 /// A tab's horizontal padding. Declared for inactive tabs too, even
 /// though nothing paints their background, so activating one makes a
 /// fill appear in exactly the right shape with no reflow.
@@ -6144,6 +6308,8 @@ mod tests {
             drag_over: false,
             from_drops: std::collections::HashSet::new(),
         archive_drag: None,
+        inner_drag: None,
+        spring: (0, None),
             config: Arc::new(hyprforge_files_core::config::Config::default()),
             #[cfg(debug_assertions)]
             debug_show: DebugShow::default(),
@@ -6169,6 +6335,102 @@ mod tests {
         assert!(app.drop_probe.0 && app.drop_probe.1.is_none(), "the waiting one went out");
         let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
         assert!(!app.drop_probe.0);
+    }
+
+    /// The compositor is not told about a drag until it reaches the
+    /// window's edge — Hyprland would hand it to iced's clipboard device,
+    /// and it could never be dropped back here. See `inner_drag`.
+    #[test]
+    fn a_drag_inside_the_window_lights_folders_without_the_compositor() {
+        use hyprforge_files::inner_drag::DragEvent;
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
+        let _ = app.update(Message::InnerDrag(DragEvent::Moved(iced::Point::new(100.0, 100.0))));
+        assert!(app.inner_drag.is_some(), "still the window's own drag");
+        assert!(app.drop_probe.0, "the layout was asked what is under it");
+        assert_eq!(app.inner_drag.as_ref().and_then(|d| d.at), Some(iced::Point::new(100.0, 100.0)));
+    }
+
+    #[test]
+    fn a_drag_resting_on_a_folder_opens_it() {
+        let mut app = app_for_test(&["/a"]);
+        let pane = app.tabs[0].panes[0].id;
+        let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
+        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a/docs"))), None));
+        let armed = app.spring.0;
+        let _ = app.update(Message::SpringFired(armed));
+        assert_eq!(app.tabs[0].panes[0].browser.current_dir(), Path::new("/a/docs"));
+        assert!(app.inner_drag.is_some(), "the drag goes on, into the folder");
+    }
+
+    #[test]
+    fn a_drag_that_moved_on_does_not_open_the_folder_it_passed() {
+        let mut app = app_for_test(&["/a"]);
+        let pane = app.tabs[0].panes[0].id;
+        let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
+        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a/docs"))), None));
+        let passed = app.spring.0;
+        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a/music"))), None));
+        let _ = app.update(Message::SpringFired(passed));
+        assert_eq!(app.tabs[0].panes[0].browser.current_dir(), Path::new("/a"));
+    }
+
+    #[test]
+    fn a_drag_let_go_before_the_folder_opened_leaves_it_shut() {
+        use hyprforge_files::inner_drag::DragEvent;
+        let mut app = app_for_test(&["/a"]);
+        let pane = app.tabs[0].panes[0].id;
+        let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
+        let _ = app.update(Message::InnerDrag(DragEvent::Moved(iced::Point::new(100.0, 100.0))));
+        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a/docs"))), None));
+        let armed = app.spring.0;
+        let _ = app.update(Message::InnerDrag(DragEvent::Released));
+        let _ = app.update(Message::SpringFired(armed));
+        assert_eq!(app.tabs[0].panes[0].browser.current_dir(), Path::new("/a"));
+    }
+
+    #[test]
+    fn resting_on_the_open_folders_background_arms_nothing() {
+        let mut app = app_for_test(&["/a"]);
+        let pane = app.tabs[0].panes[0].id;
+        let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
+        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a"))), None));
+        assert_eq!(app.spring.1, None);
+    }
+
+    #[test]
+    fn letting_go_inside_the_window_ends_the_drag_and_unlights() {
+        use hyprforge_files::inner_drag::DragEvent;
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
+        let _ = app.update(Message::InnerDrag(DragEvent::Moved(iced::Point::new(100.0, 100.0))));
+        let _ = app.update(Message::InnerDrag(DragEvent::Released));
+        assert!(app.inner_drag.is_none());
+        assert!(!app.drag_over, "a hover answer still out must not light a folder now");
+    }
+
+    #[test]
+    fn reaching_the_edge_hands_the_drag_to_the_compositor() {
+        use hyprforge_files::inner_drag::DragEvent;
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
+        let _ = app.update(Message::InnerDrag(DragEvent::Moved(iced::Point::new(100.0, 100.0))));
+        let _ = app.update(Message::InnerDrag(DragEvent::Moved(iced::Point::new(1.0, 100.0))));
+        assert!(app.inner_drag.is_none(), "the window let go of it");
+        assert!(!app.drag_over);
+    }
+
+    #[test]
+    fn escape_abandons_a_drag_and_a_late_release_drops_nothing() {
+        use hyprforge_files::inner_drag::DragEvent;
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
+        let _ = app.update(Message::InnerDrag(DragEvent::Moved(iced::Point::new(100.0, 100.0))));
+        let _ = app.update(Message::InnerDrag(DragEvent::Cancelled));
+        assert!(app.inner_drag.is_none() && !app.drag_over);
+        app.drop_probe.0 = false;
+        let _ = app.update(Message::InnerDrag(DragEvent::Released));
+        assert!(!app.drop_probe.0, "nothing was asked where to drop it");
     }
 
     /// A move by drag and drop is not the clipboard's cut, so finishing it

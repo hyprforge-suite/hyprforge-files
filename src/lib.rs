@@ -31,6 +31,7 @@ pub mod dnd;
 pub mod drag_out;
 pub mod file_manager1;
 pub mod host;
+pub mod inner_drag;
 pub mod jobs;
 pub mod launch;
 pub mod portal;
