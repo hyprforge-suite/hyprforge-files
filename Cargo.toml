@@ -140,6 +140,10 @@ inotify = { version = "0.11", default-features = false, features = ["stream"] }
 # this machine's own changes — from a local one. See `watch::is_remote`.
 libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Previous Versions says when each version is from the way the listing
+# does — `format_modified_at` takes the clock's "now", read once per
+# sheet. The workspace's pin, spelled out: this crate builds alone.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Not a dev-dependency: a file opened out of an archive is unpacked to a
 # scratch directory first — see `App::open_from_archive`.

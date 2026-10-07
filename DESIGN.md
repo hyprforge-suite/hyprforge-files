@@ -1073,6 +1073,39 @@ off, the batch landing with all six selected under their new names and
 contents, and inside a zip a find & replace of two members as one
 rewrite, both left selected.
 
+## Previous Versions — built
+
+On a machine where snapper keeps hourly btrfs snapshots of `/home`, an
+older copy of any file is already on disk, at
+`/home/.snapshots/<N>/snapshot/<path>`. "Previous Versions…" on a file
+or folder's menu finds them (`hyprforge_files_core::snapshots`, and
+`src/versions.rs` for the reading):
+
+- **Which snapshots.** The snapper config whose subvolume holds the path
+  — the deepest, so `/home/x` is `home`'s and not `root`'s — read from
+  `/etc/snapper/configs`, which anyone may read.
+- **Versions, not snapshots.** A file changed twice in a week is the same
+  in all but three of its 168 hourly copies, so copies are collapsed by
+  (modified time, size), each version named by the newest snapshot that
+  holds it and saying how many do; a copy identical to the file as it is
+  now is not offered. At most 500 snapshots, newest first, and five
+  seconds, are looked in.
+- **Open** opens the snapshot's copy the way a double-click would — it is
+  read-only, so nothing can be changed by accident. **Restore** copies it
+  back beside the file as `notes (from 2026-10-05 14.00).txt`, through
+  the ordinary copy job, so nothing is ever replaced.
+- **Reading them at all** needs snapper to allow this user:
+  `/home/.snapshots` is root's. Settings → Set up → "Previous versions of
+  your files" runs `pkexec snapper -c home set-config ALLOW_USERS=… SYNC_ACL=yes`
+  — snapper's own command, so snapper keeps the ACL it grants; the `root`
+  config is never touched. Until then the sheet says so and names the
+  item, never "no previous versions".
+
+Not yet checked live: the sheet against this machine's real snapshots,
+and `info.xml`'s parser against a real one rather than snapper's
+documented shape — both wait on the Set up item being applied here, which
+asks for a password.
+
 ## One window, on Hyprland — built
 
 "Show in folder" in a browser, "Reveal in file manager" in an editor and

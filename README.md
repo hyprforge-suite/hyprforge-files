@@ -83,6 +83,12 @@ and brings it forward, rather than a new window each time (Preferences can
 change that). A folder's menu also has Open in New Window, and Open in New
 Window on Workspace… for putting one on another Hyprland workspace.
 
+**Previous Versions** — on a machine where snapper keeps snapshots of
+your home, "Previous Versions…" on a file's menu lists the older copies
+there are (one per change, not one per snapshot), to open or to restore
+beside the current one. Settings → Set up turns on reading them, once,
+with your password.
+
 **Tags** — "Tags…" on a file's menu puts words on it, kept on the file
 itself the way Dolphin keeps them, so they survive renames, moves and
 copies and the two apps see each other's. Each tag is a row under Tags

@@ -55,4 +55,5 @@ pub mod tags_sheet;
 pub mod tabstrip;
 pub mod terminal;
 pub mod transfers;
+pub mod versions;
 pub mod watch;

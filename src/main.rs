@@ -269,6 +269,7 @@ fn main() -> iced::Result {
         compressing: None,
         tagging: None,
         picking_workspace: None,
+        versions: None,
         bulk_rename: None,
         unlocking: None,
         keyring,
@@ -600,6 +601,13 @@ enum Message {
     Note(hyprforge_files::notify::NoteEvent),
     /// Another launch's folders, handed to this window — see `handoff`.
     HandedOff(hyprforge_files::start::Start),
+    /// What the snapshots hold of this file.
+    VersionsFound(PathBuf, Result<Vec<hyprforge_files_core::snapshots::Version>, hyprforge_files_core::snapshots::Unreadable>),
+    /// A version's Open, by its place in the list.
+    VersionOpen(usize),
+    /// A version's Restore: copied back beside the file.
+    VersionRestore(usize),
+    VersionsClose,
     /// Hyprland's workspaces, listed for the picker; `None` off Hyprland.
     WorkspacesListed(PathBuf, Option<Vec<(String, String)>>),
     /// A workspace chosen in the picker — what `--workspace` takes — or
@@ -909,6 +917,9 @@ struct App {
     /// "Open in New Window on Workspace…": the folder, and Hyprland's
     /// workspaces to choose from — see `handoff::workspaces`.
     picking_workspace: Option<(PathBuf, Vec<(String, String)>)>,
+    /// "Previous Versions…": the file, and what the snapshots hold of it
+    /// — `None` while still looking. See `hyprforge_files::versions`.
+    versions: Option<(PathBuf, Option<VersionsFound>)>,
     /// The bulk rename sheet, and the id of the tab it renames in.
     bulk_rename: Option<(u64, hyprforge_files::bulk_rename::BulkRename)>,
     /// An open password prompt for an encrypted archive.
@@ -2245,6 +2256,22 @@ impl App {
             Outcome::CopyText(text) => iced::clipboard::write(text),
             Outcome::DragOut(paths) => self.begin_drag(paths),
             Outcome::OpenAsAdmin(path) => self.open_as_admin(at, path),
+            Outcome::PreviousVersions(path) => {
+                self.versions = Some((path.clone(), None));
+                Task::perform(
+                    async move {
+                        let looked = path.clone();
+                        let found = tokio::task::spawn_blocking(move || {
+                            let configs = hyprforge_files::versions::configs(Path::new(hyprforge_files::versions::CONFIGS));
+                            hyprforge_files::versions::find(&looked, &configs)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(hyprforge_files_core::snapshots::Unreadable::Failed(format!("Looking was interrupted: {e}"))));
+                        (path, found)
+                    },
+                    |(path, found)| Message::VersionsFound(path, found),
+                )
+            }
             Outcome::OpenInNewWindow { path, workspace: false } => {
                 self.new_window(&path, None);
                 Task::none()
@@ -3931,6 +3958,31 @@ impl App {
         Task::batch(tasks)
     }
 
+    /// The listed version at `index`, while the sheet shows a list.
+    fn version_at(&self, index: usize) -> Option<&hyprforge_files_core::snapshots::Version> {
+        match self.versions.as_ref()? {
+            (_, Some(Ok(list))) => list.get(index),
+            _ => None,
+        }
+    }
+
+    /// Copies `version` back beside `path`, under a name of its own —
+    /// see `snapshots::restored_name` — as an ordinary copy job, so its
+    /// progress, a conflict and Undo behave as any copy's do.
+    fn restore_version(&mut self, path: &Path, version: &hyprforge_files_core::snapshots::Version) -> Task<Message> {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return Task::none() };
+        let name = hyprforge_files_core::snapshots::restored_name(&name.to_string_lossy(), &version.newest.info.date);
+        let step = hyprforge_files_core::clipboard::PasteStep {
+            source: version.newest.path.clone(),
+            dest: dir.join(name),
+            kind: hyprforge_fileops::OpKind::Copy,
+            duplicate: false,
+        };
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        self.enqueue(Queued { id, kind: JobKind::Copy, dirs: vec![dir.to_path_buf()], what: QueuedWork::Paste { steps: vec![step] } })
+    }
+
     /// A window of its own for `path` — this same binary, never handed
     /// back to this window — on `workspace` when one is given.
     fn new_window(&mut self, path: &Path, workspace: Option<&str>) {
@@ -4328,6 +4380,12 @@ impl App {
             // current default, and "press Enter" would then mean "open
             // with the thing that was already going to open it", which
             // is never why this dialog is up.
+            Message::KeyPressed(press) if self.versions.is_some() => {
+                if press.key == keymap::Key::Escape {
+                    self.versions = None;
+                }
+                Task::none()
+            }
             Message::KeyPressed(press) if self.picking_workspace.is_some() => {
                 if press.key == keymap::Key::Escape {
                     self.picking_workspace = None;
@@ -4625,6 +4683,36 @@ impl App {
             }
             Message::InnerDrag(event) => self.inner_drag_event(event),
             Message::HandedOff(start) => self.open_handed(start),
+            Message::VersionsFound(path, found) => {
+                // An answer for a sheet since closed, or for another file.
+                if let Some((open, result)) = self.versions.as_mut().filter(|(p, _)| *p == path) {
+                    let _ = open;
+                    *result = Some(found);
+                }
+                Task::none()
+            }
+            Message::VersionsClose => {
+                self.versions = None;
+                Task::none()
+            }
+            Message::VersionOpen(index) => {
+                let copy = self.version_at(index).map(|v| v.newest.path.clone());
+                match copy {
+                    Some(copy) => {
+                        let at = self.focused();
+                        self.handle_outcome(at, Outcome::Activated(copy))
+                    }
+                    None => Task::none(),
+                }
+            }
+            Message::VersionRestore(index) => {
+                let Some((path, version)) = self.versions.as_ref().and_then(|(p, _)| Some((p.clone(), self.version_at(index)?.clone())))
+                else {
+                    return Task::none();
+                };
+                self.versions = None;
+                self.restore_version(&path, &version)
+            }
             Message::WorkspacesListed(path, listed) => {
                 match listed {
                     Some(list) => self.picking_workspace = Some((path, list)),
@@ -5483,6 +5571,9 @@ impl App {
         if let Some(sheet) = &self.tagging {
             return iced::widget::stack![window, tags_dialog(sheet, scale)].into();
         }
+        if let Some((path, found)) = &self.versions {
+            return iced::widget::stack![window, versions_dialog(path, found.as_ref(), scale)].into();
+        }
         if let Some((path, list)) = &self.picking_workspace {
             return iced::widget::stack![window, workspace_dialog(path, list, scale)].into();
         }
@@ -5978,6 +6069,58 @@ fn unlock_dialog<'a>(unlocking: &Unlocking, scale: FontScale) -> Element<'a, Mes
 /// extension is not the person's to choose — it follows the format, and
 /// a name and a format that disagree is precisely the confusion
 /// `hyprforge_archive::format` spends a module resolving.
+/// What the snapshots hold of a file, or why they could not be read.
+type VersionsFound = Result<Vec<hyprforge_files_core::snapshots::Version>, hyprforge_files_core::snapshots::Unreadable>;
+
+/// "Previous Versions…": each version there was, newest first, with Open
+/// and Restore — or why there is no list.
+fn versions_dialog<'a>(
+    path: &Path,
+    found: Option<&Result<Vec<hyprforge_files_core::snapshots::Version>, hyprforge_files_core::snapshots::Unreadable>>,
+    scale: FontScale,
+) -> Element<'a, Message> {
+    let now = chrono::Local::now();
+    let body: String;
+    let mut extra = column![].spacing(2.0);
+    match found {
+        None => body = "Looking in the snapshots\u{2026}".to_string(),
+        Some(Err(why)) => body = why.message(),
+        Some(Ok(list)) if list.is_empty() => {
+            body = "No snapshot holds a different copy of it.".to_string();
+        }
+        Some(Ok(list)) => {
+            body = "Restore puts the old copy beside this one, under its own name — nothing is replaced.".to_string();
+            for (index, version) in list.iter().enumerate() {
+                let when = hyprforge_files_core::format::format_modified_at(version.newest.modified, now);
+                let size = hyprforge_files_core::format::human_readable_size(version.newest.size);
+                let held = match version.snapshots {
+                    1 => "in 1 snapshot".to_string(),
+                    n => format!("in {n} snapshots"),
+                };
+                extra = extra.push(
+                    row![
+                        scaled_text(when, BASE_TEXT_SIZE, scale).width(Length::Fill),
+                        hyprforge_ui::widgets::meta_text(format!("{size} \u{00B7} {held}"), BASE_TEXT_SIZE, scale),
+                        secondary_button("Open").on_press(Message::VersionOpen(index)),
+                        secondary_button("Restore").on_press(Message::VersionRestore(index)),
+                    ]
+                    .spacing(spacing::SM)
+                    .align_y(iced::Alignment::Center),
+                );
+            }
+        }
+    }
+    dialog(
+        format!("Previous versions of {}", display_name(path)),
+        body,
+        Some(container(iced::widget::scrollable(extra)).max_height(scale.apply(320.0)).into()),
+        row![iced::widget::Space::new().width(Length::Fill), secondary_button("Close").on_press(Message::VersionsClose)]
+            .spacing(spacing::SM)
+            .into(),
+        scale,
+    )
+}
+
 /// "Open in New Window on Workspace…": a button per workspace, and the
 /// next empty one.
 fn workspace_dialog<'a>(path: &Path, list: &[(String, String)], scale: FontScale) -> Element<'a, Message> {
@@ -7114,6 +7257,7 @@ mod tests {
             compressing: None,
             tagging: None,
             picking_workspace: None,
+            versions: None,
             bulk_rename: None,
             unlocking: None,
             keyring: Arc::new(hyprforge_archive::Keyring::new()),
@@ -7271,6 +7415,30 @@ mod tests {
         });
         let _ = app.update(Message::Renamed(0, PathBuf::from("/a/old.txt"), PathBuf::from("/a/new.txt"), Ok(())));
         assert_eq!(app.last_prefs.tags["work"], [PathBuf::from("/a/new.txt")]);
+    }
+
+    /// Restore copies the old version beside the file under a name of
+    /// its own, as an ordinary copy job — the file itself is never
+    /// written over.
+    #[test]
+    fn restoring_a_version_copies_it_beside_the_file_never_over_it() {
+        use hyprforge_files_core::snapshots::{Found, Info, Version};
+        let mut app = app_for_test(&["/home/a"]);
+        let old = PathBuf::from("/home/.snapshots/7/snapshot/a/notes.txt");
+        let version = Version {
+            newest: Found {
+                info: Info { num: 7, date: "2026-10-05 14:00:00".into(), description: "timeline".into() },
+                path: old.clone(),
+                modified: None,
+                size: 3,
+            },
+            snapshots: 1,
+        };
+        app.versions = Some((PathBuf::from("/home/a/notes.txt"), Some(Ok(vec![version]))));
+        let _ = app.update(Message::VersionRestore(0));
+        assert!(app.versions.is_none(), "the sheet closes");
+        let job = app.jobs.last().expect("a copy job started");
+        assert_eq!(job.lands_at, [PathBuf::from("/home/a/notes (from 2026-10-05 14.00).txt")]);
     }
 
     /// The compositor is not told about a drag until it reaches the
