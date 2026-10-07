@@ -162,7 +162,8 @@ pub fn stream(
         let open = opener(&request.root);
         let worker_cancel = cancel.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            walk(backend.as_ref(), &request, &worker_cancel, &fence, &open, &mut |batch| found.send(batch).is_ok())
+            let tags_of = |path: &std::path::Path| crate::tag_io::file_tags(path).unwrap_or_default();
+            walk(backend.as_ref(), &request, &worker_cancel, &fence, &open, &tags_of, &mut |batch| found.send(batch).is_ok())
         });
         let mut count = 0;
         loop {

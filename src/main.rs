@@ -255,6 +255,7 @@ fn main() -> iced::Result {
         devices: hyprforge_files::devices::DeviceHost::new(hyprforge_files::devices::Backends::system(), true),
         connecting: None,
         compressing: None,
+        tagging: None,
         bulk_rename: None,
         unlocking: None,
         keyring,
@@ -549,6 +550,21 @@ enum Message {
     DragUnpacked(Result<(), String>),
     /// A drag over the window — see `dnd`.
     Dnd(hyprforge_files::dnd::DropEvent),
+    /// Each selected file's tags, read for the Tags sheet.
+    TagsLoaded(Vec<(PathBuf, Vec<String>)>),
+    /// The Tags sheet: a tag clicked, the field typed in, Enter in it,
+    /// Done, and Cancel.
+    TagToggle(usize),
+    TagTyped(String),
+    TagAdd,
+    TagsDone,
+    TagsCancel,
+    /// The sheet's writes: the files whose tags were written, and a
+    /// sentence for each that could not be.
+    TagsWritten(Vec<PathBuf>, Vec<String>),
+    /// A tag's view, read: what still has the tag, and what the index
+    /// listed that no longer does — this pane's.
+    TaggedRead(u64, String, Vec<Entry>, Vec<PathBuf>),
     /// From the desktop's notifications — see `notify`.
     Note(hyprforge_files::notify::NoteEvent),
     /// The answer to "Open as administrator" for this pane and folder:
@@ -850,6 +866,8 @@ struct App {
     connecting: Option<devices_view::Connecting>,
     /// An open "Compress\u{2026}" dialog.
     compressing: Option<Compressing>,
+    /// The "Tags…" sheet, while it is open — see `tags_sheet`.
+    tagging: Option<hyprforge_files::tags_sheet::TagSheet>,
     /// The bulk rename sheet, and the id of the tab it renames in.
     bulk_rename: Option<(u64, hyprforge_files::bulk_rename::BulkRename)>,
     /// An open password prompt for an encrypted archive.
@@ -1923,6 +1941,39 @@ impl App {
             ),
             Outcome::Pins(change) => self.change_pins(&change),
             Outcome::Stars(change) => self.change_stars(&change),
+            Outcome::ReadTagged { tag, paths } => {
+                let backend = self.backend.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let (entries, forgotten) = hyprforge_files::tag_io::read_tagged(backend.as_ref(), &tag, &paths);
+                            (tag, entries, forgotten)
+                        })
+                        .await
+                        .ok()
+                    },
+                    move |read| match read {
+                        Some((tag, entries, forgotten)) => Message::TaggedRead(pane_id, tag, entries, forgotten),
+                        None => Message::TagsCancel,
+                    },
+                )
+            }
+            Outcome::EditTags(paths) => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        paths
+                            .into_iter()
+                            .map(|p| {
+                                let tags = hyprforge_files::tag_io::file_tags(&p).unwrap_or_default();
+                                (p, tags)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .await
+                    .unwrap_or_default()
+                },
+                Message::TagsLoaded,
+            ),
             Outcome::ReadRecent => self.read_recent(at),
             Outcome::ReadStarred(paths) => self.read_starred(at, paths),
             Outcome::Search(ask) => self.search(at, ask),
@@ -3042,7 +3093,15 @@ impl App {
     /// and whatever the undo settings say — an undo depth of 0 turns off
     /// taking things back, not keeping track of what is starred.
     fn record(&mut self, done: hyprforge_files_core::undo::Undoable) -> Task<Message> {
-        let stars = self.follow_stars(done.moves());
+        let moves = done.moves();
+        // A tag is on the file and moves with it by itself; the index of
+        // what has it follows here, as the stars do.
+        let tags = if moves.is_empty() {
+            Task::none()
+        } else {
+            self.change_tags(&hyprforge_files_core::tags::TagChange::Follow(moves.clone()))
+        };
+        let stars = Task::batch([self.follow_stars(moves), tags]);
         let remembered = self.remember(done);
         Task::batch([stars, remembered])
     }
@@ -3198,6 +3257,28 @@ impl App {
         let change = change.clone();
         tasks.push(Task::perform(
             save_prefs(move |p: &mut Prefs| p.starred = hyprforge_files_core::starred::apply_star_change(&p.starred, &change)),
+            Message::PrefsSaved,
+        ));
+        Task::batch(tasks)
+    }
+
+    /// The tag index changed: every pane's sidebar follows it, a tag's
+    /// view on screen is read again, and `files.toml` keeps it — the
+    /// same road a star takes ([`App::change_stars`]).
+    fn change_tags(&mut self, change: &hyprforge_files_core::tags::TagChange) -> Task<Message> {
+        let tags = hyprforge_files_core::tags::apply(&self.last_prefs.tags, change);
+        if tags == self.last_prefs.tags {
+            return Task::none();
+        }
+        self.last_prefs.tags = tags.clone();
+        let mut tasks = Vec::with_capacity(self.tabs.len() + 1);
+        for at in self.every_pane() {
+            let outcome = self.pane_mut(at).browser.set_tags(tags.clone());
+            tasks.push(self.handle_outcome(at, outcome));
+        }
+        let change = change.clone();
+        tasks.push(Task::perform(
+            save_prefs(move |p: &mut Prefs| p.tags = hyprforge_files_core::tags::apply(&p.tags, &change)),
             Message::PrefsSaved,
         ));
         Task::batch(tasks)
@@ -4155,6 +4236,12 @@ impl App {
             // current default, and "press Enter" would then mean "open
             // with the thing that was already going to open it", which
             // is never why this dialog is up.
+            Message::KeyPressed(press) if self.tagging.is_some() => {
+                if press.key == keymap::Key::Escape {
+                    self.tagging = None;
+                }
+                Task::none()
+            }
             Message::KeyPressed(press) if self.chooser.is_some() => {
                 if press.key == keymap::Key::Escape {
                     self.chooser = None;
@@ -4439,6 +4526,74 @@ impl App {
                 self.drop_event(event)
             }
             Message::InnerDrag(event) => self.inner_drag_event(event),
+            Message::TagsLoaded(files) => {
+                let known: Vec<String> = self.last_prefs.tags.keys().cloned().collect();
+                self.tagging = Some(hyprforge_files::tags_sheet::TagSheet::open(files, known));
+                // The field has the keyboard: typing a tag is most of what
+                // the sheet is for.
+                iced::widget::operation::focus(iced::widget::Id::new(TAG_FIELD))
+            }
+            Message::TagToggle(index) => {
+                if let Some(sheet) = self.tagging.as_mut() {
+                    sheet.toggle(index);
+                }
+                Task::none()
+            }
+            Message::TagTyped(text) => {
+                if let Some(sheet) = self.tagging.as_mut() {
+                    sheet.typed = text;
+                    sheet.problem = None;
+                }
+                Task::none()
+            }
+            Message::TagAdd => {
+                if let Some(sheet) = self.tagging.as_mut() {
+                    sheet.add_typed();
+                }
+                Task::none()
+            }
+            Message::TagsCancel => {
+                self.tagging = None;
+                Task::none()
+            }
+            Message::TagsDone => {
+                let Some(sheet) = self.tagging.as_mut() else { return Task::none() };
+                // Something typed and not yet added is meant: Done adds it.
+                if !sheet.typed.trim().is_empty() {
+                    sheet.add_typed();
+                    if sheet.problem.is_some() {
+                        return Task::none();
+                    }
+                }
+                let writes = sheet.writes();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || hyprforge_files::tag_io::write_tags(writes))
+                            .await
+                            .unwrap_or_else(|e| (Vec::new(), vec![format!("Tagging was interrupted: {e}")]))
+                    },
+                    |(written, failed)| Message::TagsWritten(written, failed),
+                )
+            }
+            Message::TagsWritten(written, failed) => {
+                let Some(sheet) = self.tagging.take() else { return Task::none() };
+                if !failed.is_empty() {
+                    self.status = Some(failed.join(" "));
+                }
+                let changes = sheet.index_changes(&written);
+                Task::batch(changes.iter().map(|c| self.change_tags(c)).collect::<Vec<_>>())
+            }
+            Message::TaggedRead(pane_id, tag, entries, forgotten) => {
+                let shown = self.update(Message::Answer(pane_id, BrowserMessage::TaggedRead { tag: tag.clone(), entries }));
+                // Listed by the index and no longer tagged — taken off in
+                // another program, or the file is gone: out of the index.
+                let forgot = if forgotten.is_empty() {
+                    Task::none()
+                } else {
+                    self.change_tags(&hyprforge_files_core::tags::TagChange::Forget { tag, paths: forgotten })
+                };
+                Task::batch([shown, forgot])
+            }
             Message::Note(event) => {
                 use hyprforge_files::notify::{Note, NoteEvent};
                 match event {
@@ -4565,6 +4720,11 @@ impl App {
             Message::DeviceDone(done) => self.device_done(done),
             Message::Connect(message) => self.connect_update(message),
             Message::EscapeInField => {
+                // Escape in the Tags sheet's field closes the sheet.
+                if self.tagging.is_some() {
+                    self.tagging = None;
+                    return Task::none();
+                }
                 // The Connect to Server dialog's fields keep Escape: it
                 // stops an attempt, or closes the dialog.
                 if self.connecting.is_some() {
@@ -5207,6 +5367,9 @@ impl App {
         if let Some(compressing) = &self.compressing {
             return iced::widget::stack![window, compress_dialog(compressing, scale)].into();
         }
+        if let Some(sheet) = &self.tagging {
+            return iced::widget::stack![window, tags_dialog(sheet, scale)].into();
+        }
         if let Some(chooser) = &self.chooser {
             return iced::widget::stack![window, chooser_dialog(chooser, scale)].into();
         }
@@ -5696,6 +5859,65 @@ fn unlock_dialog<'a>(unlocking: &Unlocking, scale: FontScale) -> Element<'a, Mes
 /// extension is not the person's to choose — it follows the format, and
 /// a name and a format that disagree is precisely the confusion
 /// `hyprforge_archive::format` spends a module resolving.
+/// The Tags sheet's field, which has the keyboard when it opens.
+const TAG_FIELD: &str = "tags-new";
+
+/// The Tags sheet — see `hyprforge_files::tags_sheet`. A row per tag,
+/// marked by how many of the selection have it; a field for a new one.
+fn tags_dialog<'a>(sheet: &hyprforge_files::tags_sheet::TagSheet, scale: FontScale) -> Element<'a, Message> {
+    use hyprforge_files::tags_sheet::Mark;
+    let body = match sheet.files.len() {
+        1 => "Tags are kept on the file, so they go wherever it does.".to_string(),
+        n => format!("For {n} items. A dash means some of them have it; a click puts it on all of them."),
+    };
+    let mut list = column![].spacing(2.0);
+    for (index, (tag, mark)) in sheet.choices.iter().enumerate() {
+        let sign = match mark {
+            Mark::All => "\u{2713}",
+            Mark::Some => "\u{2013}",
+            Mark::None => " ",
+        };
+        let chosen = *mark != Mark::None;
+        list = list.push(
+            button(
+                row![
+                    container(scaled_text(sign, BASE_TEXT_SIZE, scale)).width(Length::Fixed(scale.apply(18.0))),
+                    scaled_text(tag.clone(), BASE_TEXT_SIZE, scale),
+                ]
+                .spacing(spacing::SM)
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([spacing::XS as u16, spacing::SM as u16])
+            .on_press(Message::TagToggle(index))
+            .style(move |t: &Theme, status| hyprforge_files_core::browser::selectable_row_style(t, status, chosen)),
+        );
+    }
+    let field = iced::widget::text_input("New tag", &sheet.typed)
+        .id(iced::widget::Id::new(TAG_FIELD))
+        .on_input(Message::TagTyped)
+        .on_submit(Message::TagAdd)
+        .size(scale.apply(BASE_TEXT_SIZE))
+        .width(Length::Fill);
+    let mut extra = column![container(iced::widget::scrollable(list)).max_height(scale.apply(260.0)), field].spacing(spacing::SM);
+    if let Some(problem) = sheet.problem {
+        extra = extra.push(scaled_text(problem, BASE_TEXT_SIZE, scale).color(hyprforge_ui::theme::warning()));
+    }
+    dialog(
+        "Tags".to_string(),
+        body,
+        Some(extra.into()),
+        row![
+            iced::widget::Space::new().width(Length::Fill),
+            secondary_button("Cancel").on_press(Message::TagsCancel),
+            primary_button("Done").on_press(Message::TagsDone),
+        ]
+        .spacing(spacing::SM)
+        .into(),
+        scale,
+    )
+}
+
 fn compress_dialog<'a>(compressing: &Compressing, scale: FontScale) -> Element<'a, Message> {
     let count = compressing.sources.len();
     let body = match count {
@@ -6745,6 +6967,7 @@ mod tests {
             ),
             connecting: None,
             compressing: None,
+            tagging: None,
             bulk_rename: None,
             unlocking: None,
             keyring: Arc::new(hyprforge_archive::Keyring::new()),
@@ -6861,6 +7084,47 @@ mod tests {
         let app = app_for_test(&["/root"]);
         assert!(app.admin.is_none());
         assert!(!app.pane_elevated(app.tabs[0].panes[0].id));
+    }
+
+    /// A finished Tags sheet reaches every tab's index, and the sidebar
+    /// with it — the window keeps one list, as it does for stars.
+    #[test]
+    fn tags_written_by_the_sheet_reach_every_tab() {
+        let mut app = app_for_test(&["/a", "/b"]);
+        let _ = app.update(Message::TagsLoaded(vec![(PathBuf::from("/a/x.txt"), Vec::new())]));
+        let _ = app.update(Message::TagTyped("work".into()));
+        let _ = app.update(Message::TagAdd);
+        let _ = app.update(Message::TagsWritten(vec![PathBuf::from("/a/x.txt")], Vec::new()));
+        assert!(app.tagging.is_none(), "the sheet closes");
+        assert_eq!(app.last_prefs.tags["work"], [PathBuf::from("/a/x.txt")]);
+        for tab in &app.tabs {
+            assert_eq!(tab.browser().prefs().tags["work"], [PathBuf::from("/a/x.txt")]);
+        }
+    }
+
+    /// A file that could not take a tag (a FAT stick) is said, and kept
+    /// out of the index.
+    #[test]
+    fn a_file_that_could_not_be_tagged_is_said_and_not_indexed() {
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.update(Message::TagsLoaded(vec![(PathBuf::from("/stick/x.txt"), Vec::new())]));
+        let _ = app.update(Message::TagTyped("work".into()));
+        let _ = app.update(Message::TagAdd);
+        let _ = app.update(Message::TagsWritten(Vec::new(), vec!["x.txt is on a drive that can't hold tags.".into()]));
+        assert!(app.status.as_deref().is_some_and(|s| s.contains("can't hold tags")));
+        assert!(app.last_prefs.tags.is_empty());
+    }
+
+    /// The index follows a rename made in Files, as the stars do.
+    #[test]
+    fn a_tag_follows_a_rename_made_here() {
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.change_tags(&hyprforge_files_core::tags::TagChange::Add {
+            tag: "work".into(),
+            paths: vec![PathBuf::from("/a/old.txt")],
+        });
+        let _ = app.update(Message::Renamed(0, PathBuf::from("/a/old.txt"), PathBuf::from("/a/new.txt"), Ok(())));
+        assert_eq!(app.last_prefs.tags["work"], [PathBuf::from("/a/new.txt")]);
     }
 
     /// The compositor is not told about a drag until it reaches the

@@ -77,6 +77,11 @@ deleting, which there skips the Trash and always asks first. It is a
 separate small helper, `hyprforge-files-admin`, that does only those
 things; the window itself never runs as root.
 
+**Tags** — "Tags…" on a file's menu puts words on it, kept on the file
+itself the way Dolphin keeps them, so they survive renames, moves and
+copies and the two apps see each other's. Each tag is a row under Tags
+in the sidebar, and `tag:work` finds them in a search.
+
 **Undo** shows what it is holding: the notice after an operation has a
 History button, and so do the palette and the empty-space menu ("Undo
 History"), listing everything Ctrl+Z can still take back, newest first.

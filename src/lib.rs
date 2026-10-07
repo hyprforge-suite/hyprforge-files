@@ -49,6 +49,8 @@ pub mod search_jobs;
 pub mod session;
 pub mod start;
 pub mod system_clipboard;
+pub mod tag_io;
+pub mod tags_sheet;
 pub mod tabstrip;
 pub mod terminal;
 pub mod transfers;

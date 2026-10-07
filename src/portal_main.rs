@@ -617,6 +617,23 @@ impl Dialog {
                     |(entries, missing)| Message::Browser(BrowserMessage::StarredRead { entries, missing }),
                 )
             }
+            // A tag's view, as in the window: what still has the tag.
+            // What no longer does is left for Files to forget — the
+            // dialog only reads the index, as it only reads the stars.
+            Outcome::ReadTagged { tag, paths } => {
+                let backend = self.backend.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let (entries, _) = hyprforge_files::tag_io::read_tagged(backend.as_ref(), &tag, &paths);
+                            (tag, entries)
+                        })
+                        .await
+                        .unwrap_or_default()
+                    },
+                    |(tag, entries)| Message::Browser(BrowserMessage::TaggedRead { tag, entries }),
+                )
+            }
             // "Unstar them" in the Starred view: the same read-modify-write
             // as a saved search from here, so Files sees it next time.
             Outcome::Stars(change) => Task::perform(

@@ -71,6 +71,7 @@ pub fn facts_of(path: &Path, db: &MimeDb) -> Result<Facts, String> {
         // changes the file it points at — which is not what the boxes
         // beside a link's name would appear to change.
         can_change_mode: !is_link && (euid == 0 || euid == uid),
+        tags: crate::tag_io::file_tags(path).unwrap_or_default(),
     })
 }
 

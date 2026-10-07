@@ -443,7 +443,7 @@ sidebar's. With nothing selected it describes the folder in view.
   disk and nothing changes. The Trash is described but read-only, and
   opens nothing.
 
-Left out: the Git tab (Git is deferred), tags (deferred) and the
+Left out: the Git tab (Git is deferred) and the
 checksum, which reads the whole file to answer a question nobody asked
 by opening Properties.
 
@@ -1073,6 +1073,41 @@ off, the batch landing with all six selected under their new names and
 contents, and inside a zip a find & replace of two members as one
 rewrite, both left selected.
 
+## Tags — built
+
+A tag lives **on the file**, in the `user.xdg.tags` extended attribute —
+comma-separated, the spelling Dolphin and Baloo write — so it goes
+wherever the file does, a file tagged in Dolphin shows its tags here,
+and the other way round (`hyprforge_files_core::tags`).
+
+- **Copies keep tags.** `hyprforge-fileops` now carries a file's and a
+  folder's `user.*` attributes across a copy (`xattr.rs`), best-effort
+  like permissions and times; `security.*`, `trusted.*` and ACLs stay
+  where they were. A rename keeps them by itself.
+- **The index.** The attribute answers "what tags does this have", never
+  "what has this tag" — that would mean reading the disk. So `files.toml`
+  keeps `[tags]`, what Files tagged, following moves made in Files the
+  way stars do. It is only an index: a tag's view checks each file's
+  attribute as it reads it, and one whose tag was taken off elsewhere,
+  or that is gone, drops out ("Nothing has this tag any more").
+- **In the window.** "Tags…" on a selection's menu (and Edit beside Tags
+  in Properties) opens a sheet listing the selection's tags and every
+  indexed one — a tick for all of them, a dash for some — with a field
+  for a new one, which has the keyboard. Nothing is written until Done,
+  and only to files that change. A drive with no attributes (FAT, most
+  phones) says so per file. The sidebar gets a Tags section, one row per
+  tag with its count, each a collection like Starred; the open/save
+  dialog lists and opens them too.
+- **Search.** `tag:work` (and `-tag:work`) is answered by the search walk
+  from each candidate's attribute, before any `content:` read; like
+  `content:` it walks even in "This folder". So `tag:work` from Home is
+  how tags set in another program are found.
+
+Checked in a nested compositor: tagging through the menu and the sheet
+wrote `user.xdg.tags="work"` (read back with `getfattr`), the Tags
+section appeared with its count, the tag's view listed the file, and
+after `setfattr -x` outside Files the view said so and the index forgot it.
+
 ## Recent and Starred — built
 
 Two sidebar rows at the top of Places, each a question rather than a
@@ -1130,8 +1165,8 @@ Preferences.
 Named so nothing here is mistaken for an oversight:
 
 - **Git** — decided above. Removes five pieces of five artboards.
-- **Tags** — no design exists for where a tag is stored or what happens when
-  the file moves. Removes the Tags sidebar section and the pink role.
+- **Tags** — built since; see "Tags — built" below. The pink role was not
+  needed: a tag row is drawn like Starred's, in `info`.
 - **The terminal drawer (`1i`)** — the most cuttable thing in the document, and
   the one with a good alternative: opening a terminal at the current directory
   is one keybind and does not need a drawer. That keybind is built — F4,
