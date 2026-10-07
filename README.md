@@ -63,6 +63,13 @@ Finder and Dolphin do, with Ctrl+F (in either mode) putting the keyboard
 in the search field. The status bar says how much **free space** is left
 on the folder's disk, and refreshes after a paste or a delete.
 
+**Open as administrator** — a folder you may not read offers it. One
+password (through polkit) and the tab browses and changes it as root,
+under a banner saying so: copying in, moving, renaming, new folders and
+deleting, which there skips the Trash and always asks first. It is a
+separate small helper, `hyprforge-files-admin`, that does only those
+things; the window itself never runs as root.
+
 **Undo** shows what it is holding: the notice after an operation has a
 History button, and so do the palette and the empty-space menu ("Undo
 History"), listing everything Ctrl+Z can still take back, newest first.
@@ -173,8 +180,10 @@ branch on which host it is in.
 What this crate owns is the window around it, and the things a dialog
 deliberately does not have: launching what you double-click, file
 operations, the transfers popover and queue view, the archive jobs, the system clipboard,
-drag and drop with other applications, and connecting to a server
-(`connect.rs`). Reading what the listing,
+drag and drop with other applications, connecting to a server
+(`connect.rs`), and administrator access — the third binary,
+`hyprforge-files-admin`, which `pkexec` runs (`admin.rs`, and the window's
+end in `admin_client.rs` and `admin_jobs.rs`). Reading what the listing,
 the preview pane and the thumbnails show is `host.rs`, shared with the
 dialog — the second binary here, `hyprforge-files-portal` — and so is
 watching drives and shares (`devices.rs`): a stick can be opened, and

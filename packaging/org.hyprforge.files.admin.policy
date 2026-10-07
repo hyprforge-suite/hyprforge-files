@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Files' administrator helper — see src/admin.rs. pkexec matches an
+  action to a program by `exec.path`, so this one covers exactly
+  hyprforge-files-admin and nothing else.
+
+  auth_admin_keep: one password covers the next few minutes of an
+  elevated tab, the way a sudo timestamp does, rather than one prompt
+  per listing. Nothing here is allowed without authenticating: not for
+  inactive sessions, not for remote ones.
+
+  The path is /usr/bin's, as the package installs it. A source install
+  (./hyprforge) writes its own copy naming /usr/local/bin.
+-->
+<policyconfig>
+  <vendor>Hyprforge</vendor>
+  <vendor_url>https://github.com/hyprforge-suite</vendor_url>
+  <action id="org.hyprforge.files.admin">
+    <description>Browse and change files as administrator</description>
+    <message>Files needs administrator access to open or change this folder</message>
+    <icon_name>system-file-manager</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/hyprforge-files-admin</annotate>
+  </action>
+</policyconfig>

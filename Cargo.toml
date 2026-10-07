@@ -23,6 +23,13 @@ path = "src/main.rs"
 name = "hyprforge-files-portal"
 path = "src/portal_main.rs"
 
+# The administrator helper, run through pkexec — see `src/admin.rs`. Its
+# own binary so the window never runs as root, and in this crate so it
+# ships in the same package as the window that starts it.
+[[bin]]
+name = "hyprforge-files-admin"
+path = "src/admin_main.rs"
+
 [dependencies]
 # The browser view itself lives in hyprforge-files-core, because the
 # portal's open/save dialog has to render the same one. This crate is

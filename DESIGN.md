@@ -755,8 +755,12 @@ Still not built, each for its reason:
 - **Completed/Failed tabs.** The queue view's one list, newest first,
   with a coloured outcome per row, is short enough for a session; tabs
   would hide a failure behind a click.
-- **"Retry as root".** Privilege escalation is not something this suite
-  does.
+- **"Retry as administrator"** on a failed job. Folders can be opened
+  as administrator now (see "Administrator access" below), and a paste
+  into one goes through the helper; offering it on a job that already
+  failed needs `OpsError`'s permission kinds carried through
+  `JobSummary` as kinds rather than sentences, so the button can be
+  offered only where it would help.
 - **"Queue survives window close · resumes on reconnect".** Jobs are threads
   in this process, and the remote transfers that line is really about need
   phase I's mounts.
@@ -1223,7 +1227,7 @@ Not yet:
 - attaching to the window that asked (`parent_window` needs xdg-foreign,
   which winit cannot import)
 
-## Dropping onto Files — built, and blocked on Hyprland
+## Dropping onto Files — built, and blocked on Hyprland for other applications
 
 `hyprforge-files-core::drop` decides where a drop lands and what it does:
 
@@ -1646,6 +1650,62 @@ Checked in a nested compositor at 1.25 scale with a virtual pointer: a
 band across the grid, the automatic scroll past the bottom edge with the
 anchor riding the content, a click clearing, the history popover from
 the palette, "ro" jumping to `romeo.txt` and Ctrl+F then searching.
+
+## Administrator access — built
+
+This suite said privilege escalation was not something it does. For a
+file manager that stopped being an answer: `/etc`, `/usr/share` and
+another user's folder are places a person sometimes has to go, and every
+other file manager has a way in. So there is one, kept as narrow as it
+can be made (`src/admin.rs`, `src/admin_client.rs`, `src/admin_jobs.rs`):
+
+- **A separate program**, `hyprforge-files-admin`, run through `pkexec`.
+  The window — renderer, fonts, D-Bus, decoders of untrusted files —
+  never runs as root, and polkit asks for the password, not this suite.
+  `packaging/org.hyprforge.files.admin.policy` names the helper's path
+  with `auth_admin_keep`, so one password covers the next few minutes.
+- **Eight operations**: list, stat, count, copy, move, rename, make a
+  folder, delete — each the same `hyprforge-listing` / `hyprforge-fileops`
+  code the unprivileged paths run. No shell, no reading contents back.
+  JSON lines over the pipe; paths that are not UTF-8 travel as bytes.
+- **Refused before anything is touched**, each in a sentence: a relative
+  path, a path through `..`, and any change to `/` or a folder directly
+  under it — no slip of a hand deletes `/usr`.
+- **It leaves**: when the window's end closes, or after five minutes with
+  nothing asked. A copy in progress when the window goes is finished
+  rather than left half-written into a system folder.
+- **Bounded waits**: two minutes for the password, ten seconds for a
+  listing after that, and two minutes *between lines* for a change — a
+  copy reports progress several times a second, so it is cut off only
+  for going quiet. A dismissed prompt (pkexec's 126) is its own sentence,
+  "Administrator access wasn't given", never an error dump.
+
+**In the window.** A folder this user cannot read says so with an "Open
+as administrator" button. The browser shows it only when the host says
+`Admin::Offered` — never from `Mode`, because the view takes nothing that
+says which host it is in, and the dialog never offers it. Once the
+password is given the pane is elevated: a warning-coloured banner says
+"changes here affect the whole system", and the pane reads through an
+`AdminBackend` — an `FsBackend` over the helper — so listings, counts
+and path completion need no change above it. In that pane:
+
+- a paste (or drop) lands through the helper as its own job kind,
+  `QueuedWork::Admin`, reporting the same events, so progress and Cancel
+  work. Conflicts are asked about before each item is sent rather than
+  during, since the helper cannot stop and ask;
+- rename and New Folder go through the helper;
+- the Trash becomes a delete, always asked about — a root-owned file in
+  this user's Trash is one they could never restore;
+- bulk rename, compress and extract say they are not available as
+  administrator;
+- nothing is offered to Undo, which would run as this user.
+
+Tested unprivileged: the refusal rules, the wire format (a listing over
+it equals the ordinary backend's), the real helper binary driven
+through `Session` with no pkexec in between, and pkexec's 126 read as a
+dismissed prompt. Not tested automatically, deliberately: a real pkexec
+round trip, which puts a password prompt on the session running the
+tests.
 
 ## What to verify, not assume
 

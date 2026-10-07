@@ -218,6 +218,10 @@ fn main() -> iced::Result {
     let (mut browser, outcome) =
         Browser::new(Mode::App, prefs.clone(), start_dir, sidebar_items.clone());
     browser.set_config(config.clone());
+    let admin = hyprforge_files::admin_client::AdminBackend::installed().map(Arc::new);
+    if admin.is_some() {
+        let _ = browser.update(BrowserMessage::SetAdmin(hyprforge_files_core::Admin::Offered));
+    }
     let mut app = App {
         home_dir: backend.home_dir(),
         backend,
@@ -237,6 +241,7 @@ fn main() -> iced::Result {
         session: Default::default(),
         clipboard: Arc::new(hyprforge_files::system_clipboard::SystemClipboard::new()),
         drag: Arc::new(hyprforge_files::dnd::Dnd::new()),
+        admin,
         // A handful of small files, read once before the window opens —
         // the same budget the sidebar's `stat`s already spend here. It
         // is not the per-double-click cost it would be if a chooser
@@ -535,6 +540,9 @@ enum Message {
     DragUnpacked(Result<(), String>),
     /// A drag over the window — see `dnd`.
     Dnd(hyprforge_files::dnd::DropEvent),
+    /// The answer to "Open as administrator" for this pane and folder:
+    /// the helper is running and authorised, or a sentence why not.
+    AdminOpened(u64, PathBuf, Result<(), String>),
     /// The pointer or Escape, during a drag that has not left the window
     /// — see `inner_drag`.
     InnerDrag(hyprforge_files::inner_drag::DragEvent),
@@ -802,6 +810,10 @@ struct App {
     /// window exists — see `dnd`'s module doc for why it cannot wait
     /// for the first drag.
     drag: Arc<hyprforge_files::dnd::Dnd>,
+    /// The administrator helper, if it is installed — see
+    /// `hyprforge_files::admin`. An elevated pane reads through it
+    /// instead of `backend` ([`App::backend_for`]).
+    admin: Option<Arc<hyprforge_files::admin_client::AdminBackend>>,
     /// Pastes in progress, oldest first.
     jobs: Vec<RunningJob>,
     /// A trash or delete waiting on the confirmation dialog.
@@ -1460,6 +1472,11 @@ enum QueuedWork {
         work: archive_jobs::Work,
         unlock: hyprforge_archive::Unlock,
     },
+    /// A paste into an elevated pane's folder, done by the
+    /// administrator helper — see `hyprforge_files::admin_jobs`.
+    Admin {
+        steps: Vec<hyprforge_files_core::clipboard::PasteStep>,
+    },
 }
 
 impl Queued {
@@ -1469,7 +1486,7 @@ impl Queued {
     /// archive must not run together, whatever else is going on.
     fn archive(&self) -> Option<&Path> {
         match &self.what {
-            QueuedWork::Paste { .. } => None,
+            QueuedWork::Paste { .. } | QueuedWork::Admin { .. } => None,
             QueuedWork::Archive { work, .. } => work.archive(),
         }
     }
@@ -1478,7 +1495,7 @@ impl Queued {
     /// which [`Queued::archive`] covers.
     fn lands_at(&self) -> impl Iterator<Item = &Path> {
         let steps: &[hyprforge_files_core::clipboard::PasteStep] = match &self.what {
-            QueuedWork::Paste { steps } => steps,
+            QueuedWork::Paste { steps } | QueuedWork::Admin { steps } => steps,
             QueuedWork::Archive { .. } => &[],
         };
         steps.iter().map(|step| step.dest.as_path())
@@ -1489,7 +1506,7 @@ impl Queued {
     fn subject(&self) -> String {
         match (&self.what, &self.kind) {
             (QueuedWork::Paste { steps }, JobKind::Restore { .. }) => transfers::restore_subject(steps),
-            (QueuedWork::Paste { steps }, _) => transfers::paste_subject(steps),
+            (QueuedWork::Paste { steps } | QueuedWork::Admin { steps }, _) => transfers::paste_subject(steps),
             (QueuedWork::Archive { work, .. }, _) => transfers::archive_subject(work),
         }
     }
@@ -1661,12 +1678,39 @@ impl App {
             .collect()
     }
 
+    /// Whether a paste into `dir` lands in an elevated pane's folder —
+    /// the folder it shows, or one below it — and so goes through the
+    /// administrator helper.
+    fn lands_elevated(&self, dir: &Path) -> bool {
+        self.admin.is_some()
+            && self
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.panes)
+                .any(|pane| pane.browser.elevated() && dir.starts_with(pane.browser.current_dir()))
+    }
+
+    /// Whether the pane with this id is an elevated one.
+    fn pane_elevated(&self, pane_id: u64) -> bool {
+        self.admin.is_some() && self.locate(pane_id).is_some_and(|at| self.pane(at).browser.elevated())
+    }
+
+    /// What a pane reads through: the helper for an elevated one, the
+    /// ordinary backend otherwise.
+    fn backend_for(&self, at: At) -> Arc<dyn FsBackend> {
+        match &self.admin {
+            Some(admin) if self.pane(at).browser.elevated() => admin.clone(),
+            _ => self.backend.clone(),
+        }
+    }
+
     fn spawn_read_dir(&mut self, at: At, path: PathBuf) -> Task<Message> {
+        let backend = self.backend_for(at);
         let pane = self.pane_mut(at);
         pane.read_generation += 1;
         let generation = pane.read_generation;
         let pane_id = pane.id;
-        Task::perform(read_dir_task(self.backend.clone(), path.clone()), move |result| {
+        Task::perform(read_dir_task(backend, path.clone()), move |result| {
             Message::DirLoaded(pane_id, generation, path.clone(), result)
         })
     }
@@ -1683,7 +1727,7 @@ impl App {
         }
         pane.resolving = true;
         let pane_id = pane.id;
-        let backend = self.backend.clone();
+        let backend = self.backend_for(at);
         let text = request.text.clone();
         Task::perform(
             async move {
@@ -1870,7 +1914,7 @@ impl App {
                 Task::perform(measure_space(path), move |space| Message::Answer(pane_id, BrowserMessage::SpaceMeasured(at, space)))
             }
             Outcome::CountFolders(folders) => {
-                Task::perform(count_folders(self.backend.clone(), folders), move |counts| {
+                Task::perform(count_folders(self.backend_for(at), folders), move |counts| {
                     Message::Answer(pane_id, BrowserMessage::CountsLoaded(counts))
                 })
             }
@@ -1878,7 +1922,7 @@ impl App {
             // fills in without waiting on the others. The browser drops an
             // answer for a pane it no longer shows.
             Outcome::ReadColumns(dirs) => Task::batch(dirs.into_iter().map(|dir| {
-                Task::perform(read_dir_task(self.backend.clone(), dir.clone()), move |result| {
+                Task::perform(read_dir_task(self.backend_for(at), dir.clone()), move |result| {
                     Message::Answer(pane_id, BrowserMessage::ColumnLoaded(dir.clone(), result))
                 })
             })),
@@ -1900,6 +1944,10 @@ impl App {
                     members.into_iter().map(hyprforge_archive::Edit::Remove).collect()
                 }, paths)
             }
+            // As administrator there is no Trash to put things in that
+            // this user could take them back out of — see `admin` — so
+            // it is a delete, always asked about first.
+            Outcome::Trash(paths) if self.pane_elevated(pane_id) => self.remove(at, Removal::Delete, paths, true),
             Outcome::Trash(paths) => {
                 let ask = self.config.behaviour.confirm_trash;
                 self.remove(at, Removal::Trash, paths, ask)
@@ -1922,6 +1970,14 @@ impl App {
             Outcome::DeletePermanently(paths) => {
                 let ask = self.config.behaviour.confirm_delete;
                 self.remove(at, Removal::Delete, paths, ask)
+            }
+            // The helper copies, moves, renames, makes folders and
+            // deletes; nothing else is done as administrator.
+            Outcome::BulkRename(_) | Outcome::Extract { .. } | Outcome::ExtractMembers { .. } | Outcome::Compress { .. }
+                if self.pane_elevated(pane_id) =>
+            {
+                self.status = Some("That isn't available as administrator — only copying, moving, renaming, new folders and deleting are.".to_string());
+                Task::none()
             }
             Outcome::Extract { archives, to } => {
                 self.start_archive_job(archive_jobs::Work::Extract { archives, into: to })
@@ -2058,6 +2114,7 @@ impl App {
             }
             Outcome::CopyText(text) => iced::clipboard::write(text),
             Outcome::DragOut(paths) => self.begin_drag(paths),
+            Outcome::OpenAsAdmin(path) => self.open_as_admin(at, path),
             Outcome::Paste(into) => self.read_clipboard_for(into),
             Outcome::ToOtherPane(clip) => self.paste_in_other_pane(at, clip),
             Outcome::ResolvePath(request) => self.spawn_resolve(at, request),
@@ -2088,6 +2145,20 @@ impl App {
                     edits: vec![hyprforge_archive::Edit::Rename { from: member, to: target }],
                 })
             }
+            Outcome::Rename { from, to } if self.pane_elevated(pane_id) => {
+                let admin = self.admin.clone();
+                Task::perform(
+                    async move {
+                        let op = hyprforge_files::admin::Op::Rename {
+                            from: hyprforge_files::admin::WirePath::from(from.as_path()),
+                            to: hyprforge_files::admin::WirePath::from(to.as_path()),
+                        };
+                        let result = admin_change(admin, op).await;
+                        (from, to, result)
+                    },
+                    move |(from, to, result)| Message::Renamed(pane_id, from, to, result),
+                )
+            }
             Outcome::Rename { from, to } => {
                 Task::perform(
                     async move {
@@ -2101,6 +2172,17 @@ impl App {
                 )
             }
             Outcome::BulkRename(request) => self.open_bulk_rename(at, request),
+            Outcome::CreateFolder(path) if self.pane_elevated(pane_id) => {
+                let admin = self.admin.clone();
+                Task::perform(
+                    async move {
+                        let op = hyprforge_files::admin::Op::Mkdir { path: hyprforge_files::admin::WirePath::from(path.as_path()) };
+                        let result = admin_change(admin, op).await;
+                        (path, result)
+                    },
+                    move |(path, result)| Message::FolderCreated(pane_id, path, result),
+                )
+            }
             Outcome::CreateFolder(path) => {
                 Task::perform(
                     async move {
@@ -2359,12 +2441,12 @@ impl App {
         }
         let id = self.next_job_id;
         self.next_job_id += 1;
-        self.enqueue(Queued {
-            id,
-            kind: JobKind::of(clip.verb),
-            dirs,
-            what: QueuedWork::Paste { steps: plan.steps },
-        })
+        let what = if self.lands_elevated(&dirs[0]) {
+            QueuedWork::Admin { steps: plan.steps }
+        } else {
+            QueuedWork::Paste { steps: plan.steps }
+        };
+        self.enqueue(Queued { id, kind: JobKind::of(clip.verb), dirs, what })
     }
 
     /// Starts putting trashed items back, once their records are found.
@@ -2616,11 +2698,11 @@ impl App {
         let Queued { id, kind, dirs, what } = queued;
         let archive = match &what {
             QueuedWork::Archive { work, .. } => work.archive().map(Path::to_path_buf),
-            QueuedWork::Paste { .. } => None,
+            QueuedWork::Paste { .. } | QueuedWork::Admin { .. } => None,
         };
         let retry = match &what {
             QueuedWork::Archive { work, .. } => transfers_view::retryable(work).then(|| work.clone()),
-            QueuedWork::Paste { .. } => None,
+            QueuedWork::Paste { .. } | QueuedWork::Admin { .. } => None,
         };
         self.transfers.batch.started(id);
         let on_conflict = self.config.behaviour.on_conflict;
@@ -2629,6 +2711,13 @@ impl App {
             QueuedWork::Archive { work, unlock } => {
                 archive_jobs::start(id, work, on_conflict, unlock)
             }
+            QueuedWork::Admin { steps } => match self.admin.clone() {
+                Some(admin) => hyprforge_files::admin_jobs::start(id, steps, on_conflict, admin),
+                // Only ever queued while the helper is there; should it
+                // somehow not be, the job finishes at once, having done
+                // nothing.
+                None => hyprforge_files::admin_jobs::start(id, Vec::new(), on_conflict, Arc::new(Default::default())),
+            },
         };
         self.jobs.push(RunningJob {
             id,
@@ -2835,6 +2924,12 @@ impl App {
             }),
             // Nothing to take back from either — which is what their
             // confirmation dialogs say.
+            Removal::Delete if self.pane_elevated(tab_id) => {
+                let admin = self.admin.clone();
+                Task::perform(admin_delete_many(admin, paths), move |errors| {
+                    Message::TrashDone(tab_id, dir.clone(), Vec::new(), errors)
+                })
+            }
             Removal::Delete => Task::perform(delete_many(paths), move |errors| {
                 Message::TrashDone(tab_id, dir.clone(), Vec::new(), errors)
             }),
@@ -2854,11 +2949,11 @@ impl App {
         path: PathBuf,
         result: Result<(), String>,
         rename_next: bool,
-        done: hyprforge_files_core::undo::Undoable,
+        done: Option<hyprforge_files_core::undo::Undoable>,
     ) -> Task<Message> {
-        let noticed = match &result {
-            Ok(()) => self.record(done),
-            Err(_) => Task::none(),
+        let noticed = match (&result, done) {
+            (Ok(()), Some(done)) => self.record(done),
+            _ => Task::none(),
         };
         let Some(at) = self.locate(pane_id) else {
             return noticed;
@@ -3290,6 +3385,33 @@ impl App {
         )
     }
 
+    /// Asks the helper for `path` — which is when the password prompt
+    /// appears — and, once it answers, makes the pane an elevated one.
+    /// Nothing changes until then: a dismissed prompt leaves the pane
+    /// exactly as it was, with a line saying so.
+    fn open_as_admin(&mut self, at: At, path: PathBuf) -> Task<Message> {
+        let Some(admin) = self.admin.clone() else { return Task::none() };
+        let pane_id = self.pane(at).id;
+        self.status = Some("Waiting for the password…".to_string());
+        let asked = path.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    use hyprforge_files::admin::{Body, Op, WirePath};
+                    match admin.ask(Op::Stat { path: WirePath::from(asked.as_path()) }, |_, _| {}) {
+                        Ok(Body::Entry { .. }) => Ok(()),
+                        Ok(Body::Failed { why, .. } | Body::Refused { why }) => Err(why),
+                        Ok(_) => Err("The administrator helper gave an answer that doesn't fit.".to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Asking for administrator access was interrupted: {e}")))
+            },
+            move |result| Message::AdminOpened(pane_id, path.clone(), result),
+        )
+    }
+
     /// A drag starts here, in the window — see `inner_drag`. Nothing is
     /// asked of the compositor until the pointer reaches the edge.
     fn begin_drag(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
@@ -3532,6 +3654,9 @@ impl App {
         browser.set_can_paste(self.clipboard.may_hold_files());
         let _ = browser.update(BrowserMessage::PinnedLoaded(self.pinned_items.clone()));
         let _ = browser.update(BrowserMessage::DevicesChanged(self.devices.snapshot()));
+        if self.admin.is_some() {
+            let _ = browser.update(BrowserMessage::SetAdmin(hyprforge_files_core::Admin::Offered));
+        }
         (browser, outcome)
     }
 
@@ -4112,6 +4237,20 @@ impl App {
                 self.drop_event(event)
             }
             Message::InnerDrag(event) => self.inner_drag_event(event),
+            Message::AdminOpened(pane_id, path, result) => {
+                let Some(at) = self.locate(pane_id) else { return Task::none() };
+                match result {
+                    Ok(()) => {
+                        self.status = None;
+                        let _ = self.pane_mut(at).browser.update(BrowserMessage::SetAdmin(hyprforge_files_core::Admin::Elevated));
+                        self.spawn_read_dir(at, path)
+                    }
+                    Err(why) => {
+                        self.status = Some(why);
+                        Task::none()
+                    }
+                }
+            }
             Message::DropHit(hit, None) => {
                 tracing::debug!(?hit, "a drag is over");
                 self.drop_probe.0 = false;
@@ -4162,13 +4301,16 @@ impl App {
                 Task::none()
             }
             Message::Job(event) => self.job_event(event),
+            // Nothing done as administrator is offered to Undo: it would
+            // run as this user, who cannot take it back.
             Message::Renamed(tab_id, from, to, result) => {
-                let done = hyprforge_files_core::undo::Undoable::Renamed { from, to: to.clone() };
+                let done = (!self.pane_elevated(tab_id))
+                    .then(|| hyprforge_files_core::undo::Undoable::Renamed { from, to: to.clone() });
                 self.name_changed(tab_id, to, result, false, done)
             }
             // A new folder goes straight into being named.
             Message::FolderCreated(tab_id, path, result) => {
-                let done = hyprforge_files_core::undo::Undoable::MadeFolder(path.clone());
+                let done = (!self.pane_elevated(tab_id)).then(|| hyprforge_files_core::undo::Undoable::MadeFolder(path.clone()));
                 self.name_changed(tab_id, path, result, true, done)
             }
             Message::Confirm => match self.confirm.take() {
@@ -6032,6 +6174,50 @@ async fn trash_many(paths: Vec<PathBuf>) -> (Vec<(PathBuf, PathBuf, PathBuf)>, V
 /// Deletes `paths` for good, off the UI thread. Anything in the Trash is
 /// erased with its record, so the Trash does not go on listing a file
 /// that is gone; anything else is removed without following symlinks.
+/// One change through the administrator helper, off the UI thread: a
+/// rename or a new folder. `Err` is a sentence.
+async fn admin_change(
+    admin: Option<Arc<hyprforge_files::admin_client::AdminBackend>>,
+    op: hyprforge_files::admin::Op,
+) -> Result<(), String> {
+    use hyprforge_files::admin::Body;
+    let Some(admin) = admin else { return Err("The administrator helper isn't installed.".to_string()) };
+    tokio::task::spawn_blocking(move || match admin.ask(op, |_, _| {}) {
+        Ok(Body::Done) => Ok(()),
+        Ok(Body::Failed { why, .. } | Body::Refused { why }) => Err(why),
+        Ok(other) => Err(format!("The administrator helper gave an answer that doesn't fit: {other:?}")),
+        Err(e) => Err(e.to_string()),
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("The change was interrupted: {e}")))
+}
+
+/// [`delete_many`], as administrator — each path deleted for good by the
+/// helper, one sentence per one that was not. Stops at the first failure
+/// that is the helper's rather than the file's: without it, nothing
+/// after would go any better.
+async fn admin_delete_many(admin: Option<Arc<hyprforge_files::admin_client::AdminBackend>>, paths: Vec<PathBuf>) -> Vec<String> {
+    use hyprforge_files::admin::{Body, Op, WirePath};
+    let Some(admin) = admin else { return vec!["The administrator helper isn't installed.".to_string()] };
+    tokio::task::spawn_blocking(move || {
+        let mut errors = Vec::new();
+        for path in paths {
+            match admin.ask(Op::Delete { path: WirePath::from(path.as_path()) }, |_, _| {}) {
+                Ok(Body::Done) => {}
+                Ok(Body::Failed { why, .. } | Body::Refused { why }) => errors.push(why),
+                Ok(other) => errors.push(format!("The administrator helper gave an answer that doesn't fit: {other:?}")),
+                Err(e) => {
+                    errors.push(e.to_string());
+                    break;
+                }
+            }
+        }
+        errors
+    })
+    .await
+    .unwrap_or_else(|e| vec![format!("Deleting was interrupted: {e}")])
+}
+
 async fn delete_many(paths: Vec<PathBuf>) -> Vec<String> {
     match tokio::task::spawn_blocking(move || {
         let home_trash = hyprforge_fileops::home_trash_dir();
@@ -6258,6 +6444,7 @@ mod tests {
             clipboard: Arc::new(MemoryClipboard::new()),
             // Never attached: no window, so every drag is refused.
             drag: Arc::new(hyprforge_files::dnd::Dnd::new()),
+            admin: None,
             // Empty, not the machine's own: these tests are about the
             // window's loop, and what happens to be installed here is
             // none of their business. Tests that need a database build
@@ -6335,6 +6522,58 @@ mod tests {
         assert!(app.drop_probe.0 && app.drop_probe.1.is_none(), "the waiting one went out");
         let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
         assert!(!app.drop_probe.0);
+    }
+
+    /// An app whose first pane is elevated. Its helper is never asked
+    /// anything by these tests — asking would start `pkexec` and put a
+    /// password prompt on the session running them — so only decisions
+    /// that do no I/O are tested here; the helper itself is tested in
+    /// `admin` and `tests/admin_session.rs`, unprivileged.
+    fn elevated_app() -> App {
+        let mut app = app_for_test(&["/etc"]);
+        app.admin = Some(Arc::new(hyprforge_files::admin_client::AdminBackend::default()));
+        let _ = app.tabs[0].panes[0].browser.update(BrowserMessage::SetAdmin(hyprforge_files_core::Admin::Elevated));
+        app
+    }
+
+    #[test]
+    fn as_administrator_the_trash_is_a_delete_and_is_always_asked_about() {
+        let mut app = elevated_app();
+        Arc::make_mut(&mut app.config).behaviour.confirm_trash = false;
+        let at = app.focused();
+        let _ = app.handle_outcome(at, Outcome::Trash(vec![PathBuf::from("/etc/x.conf")]));
+        let pending = app.confirm.as_ref().expect("asked first, whatever the setting says");
+        assert_eq!(pending.removal, Removal::Delete);
+    }
+
+    #[test]
+    fn a_paste_lands_through_the_helper_only_in_an_elevated_panes_folder() {
+        let app = elevated_app();
+        assert!(app.lands_elevated(Path::new("/etc")));
+        assert!(app.lands_elevated(Path::new("/etc/sub")), "a folder below it, as Paste into Folder does");
+        assert!(!app.lands_elevated(Path::new("/home/a")));
+        let mut plain = app_for_test(&["/etc"]);
+        plain.admin = Some(Arc::new(hyprforge_files::admin_client::AdminBackend::default()));
+        assert!(!plain.lands_elevated(Path::new("/etc")), "the same folder, not elevated");
+    }
+
+    #[test]
+    fn what_the_helper_does_not_do_is_refused_in_an_elevated_pane() {
+        let mut app = elevated_app();
+        let at = app.focused();
+        let _ = app.handle_outcome(
+            at,
+            Outcome::Compress { sources: vec![PathBuf::from("/etc/a")], into: PathBuf::from("/etc") },
+        );
+        assert!(app.status.as_deref().is_some_and(|s| s.contains("administrator")), "{:?}", app.status);
+        assert!(app.compressing.is_none());
+    }
+
+    #[test]
+    fn a_window_without_the_helper_offers_no_way_in() {
+        let app = app_for_test(&["/root"]);
+        assert!(app.admin.is_none());
+        assert!(!app.pane_elevated(app.tabs[0].panes[0].id));
     }
 
     /// The compositor is not told about a drag until it reaches the

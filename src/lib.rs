@@ -23,6 +23,9 @@
 //! So are keeping a folder on screen up to date as other programs
 //! change it (`watch`) and reopening last time's tabs (`session`).
 
+pub mod admin;
+pub mod admin_client;
+pub mod admin_jobs;
 pub mod archive_jobs;
 pub mod bulk_rename;
 pub mod connect;
