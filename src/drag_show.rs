@@ -7,7 +7,7 @@
 //! each frame while something moves and stop asking the moment nothing
 //! does. The drawing itself is `hyprforge_ui::widgets::drag_card` and
 //! `drop_target_style`; the clock that drives them is the window's
-//! (`window::frames`, subscribed only while [`App::animating`] says so —
+//! (`window::frames`, subscribed only while `App::animating` says so —
 //! see `main.rs`).
 
 use hyprforge_ui::widgets::DragCard;
@@ -113,7 +113,7 @@ pub fn opening(armed: Instant, now: Instant) -> f32 {
 }
 
 /// How covered a folder that just sprang open still is, from
-/// [`ARRIVE_COVER`] down to `0.0`, easing out so most of it clears early.
+/// most of the listing (`ARRIVE_COVER`) down to `0.0`, easing out so most of it clears early.
 pub fn arrival_cover(started: Instant, now: Instant) -> f32 {
     let t = (now.saturating_duration_since(started).as_secs_f32() / ARRIVE.as_secs_f32()).clamp(0.0, 1.0);
     let eased = 1.0 - (1.0 - t).powi(3);
