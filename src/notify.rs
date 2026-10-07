@@ -103,15 +103,24 @@ trait Notifications {
 const UNDO: &str = "undo";
 const HISTORY: &str = "history";
 
-/// The arguments one note is sent with: summary, body, actions (key,
+/// A notification's title: which application this is. A notification
+/// is read away from the window that sent it, so "Moved 1 item" on its
+/// own says neither who moved it nor what — the title says who, and the
+/// body says the rest.
+pub const TITLE: &str = "Files";
+
+/// The arguments one note is sent with: title, body, actions (key,
 /// label pairs, flattened as the spec has them) and how long it stays,
 /// in milliseconds (`-1` for the daemon's own default).
-pub fn arguments(note: &Note) -> (String, Vec<&'static str>, i32) {
+pub fn arguments(note: &Note) -> (&'static str, String, Vec<&'static str>, i32) {
     match note {
-        Note::Status(text) => (text.clone(), Vec::new(), -1),
-        Note::Undo { text, seconds } => {
-            (text.clone(), vec![UNDO, "Undo", HISTORY, "History"], (*seconds).saturating_mul(1000).min(i32::MAX as u64) as i32)
-        }
+        Note::Status(text) => (TITLE, text.clone(), Vec::new(), -1),
+        Note::Undo { text, seconds } => (
+            TITLE,
+            text.clone(),
+            vec![UNDO, "Undo", HISTORY, "History"],
+            (*seconds).saturating_mul(1000).min(i32::MAX as u64) as i32,
+        ),
     }
 }
 
@@ -149,12 +158,12 @@ pub fn events() -> impl Stream<Item = NoteEvent> {
             tokio::select! {
                 note = asked.next() => {
                     let Some(note) = note else { return };
-                    let (summary, actions, expire) = arguments(&note);
+                    let (title, body, actions, expire) = arguments(&note);
                     let mut hints = HashMap::new();
                     // Which application this is, so a daemon can show its
                     // icon and group it — the launcher entry's name.
                     hints.insert("desktop-entry", zbus::zvariant::Value::from("hyprforge-files"));
-                    let call = proxy.notify("Files", shown, "system-file-manager", &summary, "", &actions, hints, expire);
+                    let call = proxy.notify(TITLE, shown, "system-file-manager", title, &body, &actions, hints, expire);
                     match tokio::time::timeout(BUS_WAIT, call).await {
                         Ok(Ok(id)) => {
                             shown = id;
@@ -204,15 +213,15 @@ mod tests {
 
     #[test]
     fn a_status_line_has_no_buttons_and_the_daemons_own_timeout() {
-        let (summary, actions, expire) = arguments(&Note::Status("Moved 3 items".into()));
-        assert_eq!(summary, "Moved 3 items");
+        let (title, body, actions, expire) = arguments(&Note::Status("Moved 3 items".into()));
+        assert_eq!((title, body.as_str()), ("Files", "Moved 3 items"), "the application as the title, what happened as the body");
         assert!(actions.is_empty());
         assert_eq!(expire, -1);
     }
 
     #[test]
     fn the_undo_notice_brings_its_buttons_and_lasts_as_long_as_undo_offers() {
-        let (_, actions, expire) = arguments(&Note::Undo { text: "Trashed 2 items".into(), seconds: 6 });
+        let (_, _, actions, expire) = arguments(&Note::Undo { text: "Trashed 2 items".into(), seconds: 6 });
         assert_eq!(actions, [UNDO, "Undo", HISTORY, "History"], "key, label pairs, as the spec flattens them");
         assert_eq!(expire, 6000);
     }

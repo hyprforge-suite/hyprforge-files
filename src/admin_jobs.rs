@@ -15,7 +15,9 @@
 //!   merges into.
 //! - **Nothing is remembered for Undo.** Undo runs as this user, who
 //!   cannot take back what root put down, and an Undo that fails is
-//!   worse than none offered.
+//!   worse than none offered. `JobSummary::placed` is filled all the
+//!   same, so the window can say what was done; it is the window's
+//!   `RunningJob::admin` that keeps it from Undo.
 
 use crate::admin::{Body, OnCollision, Op, WirePath};
 use crate::admin_client::AdminBackend;
@@ -140,6 +142,9 @@ fn run(
                 }
                 if report.succeeded > 0 {
                     summary.done += 1;
+                    // For saying what was done; the window offers none of
+                    // it to Undo — see the module doc.
+                    summary.placed.push((step.source.clone(), report.dest.to_path()));
                 } else if report.skipped > 0 {
                     summary.skipped += 1;
                 }

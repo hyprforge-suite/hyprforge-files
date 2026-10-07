@@ -453,6 +453,60 @@ pub fn paste_subject(steps: &[PasteStep]) -> String {
     }
 }
 
+/// What a finished copy or move did, said whole: what, from where, to
+/// where, and how long it took — "Moved \u{201C}report.pdf\u{201D} from
+/// Downloads to Documents in 1.2s". The line a notification (or the
+/// window's undo strip) carries, which has to make sense read away from
+/// the window that did it.
+///
+/// `placed` is each item's source and where it landed. Several items
+/// from several folders say how many folders rather than naming one.
+pub fn finished_line(verb: &str, placed: &[(PathBuf, PathBuf)], took: std::time::Duration) -> String {
+    let what = match placed {
+        [(from, _)] => quoted_name(from),
+        many => plural(many.len(), "item", "items"),
+    };
+    let side = |paths: Vec<&Path>| -> Option<String> {
+        let first = *paths.first()?;
+        if paths.iter().all(|p| *p == first) {
+            Some(folder_name(first))
+        } else {
+            let mut distinct = paths.clone();
+            distinct.sort();
+            distinct.dedup();
+            Some(plural(distinct.len(), "folder", "folders"))
+        }
+    };
+    let from = side(placed.iter().filter_map(|(f, _)| f.parent()).collect());
+    let to = side(placed.iter().filter_map(|(_, t)| t.parent()).collect());
+    let mut line = format!("{verb} {what}");
+    if let Some(from) = from {
+        line.push_str(&format!(" from {from}"));
+    }
+    if let Some(to) = to {
+        line.push_str(&format!(" to {to}"));
+    }
+    format!("{line} in {}", took_words(took))
+}
+
+/// How long something took, as a person would say it: "<0.1s",
+/// "0.3s", "12s", "2m 05s".
+pub fn took_words(took: std::time::Duration) -> String {
+    let secs = took.as_secs_f64();
+    // A move on one disk is a rename, done before the clock moves:
+    // "0.0s" reads as nothing having happened.
+    if secs < 0.05 {
+        "<0.1s".to_string()
+    } else if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else if secs < 60.0 {
+        format!("{}s", secs.round() as u64)
+    } else {
+        let whole = secs.round() as u64;
+        format!("{}m {:02}s", whole / 60, whole % 60)
+    }
+}
+
 /// A restore's subject: where things go back to is each one's own
 /// folder, so the subject names where they come from instead.
 pub fn restore_subject(steps: &[PasteStep]) -> String {
@@ -517,6 +571,34 @@ pub fn plural(n: usize, one: &str, many: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn a_finished_move_says_what_from_where_to_where_and_how_long() {
+        let placed = [(PathBuf::from("/h/Downloads/report.pdf"), PathBuf::from("/h/Documents/report.pdf"))];
+        assert_eq!(
+            finished_line("Moved", &placed, Duration::from_millis(1234)),
+            "Moved \u{201C}report.pdf\u{201D} from Downloads to Documents in 1.2s"
+        );
+    }
+
+    #[test]
+    fn several_items_from_several_folders_count_the_folders() {
+        let placed = [
+            (PathBuf::from("/h/a/1.txt"), PathBuf::from("/h/out/1.txt")),
+            (PathBuf::from("/h/b/2.txt"), PathBuf::from("/h/out/2.txt")),
+            (PathBuf::from("/h/b/3.txt"), PathBuf::from("/h/out/3.txt")),
+        ];
+        assert_eq!(finished_line("Copied", &placed, Duration::from_secs(42)), "Copied 3 items from 2 folders to out in 42s");
+    }
+
+    #[test]
+    fn a_long_job_says_minutes() {
+        assert_eq!(took_words(Duration::from_secs(125)), "2m 05s");
+        assert_eq!(took_words(Duration::from_millis(300)), "0.3s");
+        assert_eq!(took_words(Duration::from_millis(2)), "<0.1s", "never \"0.0s\"");
+    }
+
     use super::*;
     use hyprforge_fileops::OpKind;
 

@@ -826,6 +826,7 @@ mod tests {
             id,
             control,
             kind,
+            admin: false,
             started,
             dirs: vec![],
             archive: None,

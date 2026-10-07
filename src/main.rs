@@ -1445,6 +1445,9 @@ struct RunningJob {
     id: JobId,
     control: JobControl,
     kind: JobKind,
+    /// Done by the administrator helper — so offered to nothing that
+    /// would run as this user, Undo above all.
+    admin: bool,
     /// When it started. Progress is only shown once it has run long
     /// enough to be worth showing — see `[behaviour] progress-after-ms`.
     started: Instant,
@@ -2740,6 +2743,7 @@ impl App {
         let subject = queued.subject();
         let lands_at = queued.lands_at().map(Path::to_path_buf).collect();
         let Queued { id, kind, dirs, what } = queued;
+        let admin = matches!(what, QueuedWork::Admin { .. });
         let archive = match &what {
             QueuedWork::Archive { work, .. } => work.archive().map(Path::to_path_buf),
             QueuedWork::Paste { .. } | QueuedWork::Admin { .. } => None,
@@ -2767,6 +2771,7 @@ impl App {
             id,
             control,
             kind,
+            admin,
             started: Instant::now(),
             dirs,
             archive,
@@ -2901,7 +2906,27 @@ impl App {
                         .filter(|_| summary.complete())
                         .and_then(|(_, made)| undo.record(made)),
                 };
+                let done = done.filter(|_| !finished.admin);
+                let notice_before = self.next_notice;
                 let noticed = done.map(|done| self.record(done)).unwrap_or_else(Task::none);
+                // What a copy or move did, said whole — what, from where,
+                // to where, in how long — for a notification read away
+                // from this window. On the undo notice when there is one,
+                // a plain line when there is not (a job done as
+                // administrator offers no Undo).
+                let verb = match finished.kind {
+                    JobKind::Copy => Some("Copied"),
+                    JobKind::Move => Some("Moved"),
+                    _ => None,
+                };
+                if let Some(verb) = verb.filter(|_| !summary.placed.is_empty()) {
+                    let line = transfers::finished_line(verb, &summary.placed, finished.started.elapsed());
+                    match self.notice.as_mut().filter(|_| self.next_notice != notice_before) {
+                        Some((_, text)) => *text = line,
+                        None if summary.failed.is_empty() => self.status = Some(line),
+                        None => {}
+                    }
+                }
                 let refresh = Task::batch([refresh, noticed]);
                 if let JobKind::Restore { records } = finished.kind {
                     // Records are removed only for items whose stored
@@ -6108,6 +6133,7 @@ impl DebugShow {
             id: 0,
             control,
             kind: JobKind::Copy,
+            admin: false,
             started: Instant::now(),
             dirs: Vec::new(),
             archive: None,
@@ -8128,6 +8154,7 @@ mod tests {
             id: 9,
             control,
             kind: JobKind::Move,
+            admin: false,
             started: Instant::now(),
             dirs: vec![],
             archive: None,
@@ -8163,6 +8190,7 @@ mod tests {
             id: 3,
             control,
             kind: JobKind::Copy,
+            admin: false,
             started: Instant::now(),
             dirs: vec![],
             archive: None,
@@ -8227,6 +8255,7 @@ mod tests {
             id: 4,
             control,
             kind: JobKind::Copy,
+            admin: false,
             started: Instant::now(),
             dirs: vec![],
             archive: None,
@@ -8489,6 +8518,7 @@ mod tests {
             id,
             control,
             kind,
+            admin: false,
             started: Instant::now(),
             dirs: vec![],
             archive: None,
@@ -9078,6 +9108,7 @@ mod tests {
             id: 5,
             control,
             kind: JobKind::Move,
+            admin: false,
             started: Instant::now(),
             dirs: vec![],
             archive: None,
@@ -9095,6 +9126,11 @@ mod tests {
             job: 5,
             summary: JobSummary { done: 1, placed: placed.clone(), ..JobSummary::default() },
         }));
+        let notice = app.notice.as_ref().map(|(_, text)| text.clone()).unwrap_or_default();
+        assert!(
+            notice.starts_with("Moved \u{201C}x\u{201D} from a to b in "),
+            "said whole, for a notification read away from the window: {notice}"
+        );
         assert_eq!(app.undo.pop(), Some(hyprforge_files_core::undo::Undoable::Moved(placed)));
     }
 
@@ -9822,6 +9858,7 @@ mod archive_tests {
             id: 7,
             control,
             kind: JobKind::Archive { doing: "Extracting", undo: ArchiveUndo::Nothing },
+            admin: false,
             started: Instant::now(),
             dirs: Vec::new(),
             archive: None,
