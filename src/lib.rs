@@ -34,6 +34,7 @@ pub mod dnd;
 pub mod drag_show;
 pub mod drag_out;
 pub mod file_manager1;
+pub mod handoff;
 pub mod host;
 pub mod inner_drag;
 pub mod jobs;

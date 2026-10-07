@@ -77,6 +77,12 @@ deleting, which there skips the Trash and always asks first. It is a
 separate small helper, `hyprforge-files-admin`, that does only those
 things; the window itself never runs as root.
 
+**One window** — "Show in folder" from a browser, or opening a folder
+with Files from anywhere, opens a tab in the Files window you used last
+and brings it forward, rather than a new window each time (Preferences can
+change that). A folder's menu also has Open in New Window, and Open in New
+Window on Workspace… for putting one on another Hyprland workspace.
+
 **Tags** — "Tags…" on a file's menu puts words on it, kept on the file
 itself the way Dolphin keeps them, so they survive renames, moves and
 copies and the two apps see each other's. Each tag is a row under Tags

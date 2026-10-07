@@ -24,7 +24,7 @@ use hyprforge_files_core::preferences::{
     Plan, Setting, SidebarSetting, ThumbnailSetting, CONFLICT_POLICIES, GRID_NAME_LINES, GROUPS, THUMBNAIL_CAPS,
     THUMBNAIL_SOURCES,
 };
-use hyprforge_files_core::preferences::{typing_label, TYPING_CHOICES};
+use hyprforge_files_core::preferences::{open_in_label, typing_label, OPEN_IN_CHOICES, TYPING_CHOICES};
 use hyprforge_files_core::preferences::{seconds_label, watch_network_choices};
 use hyprforge_files_core::prefs::{Prefs, SidebarPref, ViewMode};
 use hyprforge_ui::theme::{spacing, surface, FontScale, BASE_TEXT_SIZE};
@@ -512,6 +512,23 @@ impl Preferences {
                     )
                 } else {
                     config_line(typing_label(config.behaviour.typing), scale).into()
+                },
+                scale,
+            ),
+            setting_row(
+                6,
+                "Folders from other apps",
+                Some(hint_text("Show in folder, and opening a folder with Files, use the window you used last.", scale).into()),
+                if writable {
+                    segmented_choice(
+                        &OPEN_IN_CHOICES,
+                        Some(&config.behaviour.open_in),
+                        |o| open_in_label(*o).to_string(),
+                        |o| Message::Behaviour(BehaviourSetting::OpenIn(o)),
+                        scale,
+                    )
+                } else {
+                    config_line(open_in_label(config.behaviour.open_in), scale).into()
                 },
                 scale,
             ),

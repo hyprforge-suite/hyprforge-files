@@ -6,7 +6,15 @@
 //! hyprforge-files --select PATH…          each path's folder, with the paths selected
 //! hyprforge-files --properties PATH…      the same, with Properties open on them
 //! hyprforge-files --dbus-service          org.freedesktop.FileManager1, no window
+//! hyprforge-files --new-window PATH…      a window of its own, not a tab in the last one
+//! hyprforge-files --workspace N PATH…     that window on Hyprland workspace N
 //! ```
+//!
+//! A launch that names something is handed to the Files window used last
+//! — see [`crate::handoff`] — unless `[behaviour] open-in = "window"` or
+//! `--new-window` says otherwise. `--workspace` implies `--new-window`:
+//! moving the window already open to another workspace is not what was
+//! asked.
 //!
 //! `--select` and `--properties` are what `org.freedesktop.FileManager1`
 //! asks for (`ShowItems`, `ShowItemProperties` — see
@@ -48,6 +56,11 @@ pub struct Start {
     pub tabs: Vec<StartTab>,
     /// Open Properties on the first tab's selection.
     pub properties: bool,
+    /// A window of its own, whatever `open-in` says.
+    pub new_window: bool,
+    /// The Hyprland workspace to put the window on, as `hl.dsp`'s
+    /// `workspace` takes it (a number, `name:…`).
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +71,8 @@ pub struct StartTab {
 }
 
 /// One line of help, for `--help` and for an option this does not know.
-pub const USAGE: &str = "usage: hyprforge-files [PATH…] [--select PATH…] [--properties PATH…] | --dbus-service";
+pub const USAGE: &str =
+    "usage: hyprforge-files [--new-window] [--workspace N] [PATH…] [--select PATH…] [--properties PATH…] | --dbus-service";
 
 /// Reads the arguments (without the program's name). `is_dir` answers
 /// whether a path is a folder: `Some(true)`, `Some(false)` for anything
@@ -84,9 +98,23 @@ pub fn parse(
     let mut start = Start::default();
     let mut mode = Mode::Open;
     let mut options_done = false;
-    for arg in args {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         if !options_done {
             match arg.to_str() {
+                Some("--new-window") => {
+                    start.new_window = true;
+                    continue;
+                }
+                Some("--workspace") => {
+                    let Some(workspace) = args.next().and_then(|w| w.into_string().ok()).filter(|w| !w.trim().is_empty())
+                    else {
+                        return Err(format!("--workspace needs a workspace, like --workspace 3\n{USAGE}"));
+                    };
+                    start.workspace = Some(workspace.trim().to_string());
+                    start.new_window = true;
+                    continue;
+                }
                 Some("--select") => {
                     mode = Mode::Select;
                     continue;
@@ -295,5 +323,21 @@ mod tests {
     fn only_a_non_file_scheme_is_a_foreign_uri() {
         assert!(is_foreign_uri("sftp://host/x") && is_foreign_uri("smb://nas/share"));
         assert!(!is_foreign_uri("file:///x") && !is_foreign_uri("/x") && !is_foreign_uri("/odd/a://b"));
+    }
+
+    #[test]
+    fn a_new_window_can_be_asked_for_and_a_workspace_implies_one() {
+        let s = start(&["--new-window", "/home/a/dir"]);
+        assert!(s.new_window && s.workspace.is_none());
+        let s = start(&["--workspace", "3", "/home/a/dir"]);
+        assert!(s.new_window, "a window moved to 3 is a new one, not the one already open");
+        assert_eq!(s.workspace.as_deref(), Some("3"));
+        assert_eq!(s.tabs.len(), 1);
+    }
+
+    #[test]
+    fn a_workspace_with_nothing_after_it_is_refused() {
+        let args = ["--workspace"].iter().map(OsString::from);
+        assert!(parse(args, &fake).is_err());
     }
 }

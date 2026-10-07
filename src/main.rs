@@ -166,6 +166,18 @@ fn main() -> iced::Result {
     let (config, config_problems) = hyprforge_files_core::config::load();
     let config = Arc::new(config);
 
+    // Something named, from outside: a tab in the Files window used
+    // last, which comes forward — see `hyprforge_files::handoff`. Only
+    // when that window took it does this process stop here; anything
+    // else, and it opens its own window as it always has.
+    if !start.tabs.is_empty()
+        && !start.new_window
+        && config.behaviour.open_in == hyprforge_files_core::config::OpenIn::Tab
+        && hyprforge_files::handoff::hand_off(&start)
+    {
+        return Ok(());
+    }
+
     let (prefs, prefs_status) = match hyprforge_files_core::prefs::load() {
         Ok(prefs) => (prefs, None),
         Err(e) => (
@@ -256,6 +268,7 @@ fn main() -> iced::Result {
         connecting: None,
         compressing: None,
         tagging: None,
+        picking_workspace: None,
         bulk_rename: None,
         unlocking: None,
         keyring,
@@ -338,6 +351,7 @@ fn main() -> iced::Result {
         app.attach_drag(),
         app.open_start_tabs(start_select, &start),
         learn_scale(),
+        move_to_workspace(start.workspace.clone()),
     ]);
 
     // `iced::application` calls this closure exactly once; a `RefCell`
@@ -346,7 +360,7 @@ fn main() -> iced::Result {
     // the same shape `hyprforge-greet` uses for its own one-shot state.
     let boot = std::cell::RefCell::new(Some((app, boot_task)));
 
-    iced::application(
+    let result = iced::application(
         move || boot.borrow_mut().take().expect("hyprforge-files boots once"),
         App::update_and_remember,
         App::view,
@@ -363,7 +377,24 @@ fn main() -> iced::Result {
         },
         ..window::Settings::default()
     })
-    .run()
+    .run();
+    // The window's socket goes with it, so no later launch finds it.
+    hyprforge_files::handoff::withdraw();
+    result
+}
+
+/// `--workspace`: the window onto that workspace once it is mapped — see
+/// `hyprforge_files::handoff::move_own_window`. Off the UI thread; a
+/// failure is a logged line, the window being open where it is.
+fn move_to_workspace(workspace: Option<String>) -> Task<Message> {
+    let Some(workspace) = workspace else { return Task::none() };
+    Task::future(async move {
+        let moved = tokio::task::spawn_blocking(move || hyprforge_files::handoff::move_own_window(&workspace)).await;
+        if let Ok(Err(e)) = moved {
+            tracing::warn!(error = %e, "the window could not be moved to its workspace");
+        }
+    })
+    .discard()
 }
 
 // ---------------------------------------------------------------------
@@ -567,6 +598,13 @@ enum Message {
     TaggedRead(u64, String, Vec<Entry>, Vec<PathBuf>),
     /// From the desktop's notifications — see `notify`.
     Note(hyprforge_files::notify::NoteEvent),
+    /// Another launch's folders, handed to this window — see `handoff`.
+    HandedOff(hyprforge_files::start::Start),
+    /// Hyprland's workspaces, listed for the picker; `None` off Hyprland.
+    WorkspacesListed(PathBuf, Option<Vec<(String, String)>>),
+    /// A workspace chosen in the picker — what `--workspace` takes — or
+    /// `None` for Cancel.
+    WorkspacePicked(Option<String>),
     /// The answer to "Open as administrator" for this pane and folder:
     /// the helper is running and authorised, or a sentence why not.
     AdminOpened(u64, PathBuf, Result<(), String>),
@@ -868,6 +906,9 @@ struct App {
     compressing: Option<Compressing>,
     /// The "Tags…" sheet, while it is open — see `tags_sheet`.
     tagging: Option<hyprforge_files::tags_sheet::TagSheet>,
+    /// "Open in New Window on Workspace…": the folder, and Hyprland's
+    /// workspaces to choose from — see `handoff::workspaces`.
+    picking_workspace: Option<(PathBuf, Vec<(String, String)>)>,
     /// The bulk rename sheet, and the id of the tab it renames in.
     bulk_rename: Option<(u64, hyprforge_files::bulk_rename::BulkRename)>,
     /// An open password prompt for an encrypted archive.
@@ -2204,6 +2245,17 @@ impl App {
             Outcome::CopyText(text) => iced::clipboard::write(text),
             Outcome::DragOut(paths) => self.begin_drag(paths),
             Outcome::OpenAsAdmin(path) => self.open_as_admin(at, path),
+            Outcome::OpenInNewWindow { path, workspace: false } => {
+                self.new_window(&path, None);
+                Task::none()
+            }
+            Outcome::OpenInNewWindow { path, workspace: true } => Task::perform(
+                async move {
+                    let listed = tokio::task::spawn_blocking(hyprforge_files::handoff::workspaces).await.ok().flatten();
+                    (path, listed)
+                },
+                |(path, listed)| Message::WorkspacesListed(path, listed),
+            ),
             Outcome::LeaveAdmin(path) => {
                 // The last elevated pane gone: the helper goes too, so
                 // no root process waits five minutes for nobody.
@@ -3879,6 +3931,46 @@ impl App {
         Task::batch(tasks)
     }
 
+    /// A window of its own for `path` — this same binary, never handed
+    /// back to this window — on `workspace` when one is given.
+    fn new_window(&mut self, path: &Path, workspace: Option<&str>) {
+        use hyprforge_files::file_manager1::Launch;
+        let mut args: Vec<std::ffi::OsString> = vec!["--new-window".into()];
+        if let Some(workspace) = workspace {
+            args.push("--workspace".into());
+            args.push(workspace.into());
+        }
+        args.push("--".into());
+        args.push(path.as_os_str().to_owned());
+        let launched = hyprforge_files::file_manager1::ThisBinary::new().and_then(|this| this.launch(args, ""));
+        if let Err(e) = launched {
+            self.status = Some(format!("A new window couldn't be opened: {e}"));
+        }
+    }
+
+    /// Folders another launch handed this window — "Show in folder" from
+    /// elsewhere: a tab each, the first in front, its selection made once
+    /// it is listed, Properties on it when asked.
+    fn open_handed(&mut self, start: hyprforge_files::start::Start) -> Task<Message> {
+        let first = self.tabs.len();
+        let mut tasks = Vec::new();
+        for tab in &start.tabs {
+            tasks.push(self.add_tab(tab.dir.clone()));
+            if !tab.select.is_empty() {
+                let _ = self.active_tab_mut().browser_mut().update(BrowserMessage::SelectWhenListed(tab.select.clone()));
+            }
+        }
+        if first < self.tabs.len() {
+            self.active = first;
+            if start.properties {
+                let at = At { tab: first, pane: self.tabs[first].focused };
+                let outcome = self.pane_mut(at).browser.update(BrowserMessage::ToggleProperties);
+                tasks.push(self.handle_outcome(at, outcome));
+            }
+        }
+        Task::batch(tasks)
+    }
+
     /// Opens a new tab at `start_dir` and makes it active — `Ctrl+T` and
     /// the titlebar `+` both funnel here — split at the same folder when
     /// Preferences says new tabs open split.
@@ -4236,6 +4328,12 @@ impl App {
             // current default, and "press Enter" would then mean "open
             // with the thing that was already going to open it", which
             // is never why this dialog is up.
+            Message::KeyPressed(press) if self.picking_workspace.is_some() => {
+                if press.key == keymap::Key::Escape {
+                    self.picking_workspace = None;
+                }
+                Task::none()
+            }
             Message::KeyPressed(press) if self.tagging.is_some() => {
                 if press.key == keymap::Key::Escape {
                     self.tagging = None;
@@ -4526,6 +4624,21 @@ impl App {
                 self.drop_event(event)
             }
             Message::InnerDrag(event) => self.inner_drag_event(event),
+            Message::HandedOff(start) => self.open_handed(start),
+            Message::WorkspacesListed(path, listed) => {
+                match listed {
+                    Some(list) => self.picking_workspace = Some((path, list)),
+                    None => self.status = Some("Workspaces are Hyprland's, and this isn't running under it.".to_string()),
+                }
+                Task::none()
+            }
+            Message::WorkspacePicked(choice) => {
+                let picked = self.picking_workspace.take();
+                if let (Some(workspace), Some((path, _))) = (choice, picked) {
+                    self.new_window(&path, Some(&workspace));
+                }
+                Task::none()
+            }
             Message::TagsLoaded(files) => {
                 let known: Vec<String> = self.last_prefs.tags.keys().cloned().collect();
                 self.tagging = Some(hyprforge_files::tags_sheet::TagSheet::open(files, known));
@@ -5370,6 +5483,9 @@ impl App {
         if let Some(sheet) = &self.tagging {
             return iced::widget::stack![window, tags_dialog(sheet, scale)].into();
         }
+        if let Some((path, list)) = &self.picking_workspace {
+            return iced::widget::stack![window, workspace_dialog(path, list, scale)].into();
+        }
         if let Some(chooser) = &self.chooser {
             return iced::widget::stack![window, chooser_dialog(chooser, scale)].into();
         }
@@ -5487,6 +5603,9 @@ impl App {
             Subscription::run(hyprforge_files::dnd::events).map(Message::Dnd),
             hyprforge_files::inner_drag::events().map(Message::InnerDrag),
             Subscription::run(hyprforge_files::notify::events).map(Message::Note),
+            // Other launches asking this window to open folders — see
+            // `hyprforge_files::handoff`.
+            Subscription::run(hyprforge_files::handoff::serve).map(Message::HandedOff),
             if self.animating() { window::frames().map(Message::Frame) } else { Subscription::none() },
             // Drives and shares: listed at once, then again whenever
             // UDisks2 or gvfs says something changed, a burst at a time.
@@ -5859,6 +5978,32 @@ fn unlock_dialog<'a>(unlocking: &Unlocking, scale: FontScale) -> Element<'a, Mes
 /// extension is not the person's to choose — it follows the format, and
 /// a name and a format that disagree is precisely the confusion
 /// `hyprforge_archive::format` spends a module resolving.
+/// "Open in New Window on Workspace…": a button per workspace, and the
+/// next empty one.
+fn workspace_dialog<'a>(path: &Path, list: &[(String, String)], scale: FontScale) -> Element<'a, Message> {
+    let mut buttons = row![].spacing(spacing::XS);
+    for (workspace, label) in list {
+        buttons = buttons.push(
+            secondary_button(label.clone()).on_press(Message::WorkspacePicked(Some(workspace.clone()))),
+        );
+    }
+    // Wrapped, so ten workspaces make two rows rather than a dialog
+    // wider than the window.
+    let buttons = buttons.wrap();
+    dialog(
+        "Open on workspace".to_string(),
+        format!("A new window for {}, on the workspace you choose.", display_name(path)),
+        Some(buttons.into()),
+        row![
+            iced::widget::Space::new().width(Length::Fill),
+            secondary_button("Cancel").on_press(Message::WorkspacePicked(None)),
+        ]
+        .spacing(spacing::SM)
+        .into(),
+        scale,
+    )
+}
+
 /// The Tags sheet's field, which has the keyboard when it opens.
 const TAG_FIELD: &str = "tags-new";
 
@@ -6968,6 +7113,7 @@ mod tests {
             connecting: None,
             compressing: None,
             tagging: None,
+            picking_workspace: None,
             bulk_rename: None,
             unlocking: None,
             keyring: Arc::new(hyprforge_archive::Keyring::new()),

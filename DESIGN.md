@@ -1073,6 +1073,50 @@ off, the batch landing with all six selected under their new names and
 contents, and inside a zip a find & replace of two members as one
 rewrite, both left selected.
 
+## One window, on Hyprland — built
+
+"Show in folder" in a browser, "Reveal in file manager" in an editor and
+`hyprforge-files PATH` from a launcher each start this binary, and each
+used to open a window. Now a launch that names something first asks the
+Files window used most recently to open it as tabs, and that window comes
+forward (`src/handoff.rs`):
+
+- **Finding it.** Every window serves `$XDG_RUNTIME_DIR/hyprforge-files/
+  <pid>.sock` (owner-only), one JSON line in and `ok` out, the shape of
+  Settings' `ipc.rs`. "Used most recently" is Hyprland's to say:
+  `hyprctl clients`' `focusHistoryID`, matched to a socket by pid. A
+  window that does not answer within two seconds is passed over for the
+  next, and with none the launch opens its own — a wedged window costs a
+  second window, never a launch that never happens. A socket whose window
+  is gone is removed by whoever finds it; a window removes its own on
+  closing.
+- **Bringing it forward.** `hl.dsp.focus({ window = "pid:N" })`, checked
+  live on 0.56: it focuses the window and switches to its workspace,
+  whatever `misc:focus_on_activate` says. No `xdg_activation` token is
+  passed on for this: the focus dispatch is what reliably raises a window
+  on Hyprland, and a window started fresh is activated by winit from
+  `XDG_ACTIVATION_TOKEN` as before.
+- **When it does not.** Off Hyprland; a launch that names nothing (the
+  launcher's plain "Files" still opens a window, as anyone clicking it
+  expects); `--new-window`; and `[behaviour] open-in = "window"`, which
+  Preferences offers as "Folders from other apps: New tab / New window".
+- **Open in New Window** (Ctrl+Shift+Enter) and **Open in New Window on
+  Workspace…** on a folder's menu. The second lists Hyprland's workspaces
+  — numbered ones, then named, then the next empty number — and starts a
+  window with `--workspace N`, which moves itself there once mapped
+  (`hl.dsp.window.move({ window, workspace, follow = true })`, checked
+  live) and takes you with it. It appears where you are for a moment
+  first: placing it at map time would mean starting it through Hyprland's
+  `exec_cmd`, through a shell, with the path quoted twice over.
+- **The session file.** Every window writes `files-session.toml` and the
+  last to close wins, as before; with folders from outside landing in one
+  window, one window is now the common case.
+
+Checked in a nested compositor: a second launch exited in 50ms and its
+folder opened as a tab in the first window; from an empty workspace, a
+launch went to the window used last and Hyprland switched to it;
+`--workspace 4` put a new window on 4; closing a window removed its socket.
+
 ## Tags — built
 
 A tag lives **on the file**, in the `user.xdg.tags` extended attribute —
