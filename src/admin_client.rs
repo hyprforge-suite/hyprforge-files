@@ -338,6 +338,15 @@ impl AdminBackend {
         session.ask_cancellable(op, progress, stop)
     }
 
+    /// Lets the helper go: its input closes and it exits. Nothing is
+    /// asked to stop — a copy still holding the session keeps it, and
+    /// the helper leaves on its own once idle.
+    pub fn close(&self) {
+        if let Ok(mut guard) = self.session.try_lock() {
+            guard.take();
+        }
+    }
+
     fn files_error(path: &Path, body: Result<Body, AdminError>) -> FilesError {
         let message = match body {
             Ok(Body::Failed { kind: crate::admin::FailKind::NotFound, .. }) => {

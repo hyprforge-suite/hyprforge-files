@@ -40,6 +40,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// the pointer from inside the band to beyond it.
 pub const EDGE: f32 = 4.0;
 
+/// How far one notch of a wheel scrolls a listing during a drag, in
+/// logical pixels.
+pub const WHEEL_LINE: f32 = 60.0;
+
 /// What one pointer position means for a drag in progress.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Step {
@@ -90,6 +94,11 @@ pub enum DragEvent {
     Left,
     /// Escape: the drag is abandoned and nothing moves.
     Cancelled,
+    /// The wheel turned, by this many logical pixels down (negative is
+    /// up). The card covering the window takes the wheel from the
+    /// listing under it, so the window scrolls the listing itself —
+    /// otherwise a folder below the fold could never be reached.
+    Wheel(f32),
 }
 
 /// Whether a drag is in progress, for the event listener — which is a
@@ -117,6 +126,12 @@ pub fn events() -> Subscription<DragEvent> {
             Event::Mouse(mouse::Event::CursorMoved { position }) => Some(DragEvent::Moved(position)),
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(DragEvent::Released),
             Event::Mouse(mouse::Event::CursorLeft) => Some(DragEvent::Left),
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(DragEvent::Wheel(match delta {
+                // A notch of a wheel: three rows' worth, about what a
+                // scrollable moves for one by itself.
+                mouse::ScrollDelta::Lines { y, .. } => -y * WHEEL_LINE,
+                mouse::ScrollDelta::Pixels { y, .. } => -y,
+            })),
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 ..

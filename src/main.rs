@@ -270,6 +270,8 @@ fn main() -> iced::Result {
         undo: hyprforge_files_core::undo::UndoHistory::new(config.behaviour.undo_depth as usize),
         notice: None,
         next_notice: 0,
+        notes: false,
+        noted_undo: 0,
         undo_history_open: false,
         next_job_id: 1,
         modifiers: keyboard::Modifiers::default(),
@@ -279,7 +281,14 @@ fn main() -> iced::Result {
         from_drops: std::collections::HashSet::new(),
         archive_drag: None,
         inner_drag: None,
-        spring: (0, None),
+        spring: (0, None, None),
+        ghost: None,
+        spring_rest: None,
+        drag_point: None,
+        arriving: None,
+        drop_tab: None,
+        now: std::time::Instant::now(),
+        spring_target: None,
         config: config.clone(),
         #[cfg(debug_assertions)]
         debug_show: DebugShow::from_env(),
@@ -540,18 +549,20 @@ enum Message {
     DragUnpacked(Result<(), String>),
     /// A drag over the window — see `dnd`.
     Dnd(hyprforge_files::dnd::DropEvent),
+    /// From the desktop's notifications — see `notify`.
+    Note(hyprforge_files::notify::NoteEvent),
     /// The answer to "Open as administrator" for this pane and folder:
     /// the helper is running and authorised, or a sentence why not.
     AdminOpened(u64, PathBuf, Result<(), String>),
     /// The pointer or Escape, during a drag that has not left the window
     /// — see `inner_drag`.
     InnerDrag(hyprforge_files::inner_drag::DragEvent),
-    /// A drag has rested on one folder long enough to open it — the
-    /// generation it was armed with. See [`App::spring`].
-    SpringFired(u64),
     /// Which folder a point is over, in which pane, as the layout
     /// answered — and, for a drop, what was dropped there.
-    DropHit(Option<(u64, PathBuf)>, Option<hyprforge_files_core::drop::DropFrom>),
+    DropHit(Option<DropSpot>, Option<hyprforge_files_core::drop::DropFrom>),
+    /// A frame is about to be drawn, while something moves — see
+    /// [`App::animating`].
+    Frame(std::time::Instant),
     /// What a drop turned out to mean, once the filesystems were asked.
     DropPlanned(hyprforge_files_core::drop::DropPlan),
     /// A finished restore removed the records of what it put back.
@@ -889,6 +900,12 @@ struct App {
     /// timer must not take the newer notice down with it.
     notice: Option<(u64, String)>,
     next_notice: u64,
+    /// Whether a notification daemon is there to say things through —
+    /// see [`App::update`]. False until the bus says otherwise, so a
+    /// message never waits on it.
+    notes: bool,
+    /// The undo notice last sent as a notification, so it is sent once.
+    noted_undo: u64,
     /// Whether the undo history popover is open — see `undo_view`.
     undo_history_open: bool,
     next_job_id: JobId,
@@ -957,7 +974,25 @@ struct App {
     /// timer that opens it when the drag stays there — a spring-loaded
     /// folder. Bumped whenever the drag moves to another folder or ends,
     /// so a timer about a folder the drag has left is recognisably stale.
-    spring: (u64, Option<(u64, PathBuf)>),
+    spring: (u64, Option<DropSpot>, Option<std::time::Instant>),
+    /// The card under the pointer during a drag inside the window, and
+    /// for the moment after while it settles — see `drag_show`.
+    ghost: Option<hyprforge_files::drag_show::Ghost>,
+    /// Where the pointer was when a folder last sprang open: nothing
+    /// arms again until it has moved `REST_SLOP` from here.
+    spring_rest: Option<(f64, f64)>,
+    /// Where a drag over the window was last seen.
+    drag_point: Option<(f64, f64)>,
+    /// A pane whose folder a drag just opened, fading in since when.
+    arriving: Option<(u64, std::time::Instant)>,
+    /// The tab a drag is over, by index, and how much of its wait has
+    /// passed — tabs are the window's, not a browser's, so their look is
+    /// kept here.
+    drop_tab: Option<(usize, f32)>,
+    /// The latest frame's time: what the view draws animations at.
+    now: std::time::Instant,
+    /// The pane a drag was last over — where the wheel scrolls.
+    spring_target: Option<u64>,
     /// Debug builds only: what to put on screen for a screenshot. See
     /// [`DebugShow`].
     #[cfg(debug_assertions)]
@@ -2115,6 +2150,15 @@ impl App {
             Outcome::CopyText(text) => iced::clipboard::write(text),
             Outcome::DragOut(paths) => self.begin_drag(paths),
             Outcome::OpenAsAdmin(path) => self.open_as_admin(at, path),
+            Outcome::LeaveAdmin(path) => {
+                // The last elevated pane gone: the helper goes too, so
+                // no root process waits five minutes for nobody.
+                let still = self.tabs.iter().flat_map(|t| &t.panes).any(|p| p.browser.elevated());
+                if let (false, Some(admin)) = (still, &self.admin) {
+                    admin.close();
+                }
+                self.spawn_read_dir(at, path)
+            }
             Outcome::Paste(into) => self.read_clipboard_for(into),
             Outcome::ToOtherPane(clip) => self.paste_in_other_pane(at, clip),
             Outcome::ResolvePath(request) => self.spawn_resolve(at, request),
@@ -3233,6 +3277,7 @@ impl App {
         match event {
             DropEvent::Over { x, y } => {
                 self.drag_over = true;
+                self.drag_point = Some((x, y));
                 if self.drop_probe.0 {
                     self.drop_probe.1 = Some((x, y));
                     return Task::none();
@@ -3270,12 +3315,17 @@ impl App {
         // over either. Each browser's ids are its own (see
         // `drop::target_id`), so the hit says which pane as well as which
         // folder.
-        let targets: std::collections::HashMap<_, (u64, PathBuf)> = self
+        let mut targets: std::collections::HashMap<_, DropSpot> = self
             .active_tab()
             .panes
             .iter()
-            .flat_map(|pane| pane.browser.drop_targets().into_iter().map(move |(id, path)| (id, (pane.id, path))))
+            .flat_map(|pane| {
+                pane.browser.drop_targets().into_iter().map(move |(id, path)| (id, DropSpot::Pane(pane.id, path)))
+            })
             .collect();
+        // The tabs: a drop on one lands in the folder it shows, and
+        // resting on one switches to it.
+        targets.extend((0..self.tabs.len()).map(|index| (tab_target_id(index), DropSpot::Tab(index))));
         let point = iced::Point::new(x as f32, y as f32);
         iced::advanced::widget::operate(hyprforge_files_core::drop::HitTest::new(point, targets))
             .map(move |hit| Message::DropHit(hit, dropped.clone()))
@@ -3285,32 +3335,36 @@ impl App {
     fn disarm_spring(&mut self) {
         self.spring.0 += 1;
         self.spring.1 = None;
+        self.spring.2 = None;
+        self.spring_rest = None;
     }
 
     /// Starts the clock on a spring-loaded folder when a drag comes to a
     /// new one, and stops it when the drag leaves. Resting on the
     /// listing's own background arms nothing: that folder is open.
-    fn arm_spring(&mut self, hit: Option<(u64, PathBuf)>) -> Task<Message> {
+    fn arm_spring(&mut self, hit: Option<DropSpot>) {
+        // Just sprang open, and the pointer has not moved since: what is
+        // under it now is whatever row of the new listing landed there,
+        // which nobody chose. See `drag_show::REST_SLOP`.
+        if let (Some(rest), Some(now)) = (self.spring_rest, self.drag_point) {
+            let moved = ((now.0 - rest.0).powi(2) + (now.1 - rest.1).powi(2)).sqrt();
+            if moved < f64::from(hyprforge_files::drag_show::REST_SLOP) {
+                return;
+            }
+            self.spring_rest = None;
+        }
         if hit == self.spring.1 {
-            return Task::none();
+            return;
         }
         self.spring.0 += 1;
-        let open = hit.filter(|(pane, path)| {
-            self.locate(*pane).is_some_and(|at| self.pane(at).browser.current_dir() != path.as_path())
+        let open = hit.filter(|spot| match spot {
+            DropSpot::Pane(pane, path) => {
+                self.locate(*pane).is_some_and(|at| self.pane(at).browser.current_dir() != path.as_path())
+            }
+            DropSpot::Tab(index) => *index != self.active,
         });
-        let armed = open.is_some();
+        self.spring.2 = open.is_some().then(std::time::Instant::now);
         self.spring.1 = open;
-        if !armed {
-            return Task::none();
-        }
-        let generation = self.spring.0;
-        Task::perform(
-            async move {
-                tokio::time::sleep(SPRING_DELAY).await;
-                generation
-            },
-            Message::SpringFired,
-        )
     }
 
     /// The drag stayed on one folder: open it in the pane it is in, so
@@ -3319,19 +3373,87 @@ impl App {
         if generation != self.spring.0 || !self.drag_over {
             return Task::none();
         }
-        let Some((pane, path)) = self.spring.1.take() else { return Task::none() };
+        let Some(spot) = self.spring.1.take() else { return Task::none() };
         self.spring.0 += 1;
-        let Some(at) = self.locate(pane).filter(|at| at.tab == self.active) else { return Task::none() };
+        self.spring.2 = None;
+        self.spring_rest = self.drag_point;
         self.light_drop(None);
-        self.browser_message(at, BrowserMessage::Navigate(path))
+        match spot {
+            DropSpot::Pane(pane, path) => {
+                let Some(at) = self.locate(pane).filter(|at| at.tab == self.active) else { return Task::none() };
+                self.arriving = Some((pane, std::time::Instant::now()));
+                self.browser_message(at, BrowserMessage::Navigate(path))
+            }
+            DropSpot::Tab(index) if index < self.tabs.len() => {
+                let pane = self.tabs[index].pane().id;
+                self.arriving = Some((pane, std::time::Instant::now()));
+                self.update(Message::SwitchTab(index))
+            }
+            DropSpot::Tab(_) => Task::none(),
+        }
+    }
+
+    /// Whether anything is moving on its own, so the window asks for
+    /// frames — and only then: an idle window draws nothing.
+    fn animating(&self) -> bool {
+        self.ghost.is_some() || self.spring.2.is_some() || self.arriving.is_some()
+    }
+
+    /// One frame of whatever is moving: the card settling, a folder
+    /// filling as it gets ready to open (and opening, once full), a
+    /// sprung folder fading in.
+    fn frame(&mut self, now: std::time::Instant) -> Task<Message> {
+        use hyprforge_files::drag_show;
+        self.now = now;
+        if self.ghost.as_ref().is_some_and(|g| g.gone(now)) {
+            self.ghost = None;
+        }
+        let mut sprung = Task::none();
+        if let (Some(spot), Some(armed)) = (self.spring.1.clone(), self.spring.2) {
+            let opening = drag_show::opening(armed, now);
+            match &spot {
+                DropSpot::Pane(id, _) => {
+                    if let Some(at) = self.locate(*id) {
+                        let _ = self.pane_mut(at).browser.update(BrowserMessage::DropOpening(opening));
+                    }
+                }
+                DropSpot::Tab(index) => self.drop_tab = Some((*index, opening)),
+            }
+            if opening >= 1.0 {
+                sprung = self.spring_fired(self.spring.0);
+            }
+        }
+        if let Some((pane, started)) = self.arriving {
+            let cover = drag_show::arrival_cover(started, now);
+            if let Some(at) = self.locate(pane) {
+                let _ = self.pane_mut(at).browser.update(BrowserMessage::Arriving(cover));
+            }
+            if cover <= 0.0 {
+                self.arriving = None;
+            }
+        }
+        sprung
     }
 
     /// Lights the folder a drag is over in the pane it is over, and
     /// unlights it in every other pane of the tab — `None` unlights all.
-    fn light_drop(&mut self, hit: Option<(u64, PathBuf)>) {
+    fn light_drop(&mut self, hit: Option<DropSpot>) {
+        if let Some(DropSpot::Pane(id, _)) = &hit {
+            self.spring_target = Some(*id);
+        }
         for pane in &mut self.tabs[self.active].panes {
-            let here = hit.as_ref().filter(|(id, _)| *id == pane.id).map(|(_, path)| path.clone());
+            let here = match &hit {
+                Some(DropSpot::Pane(id, path)) if *id == pane.id => Some(path.clone()),
+                _ => None,
+            };
             let _ = pane.browser.update(BrowserMessage::DropHover(here));
+        }
+        let tab = match hit {
+            Some(DropSpot::Tab(index)) => Some(index),
+            _ => None,
+        };
+        if self.drop_tab.map(|(i, _)| i) != tab {
+            self.drop_tab = tab.map(|i| (i, 0.0));
         }
     }
 
@@ -3418,6 +3540,8 @@ impl App {
         if paths.is_empty() {
             return Task::none();
         }
+        let card = hyprforge_files::drag_show::card_for(&paths, self.modifiers.control());
+        self.ghost = Some(hyprforge_files::drag_show::Ghost::pick_up(card, std::time::Instant::now()));
         self.inner_drag = Some(hyprforge_files::inner_drag::InnerDrag::new(paths));
         hyprforge_files::inner_drag::set_active(true);
         self.drag_over = true;
@@ -3441,6 +3565,11 @@ impl App {
                 match step(at, window) {
                     Step::Over(at) => {
                         drag.at = Some(at);
+                        let copying = self.modifiers.control();
+                        if let Some(ghost) = self.ghost.as_mut() {
+                            ghost.at = Some(at);
+                            ghost.card.copying = copying;
+                        }
                         self.drop_event(hyprforge_files::dnd::DropEvent::Over { x: at.x.into(), y: at.y.into() })
                     }
                     Step::HandOff => self.hand_off_drag(),
@@ -3458,12 +3587,35 @@ impl App {
                 self.end_inner_drag();
                 Task::none()
             }
+            DragEvent::Wheel(dy) => {
+                // The pane the drag is over, by the last answer the
+                // layout gave; the one with the keyboard before any.
+                let pane = match &self.spring_target {
+                    Some(id) => self.locate(*id),
+                    None => Some(self.focused()),
+                };
+                let Some(at) = pane else { return Task::none() };
+                let id = self.pane(at).browser.list_scrollable_id();
+                let scrolled = iced::widget::operation::scroll_by(
+                    id,
+                    iced::widget::operation::AbsoluteOffset { x: 0.0, y: dy },
+                );
+                // What is under the pointer moved: ask again.
+                let again = match self.drag_point {
+                    Some((x, y)) => self.drop_event(hyprforge_files::dnd::DropEvent::Over { x, y }),
+                    None => Task::none(),
+                };
+                scrolled.chain(again)
+            }
         }
     }
 
     /// Ends a drag inside the window, unlighting whatever it was over.
     fn end_inner_drag(&mut self) -> Option<hyprforge_files::inner_drag::InnerDrag> {
         hyprforge_files::inner_drag::set_active(false);
+        if let Some(ghost) = self.ghost.as_mut() {
+            ghost.put_down(std::time::Instant::now());
+        }
         self.disarm_spring();
         self.drag_over = false;
         self.drop_probe.1 = None;
@@ -3474,7 +3626,11 @@ impl App {
     /// The drag reached the window's edge: from here it is the
     /// compositor's, so another application can take it.
     fn hand_off_drag(&mut self) -> Task<Message> {
-        match self.end_inner_drag() {
+        // The compositor draws its own drag from here; two would be one
+        // too many.
+        let ended = self.end_inner_drag();
+        self.ghost = None;
+        match ended {
             Some(drag) => self.start_drag(drag.paths),
             None => Task::none(),
         }
@@ -3847,7 +4003,28 @@ impl App {
         self.handle_outcome(at, outcome)
     }
 
+    /// Every message, and then: whatever the window has to say goes to
+    /// the desktop's notifications while a daemon is there to show it —
+    /// see `hyprforge_files::notify`. Here rather than at each of the
+    /// hundred places a status line is set, so none can be missed.
     fn update(&mut self, message: Message) -> Task<Message> {
+        use hyprforge_files::notify::{show, Note};
+        let task = self.update_inner(message);
+        if self.notes {
+            if let Some(text) = self.status.take() {
+                show(Note::Status(text));
+            }
+            if let Some((id, text)) = &self.notice {
+                if *id != self.noted_undo {
+                    self.noted_undo = *id;
+                    show(Note::Undo { text: text.clone(), seconds: self.config.behaviour.undo_notice_seconds });
+                }
+            }
+        }
+        task
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers;
@@ -4237,6 +4414,27 @@ impl App {
                 self.drop_event(event)
             }
             Message::InnerDrag(event) => self.inner_drag_event(event),
+            Message::Note(event) => {
+                use hyprforge_files::notify::{Note, NoteEvent};
+                match event {
+                    NoteEvent::Available(there) => {
+                        self.notes = there;
+                        Task::none()
+                    }
+                    // Not shown: it goes on the window's own line, and so
+                    // does everything after — a daemon that failed once
+                    // is not trusted with the next message.
+                    NoteEvent::Failed(note) => {
+                        self.notes = false;
+                        if let Note::Status(text) = note {
+                            self.status = Some(text);
+                        }
+                        Task::none()
+                    }
+                    NoteEvent::Undo => self.update(Message::Browser(BrowserMessage::Perform(Action::Undo))),
+                    NoteEvent::History => self.update(Message::UndoHistory(true)),
+                }
+            }
             Message::AdminOpened(pane_id, path, result) => {
                 let Some(at) = self.locate(pane_id) else { return Task::none() };
                 match result {
@@ -4257,19 +4455,26 @@ impl App {
                 // An answer for a drag that has since left or been let go.
                 let hit = hit.filter(|_| self.drag_over);
                 self.light_drop(hit.clone());
-                let spring = self.arm_spring(hit);
-                let probe = match self.drop_probe.1.take() {
+                self.arm_spring(hit);
+                match self.drop_probe.1.take() {
                     Some(at) => self.probe_drop(at, None),
                     None => Task::none(),
-                };
-                Task::batch([spring, probe])
+                }
             }
-            Message::SpringFired(generation) => self.spring_fired(generation),
+            Message::Frame(now) => self.frame(now),
             Message::DropHit(None, Some(_)) => {
                 self.status = Some("Drop files onto a folder, or onto the listing.".to_string());
                 Task::none()
             }
-            Message::DropHit(Some((_, into)), Some(from)) => self.plan_drop(into, from),
+            Message::DropHit(Some(DropSpot::Pane(_, into)), Some(from)) => self.plan_drop(into, from),
+            // On a tab: into the folder that tab shows.
+            Message::DropHit(Some(DropSpot::Tab(index)), Some(from)) => match self.tabs.get(index) {
+                Some(tab) => {
+                    let into = tab.browser().current_dir().to_path_buf();
+                    self.plan_drop(into, from)
+                }
+                None => Task::none(),
+            },
             Message::DropPlanned(plan) => match plan {
                 hyprforge_files_core::drop::DropPlan::Nothing => Task::none(),
                 hyprforge_files_core::drop::DropPlan::Paste { clip, into } => {
@@ -4798,7 +5003,15 @@ impl App {
         // which reads as a toolbar of pills rather than as tabs.
         let mut bar = row![].spacing(2.0).align_y(tabstrip::STRIP_ALIGNMENT);
         for (index, tab) in self.tabs.iter().enumerate() {
-            bar = bar.push(tab_widget(index, tab, index == self.active, scale));
+            use hyprforge_ui::widgets::{drop_target_style, DropLook};
+            let look = match self.drop_tab {
+                Some((over, opening)) if over == index => DropLook::Over { opening },
+                _ => DropLook::Idle,
+            };
+            let target = container(tab_widget(index, tab, index == self.active, scale))
+                .id(tab_target_id(index))
+                .style(move |_: &Theme| drop_target_style(look));
+            bar = bar.push(target);
         }
 
         let plus = tabstrip::new_tab_size();
@@ -4849,6 +5062,28 @@ impl App {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let base = self.view_window();
+        let Some(ghost) = &self.ghost else { return base };
+        let Some(at) = ghost.at else { return base };
+        // Over everything while a drag is under way: the card at the
+        // pointer, and a grabbing hand across the whole window. The
+        // layer reports an interaction, so iced's `stack` gives what is
+        // under it a levitated cursor — no row lights up as hovered
+        // under a drag, and letting go over the row it started on is
+        // not a click on it.
+        let (dx, dy) = hyprforge_files::drag_show::CARD_OFFSET;
+        let lift = ghost.lift(self.now);
+        let card = iced::widget::float(hyprforge_ui::widgets::drag_card(&ghost.card, lift, self.font_scale))
+            .scale(ghost.scale(self.now));
+        let layer = iced::widget::stack![
+            iced::widget::mouse_area(iced::widget::Space::new().width(Length::Fill).height(Length::Fill))
+                .interaction(iced::mouse::Interaction::Grabbing),
+            iced::widget::pin(card).position(iced::Point::new(at.x + dx, at.y + dy)),
+        ];
+        iced::widget::stack![base, layer].into()
+    }
+
+    fn view_window(&self) -> Element<'_, Message> {
         let scale = self.font_scale;
         let tab = self.active_tab();
 
@@ -4887,7 +5122,9 @@ impl App {
             content = content.push(panel);
         }
 
-        if let Some((_, text)) = &self.notice {
+        // On the desktop's notifications instead, while a daemon is
+        // there — see `App::update`.
+        if let Some((_, text)) = self.notice.as_ref().filter(|_| !self.notes) {
             content = content.push(undo_notice(text, scale));
         }
 
@@ -5061,6 +5298,8 @@ impl App {
             iced::event::listen_with(field_escape),
             Subscription::run(hyprforge_files::dnd::events).map(Message::Dnd),
             hyprforge_files::inner_drag::events().map(Message::InnerDrag),
+            Subscription::run(hyprforge_files::notify::events).map(Message::Note),
+            if self.animating() { window::frames().map(Message::Frame) } else { Subscription::none() },
             // Drives and shares: listed at once, then again whenever
             // UDisks2 or gvfs says something changed, a burst at a time.
             Subscription::run_with(self.devices.backends.clone(), hyprforge_files::devices::watch)
@@ -6084,7 +6323,10 @@ fn tab_widget(index: usize, tab: &Tab, is_active: bool, scale: FontScale) -> Ele
     // Dim text on an inactive tab, full brightness on the active one.
     // The identity mark above keeps its colour either way — see
     // `tabstrip`'s own doc for why that asymmetry is deliberate.
-    let label = scaled_text(name, BASE_TEXT_SIZE, scale)
+    // Cut with "…" at the tab's edge: iced does not clip text, so an
+    // unwrapped name longer than the tab drew on across the strip.
+    let label = hyprforge_ui::widgets::clamped_text(name, 1)
+        .size(scale.apply(BASE_TEXT_SIZE))
         .color(if is_active {
             hyprforge_ui::theme::text()
         } else {
@@ -6141,11 +6383,21 @@ fn tab_widget(index: usize, tab: &Tab, is_active: bool, scale: FontScale) -> Ele
 /// closing the window immediately still saves.
 const RESIZE_SETTLE: u64 = 400;
 
-/// How long a drag has to rest on a folder before it opens — a
-/// spring-loaded folder. Finder's default "medium" delay is about this;
-/// much shorter and passing over a folder on the way somewhere else
-/// opens it, much longer and the user has let go before it does.
-const SPRING_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+/// Where a drag over the window is: a folder in one of the tab's panes —
+/// a row, a sidebar place, a crumb of the path bar, the listing's own
+/// background — or one of the tabs, which lands in the folder that tab
+/// shows.
+#[derive(Debug, Clone, PartialEq)]
+enum DropSpot {
+    Pane(u64, PathBuf),
+    Tab(usize),
+}
+
+/// The widget id a tab's drop target carries, for the same
+/// `drop::HitTest` the panes' folders answer to.
+fn tab_target_id(index: usize) -> iced::widget::Id {
+    iced::widget::Id::from(format!("hyprforge-drop-tab:{index}"))
+}
 
 /// A tab's horizontal padding. Declared for inactive tabs too, even
 /// though nothing paints their background, so activating one makes a
@@ -6487,6 +6739,8 @@ mod tests {
             undo: hyprforge_files_core::undo::UndoHistory::new(20),
             notice: None,
             next_notice: 0,
+            notes: false,
+            noted_undo: 0,
             undo_history_open: false,
             next_job_id: 1,
             modifiers: keyboard::Modifiers::default(),
@@ -6496,7 +6750,14 @@ mod tests {
             from_drops: std::collections::HashSet::new(),
         archive_drag: None,
         inner_drag: None,
-        spring: (0, None),
+        spring: (0, None, None),
+        ghost: None,
+        spring_rest: None,
+        drag_point: None,
+        arriving: None,
+        drop_tab: None,
+        now: std::time::Instant::now(),
+        spring_target: None,
             config: Arc::new(hyprforge_files_core::config::Config::default()),
             #[cfg(debug_assertions)]
             debug_show: DebugShow::default(),
@@ -6518,9 +6779,9 @@ mod tests {
         let _ = app.update(Message::Dnd(DropEvent::Over { x: 3.0, y: 3.0 }));
         assert_eq!(app.drop_probe.1, Some((3.0, 3.0)), "only the newest waits");
 
-        let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
+        let _ = app.update(Message::DropHit(Some(DropSpot::Pane(0, PathBuf::from("/a/docs"))), None));
         assert!(app.drop_probe.0 && app.drop_probe.1.is_none(), "the waiting one went out");
-        let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
+        let _ = app.update(Message::DropHit(Some(DropSpot::Pane(0, PathBuf::from("/a/docs"))), None));
         assert!(!app.drop_probe.0);
     }
 
@@ -6595,9 +6856,8 @@ mod tests {
         let mut app = app_for_test(&["/a"]);
         let pane = app.tabs[0].panes[0].id;
         let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
-        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a/docs"))), None));
-        let armed = app.spring.0;
-        let _ = app.update(Message::SpringFired(armed));
+        let _ = app.update(Message::DropHit(Some(DropSpot::Pane(pane, PathBuf::from("/a/docs"))), None));
+        let _ = app.update(Message::Frame(app.spring.2.expect("armed") + hyprforge_files::drag_show::SPRING_DELAY));
         assert_eq!(app.tabs[0].panes[0].browser.current_dir(), Path::new("/a/docs"));
         assert!(app.inner_drag.is_some(), "the drag goes on, into the folder");
     }
@@ -6607,10 +6867,10 @@ mod tests {
         let mut app = app_for_test(&["/a"]);
         let pane = app.tabs[0].panes[0].id;
         let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
-        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a/docs"))), None));
-        let passed = app.spring.0;
-        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a/music"))), None));
-        let _ = app.update(Message::SpringFired(passed));
+        let _ = app.update(Message::DropHit(Some(DropSpot::Pane(pane, PathBuf::from("/a/docs"))), None));
+        let passed = app.spring.2.expect("armed");
+        let _ = app.update(Message::DropHit(Some(DropSpot::Pane(pane, PathBuf::from("/a/music"))), None));
+        let _ = app.update(Message::Frame(passed + hyprforge_files::drag_show::SPRING_DELAY));
         assert_eq!(app.tabs[0].panes[0].browser.current_dir(), Path::new("/a"));
     }
 
@@ -6621,10 +6881,10 @@ mod tests {
         let pane = app.tabs[0].panes[0].id;
         let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
         let _ = app.update(Message::InnerDrag(DragEvent::Moved(iced::Point::new(100.0, 100.0))));
-        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a/docs"))), None));
-        let armed = app.spring.0;
+        let _ = app.update(Message::DropHit(Some(DropSpot::Pane(pane, PathBuf::from("/a/docs"))), None));
+        let armed = app.spring.2.expect("armed");
         let _ = app.update(Message::InnerDrag(DragEvent::Released));
-        let _ = app.update(Message::SpringFired(armed));
+        let _ = app.update(Message::Frame(armed + hyprforge_files::drag_show::SPRING_DELAY));
         assert_eq!(app.tabs[0].panes[0].browser.current_dir(), Path::new("/a"));
     }
 
@@ -6633,7 +6893,7 @@ mod tests {
         let mut app = app_for_test(&["/a"]);
         let pane = app.tabs[0].panes[0].id;
         let _ = app.begin_drag(vec![PathBuf::from("/a/x.txt")]);
-        let _ = app.update(Message::DropHit(Some((pane, PathBuf::from("/a"))), None));
+        let _ = app.update(Message::DropHit(Some(DropSpot::Pane(pane, PathBuf::from("/a"))), None));
         assert_eq!(app.spring.1, None);
     }
 
@@ -6699,7 +6959,7 @@ mod tests {
         let _ = app.update(Message::Dnd(DropEvent::Over { x: 1.0, y: 1.0 }));
         let _ = app.update(Message::Dnd(DropEvent::Left));
         // The hit-test that went out on `Over` comes back late.
-        let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
+        let _ = app.update(Message::DropHit(Some(DropSpot::Pane(0, PathBuf::from("/a/docs"))), None));
         assert!(!format!("{:?}", app.tabs[0].browser()).contains("drop_hover: Some"));
     }
 
@@ -6707,7 +6967,7 @@ mod tests {
     fn a_drag_leaving_the_window_unlights_the_folder() {
         use hyprforge_files::dnd::DropEvent;
         let mut app = app_for_test(&["/a"]);
-        let _ = app.update(Message::DropHit(Some((0, PathBuf::from("/a/docs"))), None));
+        let _ = app.update(Message::DropHit(Some(DropSpot::Pane(0, PathBuf::from("/a/docs"))), None));
         let _ = app.update(Message::Dnd(DropEvent::Left));
         assert!(!format!("{:?}", app.tabs[0].browser()).contains("drop_hover: Some"));
     }

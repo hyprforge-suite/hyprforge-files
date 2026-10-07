@@ -33,8 +33,15 @@ and viewer already shares. Files can be copied and pasted with other
 applications, and dragged out of the window into them — members of an
 archive too, unpacked while the drag is under way and handed over once
 they are on disk. Dragged between folders of the window itself, they
-move (Ctrl copies), and a folder the drag rests on opens so it can go
-on deeper.
+move (Ctrl copies) — picked up as a card under the pointer, onto a
+folder, a sidebar place, a folder in the path bar or a tab — and a
+folder the drag rests on fills as it gets ready, then opens so the drag
+can go on deeper.
+
+**Messages** — "Moved 3 items", a copy that failed — go to the
+desktop's notifications when a notification daemon is running, the
+undo notice with its Undo and History buttons; with none, they are a
+line at the bottom of the window as before.
 
 **Zoom** with Ctrl+scroll over the listing, or Ctrl+= / Ctrl+- / Ctrl+0,
 the way Explorer does it: one ladder from Compact details through

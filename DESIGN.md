@@ -1282,11 +1282,29 @@ it.
   of the same one, they are refused in a sentence. A drag out of an
   archive starts unpacking only when it is handed to the compositor.
 - **Spring-loaded folders.** A drag that rests on a folder for 700ms
-  opens it in the pane it is in, and the drag goes on into it. A
-  generation guards the timer, the way `read_generation` guards a
-  listing: moving to another folder, leaving or letting go makes the
-  timer's answer stale. Resting on the open folder's own background
-  arms nothing.
+  opens it in the pane it is in, and the drag goes on into it; resting
+  on a tab switches to it. The wait is drawn — the folder's outline
+  fills from the left as it runs out — and the new listing fades in
+  under a cover of the card's colour rather than snapping, both from
+  `drag_show`'s clock on `window::frames`, subscribed only while
+  something moves. After a folder springs, nothing arms again until the
+  pointer has moved 8px: held still, it otherwise opened whatever row
+  of the new listing landed under it, and so on down. Resting on the
+  open folder's own background arms nothing.
+- **What a drag looks like.** The thing picked up becomes a card under
+  the pointer (`hyprforge_ui::widgets::drag_card`): it lifts out of the
+  row with a slight overshoot, shows a pile and a count for more than
+  one, a `+` while Ctrl copies, and sinks where it is let go. A target
+  under it is outlined in the foreground colour (`drop_target_style`) —
+  not the accent, which means selected, and not the hover fill, which
+  is what made the old highlight invisible. A layer over the window
+  holds the grabbing cursor, which also keeps rows from lighting as
+  hovered and a release over the starting row from being a click; it
+  takes the wheel too, so the window scrolls the listing under the
+  drag itself.
+- **Where it can land**: a folder row or cell, the listing's background,
+  a sidebar place, a folder in the path bar (up a level by dragging),
+  and a tab, which lands in the folder that tab shows.
 
 Checked in a nested compositor with a virtual pointer and keyboard: a
 file dragged onto a folder row moved into it; one rested on a folder
@@ -1685,7 +1703,9 @@ as administrator" button. The browser shows it only when the host says
 `Admin::Offered` — never from `Mode`, because the view takes nothing that
 says which host it is in, and the dialog never offers it. Once the
 password is given the pane is elevated: a warning-coloured banner says
-"changes here affect the whole system", and the pane reads through an
+"changes here affect the whole system", with a "Leave administrator"
+button that reads the folder again as this user (and lets the helper go
+once no pane needs it), and the pane reads through an
 `AdminBackend` — an `FsBackend` over the helper — so listings, counts
 and path completion need no change above it. In that pane:
 
