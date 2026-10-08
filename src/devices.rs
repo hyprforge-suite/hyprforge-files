@@ -22,7 +22,7 @@
 use hyprforge_files_core::devices::{Ask, Devices};
 use hyprforge_volumes::backend::{ShareBackend, VolumeBackend};
 use hyprforge_volumes::settle::{settle, CEILING, QUIET};
-use hyprforge_volumes::{sentence, Gvfs, Operation, Share, Volume, VolumeError, VolumeId};
+use hyprforge_volumes::{sentence, ConnectError, Gadgets, Gvfs, Operation, Share, Volume, VolumeError, VolumeId};
 use iced::futures::{SinkExt, Stream};
 use std::collections::HashMap;
 use std::future::Future;
@@ -68,6 +68,7 @@ impl Hash for Backends {
 pub enum Event {
     Volumes(Result<Vec<Volume>, VolumeError>),
     Shares(Vec<Share>),
+    Gadgets(Gadgets),
     Gvfs(Gvfs),
 }
 
@@ -76,6 +77,8 @@ pub enum Event {
 pub enum Done {
     Volume { id: VolumeId, op: Operation, result: Result<Option<PathBuf>, VolumeError> },
     Disconnected { path: PathBuf, result: Result<(), String> },
+    /// A phone or camera opened (`Mount`, with where) or let go of.
+    Gadget { uri: String, op: Operation, result: Result<Option<PathBuf>, String> },
 }
 
 /// The work an [`Ask`] became, for the host to run off the UI thread.
@@ -102,6 +105,8 @@ pub struct DeviceHost {
     shared: Arc<Devices>,
     /// Which tab asked to go to a drive once it is mounted.
     opens: HashMap<VolumeId, u64>,
+    /// The same for a phone or camera, by URI.
+    gadget_opens: HashMap<String, u64>,
     gvfs: Option<Gvfs>,
     /// Mount points that went away since [`Self::take_gone`] was last
     /// asked — a stick pulled out, a share unmounted by another program.
@@ -111,7 +116,15 @@ pub struct DeviceHost {
 impl DeviceHost {
     pub fn new(backends: Backends, manages_mounts: bool) -> Self {
         let state = Devices { manages_mounts, ..Devices::default() };
-        DeviceHost { backends, shared: Arc::new(state.clone()), state, opens: HashMap::new(), gvfs: None, gone: Vec::new() }
+        DeviceHost {
+            backends,
+            shared: Arc::new(state.clone()),
+            state,
+            opens: HashMap::new(),
+            gadget_opens: HashMap::new(),
+            gvfs: None,
+            gone: Vec::new(),
+        }
     }
 
     /// What every tab should be showing.
@@ -163,6 +176,20 @@ impl DeviceHost {
                     .collect();
                 self.gone.extend(went);
                 self.state.shares = shares;
+            }
+            Event::Gadgets(gadgets) => {
+                // A phone pulled out while open takes its tabs with it.
+                let went: Vec<PathBuf> = self
+                    .state
+                    .gadgets
+                    .list
+                    .iter()
+                    .filter_map(|old| old.mounted.clone())
+                    .filter(|m| !gadgets.list.iter().any(|g| g.mounted.as_ref() == Some(m)))
+                    .collect();
+                self.gone.extend(went);
+                self.state.gadget_busy.retain(|uri, _| gadgets.list.iter().any(|g| &g.uri == uri));
+                self.state.gadgets = gadgets;
             }
             Event::Gvfs(gvfs) => {
                 self.gvfs = Some(gvfs);
@@ -224,6 +251,38 @@ impl DeviceHost {
                     Done::Disconnected { path, result }
                 })
             }
+            Ask::MountGadget { uri, open } => {
+                let gadget = self.state.gadget(&uri)?.clone();
+                if self.state.gadget_busy.contains_key(&uri) {
+                    return None;
+                }
+                self.state.gadget_busy.insert(uri.clone(), Operation::Mount);
+                if open {
+                    self.gadget_opens.insert(uri.clone(), tab);
+                }
+                let shares = self.backends.shares.clone();
+                Box::pin(async move {
+                    let result = shares.connect(&uri, Default::default()).await.map_err(|e| match e {
+                        // gio's own words, which the gadget sentences
+                        // read; anything else is already a sentence.
+                        ConnectError::Failed(said) => hyprforge_volumes::gadgets::failure(gadget.kind, &gadget.label, &said),
+                        other => other.to_string(),
+                    });
+                    Done::Gadget { uri, op: Operation::Mount, result }
+                })
+            }
+            Ask::ReleaseGadget(uri) => {
+                self.state.gadget(&uri)?;
+                if self.state.gadget_busy.contains_key(&uri) {
+                    return None;
+                }
+                self.state.gadget_busy.insert(uri.clone(), Operation::Unmount);
+                let shares = self.backends.shares.clone();
+                Box::pin(async move {
+                    let result = shares.release(&uri).await.map(|()| None);
+                    Done::Gadget { uri, op: Operation::Unmount, result }
+                })
+            }
         };
         self.publish();
         Some(work)
@@ -251,6 +310,36 @@ impl DeviceHost {
                         ..Finished::default()
                     },
                     (Ok(_), _) => Finished::default(),
+                }
+            }
+            Done::Gadget { uri, op, result } => {
+                self.state.gadget_busy.remove(&uri);
+                let opener = self.gadget_opens.remove(&uri);
+                let gadget = self.state.gadgets.list.iter_mut().find(|g| g.uri == uri);
+                let label = gadget.as_ref().map_or_else(|| "the device".to_string(), |g| g.label.clone());
+                match (result, gadget) {
+                    (Err(why), _) if op == Operation::Mount => Finished { status: Some(why), ..Finished::default() },
+                    (Err(why), _) => Finished {
+                        status: Some(format!("Couldn't let go of \u{201C}{label}\u{201D}: {why}")),
+                        ..Finished::default()
+                    },
+                    (Ok(point), Some(gadget)) if op == Operation::Mount => {
+                        // As a drive's: the row changes now, not when
+                        // gvfs's signal comes round.
+                        if point.is_some() {
+                            gadget.mounted = point.clone();
+                        }
+                        Finished {
+                            open: opener.zip(point.or_else(|| gadget.mounted.clone())),
+                            ..Finished::default()
+                        }
+                    }
+                    (Ok(_), Some(gadget)) => Finished {
+                        left: gadget.mounted.take(),
+                        status: Some(format!("\u{201C}{label}\u{201D} can be unplugged.")),
+                        ..Finished::default()
+                    },
+                    (Ok(_), None) => Finished::default(),
                 }
             }
             Done::Disconnected { path, result } => {
@@ -284,6 +373,7 @@ pub fn watch(backends: &Backends) -> impl Stream<Item = Event> + use<> {
         let Backends { volumes, shares } = backends;
         let _ = out.send(Event::Gvfs(shares.gvfs().await)).await;
         let _ = out.send(Event::Shares(shares.shares().await)).await;
+        let _ = out.send(Event::Gadgets(shares.gadgets().await)).await;
         let mut share_signals = Some(shares.watch().await);
         loop {
             let mut volume_signals = match volumes.watch().await {
@@ -316,6 +406,7 @@ pub fn watch(backends: &Backends) -> impl Stream<Item = Event> + use<> {
                     let _ = out.send(Event::Volumes(volumes.volumes().await)).await;
                 }
                 let _ = out.send(Event::Shares(shares.shares().await)).await;
+                let _ = out.send(Event::Gadgets(shares.gadgets().await)).await;
             }
         }
     })
@@ -473,9 +564,62 @@ mod tests {
         let mut events = Box::pin(watch(&backends));
         assert!(matches!(events.next().await, Some(Event::Gvfs(_))));
         assert!(matches!(events.next().await, Some(Event::Shares(_))));
+        assert!(matches!(events.next().await, Some(Event::Gadgets(_))));
         assert!(matches!(events.next().await, Some(Event::Volumes(Err(VolumeError::Unavailable)))));
         mock.set_unavailable(false);
         let next = tokio::time::timeout(Duration::from_secs(5), events.next()).await.unwrap();
         assert!(matches!(&next, Some(Event::Volumes(Ok(v))) if v.len() == 1), "{next:?}");
+    }
+
+    fn phone_host(answer: Result<Option<PathBuf>, ConnectError>) -> (DeviceHost, Arc<MockShares>) {
+        let phone = hyprforge_volumes::Gadget {
+            label: "SAMSUNG Android".into(),
+            kind: hyprforge_volumes::GadgetKind::Phone,
+            uri: "mtp://S/".into(),
+            mounted: None,
+        };
+        let shares = Arc::new(MockShares::new(Gvfs::Available { schemes: vec!["mtp".into()] }, vec![]));
+        shares.answer(vec![answer]);
+        let backends = Backends { volumes: Arc::new(MockVolumes::new(vec![])), shares: shares.clone() };
+        let mut host = DeviceHost::new(backends, true);
+        host.heard(Event::Gadgets(Gadgets { list: vec![phone], unreadable: vec![] }));
+        (host, shares)
+    }
+
+    #[tokio::test]
+    async fn a_phone_clicked_opens_in_the_tab_that_clicked() {
+        let (mut host, shares) = phone_host(Ok(Some(PathBuf::from("/g/mtp:host=S"))));
+        let work = host.ask(Ask::MountGadget { uri: "mtp://S/".into(), open: true }, 4).unwrap();
+        assert_eq!(host.snapshot().gadget_busy.get("mtp://S/"), Some(&Operation::Mount));
+        assert!(host.ask(Ask::MountGadget { uri: "mtp://S/".into(), open: true }, 5).is_none(), "one at a time");
+        let finished = host.done(work.await);
+        assert_eq!(finished.open, Some((4, PathBuf::from("/g/mtp:host=S"))));
+        assert_eq!(shares.connects()[0].0, "mtp://S/");
+        assert_eq!(host.devices().gadgets.list[0].mounted, Some(PathBuf::from("/g/mtp:host=S")));
+    }
+
+    /// gvfs-mtp's own failure for a locked phone becomes the thing to do
+    /// about it.
+    #[tokio::test]
+    async fn a_locked_phone_is_asked_to_be_unlocked() {
+        let said = "Unable to open MTP device \u{201C}001,008\u{201D}".to_string();
+        let (mut host, _) = phone_host(Err(ConnectError::Failed(said)));
+        let work = host.ask(Ask::MountGadget { uri: "mtp://S/".into(), open: true }, 1).unwrap();
+        let finished = host.done(work.await);
+        assert!(finished.status.unwrap().contains("Unlock it"));
+        assert_eq!(finished.open, None);
+        assert!(host.snapshot().gadget_busy.is_empty());
+    }
+
+    #[tokio::test]
+    async fn letting_go_of_a_phone_says_it_can_be_unplugged_and_moves_tabs_off_it() {
+        let (mut host, shares) = phone_host(Ok(Some(PathBuf::from("/g/mtp:host=S"))));
+        let open = host.ask(Ask::MountGadget { uri: "mtp://S/".into(), open: false }, 1).unwrap();
+        host.done(open.await);
+        let release = host.ask(Ask::ReleaseGadget("mtp://S/".into()), 1).unwrap();
+        let finished = host.done(release.await);
+        assert_eq!(finished.left, Some(PathBuf::from("/g/mtp:host=S")));
+        assert!(finished.status.unwrap().contains("can be unplugged"));
+        assert_eq!(shares.releases(), ["mtp://S/"]);
     }
 }

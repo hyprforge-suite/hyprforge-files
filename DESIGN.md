@@ -1853,6 +1853,51 @@ dismissed prompt. Not tested automatically, deliberately: a real pkexec
 round trip, which puts a password prompt on the session running the
 tests.
 
+## Phones and cameras — built (2026-10-07), not yet seen with a phone
+
+A phone is not a block device — Android speaks MTP, a camera PTP — so
+UDisks2 never lists one. gvfs has a backend for each, `gvfs-mtp` and
+`gvfs-gphoto2`, that notices the device and mounts it into the same FUSE
+directory a network share lands in; once open, a phone is browsed with
+exactly the code a home folder is. `hyprforge-volumes`' `gadgets` module
+is the reading, and the rows sit in **Devices**, with the drives, because
+a phone is something you plug in — gvfs mounting it beside the servers
+does not make it one.
+
+- **Listed through `gio mount -li`**, the published face of gvfs's
+  volume monitors, whose own protocol is `org.gtk.Private.…`. The
+  fixtures are real output copied from public bug reports — a Samsung
+  phone's (2025) and a Nikon camera's — not written from memory, and a
+  `check.sh` tier holds the parser to the `gio` installed here.
+- **Not installed is a row, not an absence.** This machine has neither
+  backend, and the person chose not to install them; so the kernel's
+  own USB listing (sysfs, no daemon) is read too, for an interface that
+  is a phone or a camera. Android's descriptors (`MtpDescriptors.cpp`)
+  are the source: both are class `06`, and MTP's interface carries the
+  string `"MTP"`. A device on USB that no gvfs monitor claimed, whose
+  backend is missing, is a dim row: "Install gvfs-mtp to open “Pixel 8”".
+- **Heard when plugged in** through inotify on `/dev/bus/usb/<bus>/`,
+  where the kernel makes a node per device — so a phone arrives even
+  with no gvfs monitor to hear it — and through the volume monitors'
+  signals, used only as "look again".
+- **A click opens it** (`gio mount <activation root>`), the eject mark
+  lets go (`gio mount -u`), and "can be unplugged" is said after. gvfs's
+  and libgphoto2's own failures become what to do: "Unable to open MTP
+  device" is a locked phone ("Unlock it, and choose File transfer…"),
+  "Could not lock the device" a camera another program holds.
+- **An empty phone is not empty.** A locked Android phone, or one set to
+  charge only, mounts and lists no storage at all; its top folder says
+  to unlock it rather than "This folder is empty."
+- **No thumbnails or folder counts on one.** Every read is a USB round
+  trip and a thumbnail reads the whole photograph; a folder of two
+  thousand would keep the phone busy for minutes. Its files keep their
+  icons, as Nautilus's do on MTP. Not a preference yet.
+
+Not verified with a real device: nothing has been plugged in, because
+the backends are not installed here. What is verified is the parsing
+against real published output and this machine's own `gio` and sysfs,
+and the window against the mock backend.
+
 ## What to verify, not assume
 
 - Screenshot the real window against the mockup at the same size, and compare

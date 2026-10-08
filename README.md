@@ -114,6 +114,11 @@ gvfs's and the kernel's, and **Connect to Server** mounts an `smb://`,
 `sftp://` or `ftp://` address through gvfs, asking for a name and
 password when the server wants one. UDisks2 not running, or gvfs not
 installed, is said in the sidebar or the dialog rather than hidden.
+**Phones and cameras** are in Devices too: a click opens one through
+gvfs's MTP or gPhoto2 backend and the eject mark lets go of it. A
+locked phone is asked to be unlocked rather than shown empty, and one
+plugged in with no backend to read it is a row saying which package to
+install (`gvfs-mtp`, `gvfs-gphoto2`).
 
 A folder on screen **keeps itself up to date**: a download finishing, a
 file saved from an editor or a build writing its output shows up without
@@ -243,7 +248,9 @@ thumbnail.
 So are UDisks2 and gvfs. Without UDisks2 the Devices section says it
 isn't running; without gvfs (and `gvfs-smb` for Windows shares) the
 Connect to Server dialog says what to install. Network shares mounted
-some other way — an fstab line, `sshfs` — are listed either way.
+some other way — an fstab line, `sshfs` — are listed either way. A phone
+needs `gvfs-mtp` and a camera `gvfs-gphoto2`; without them, a plugged-in
+one is listed with the package to install.
 
 ## The open/save dialog
 
