@@ -53,6 +53,9 @@ hyprforge-thumbnails = "0.1"
 # photo viewer finds it — the two share one thumbnail cache, and two
 # programs picking different frames would each find the other's there.
 hyprforge-video = "0.1"
+# Quick Look's playing video and turning model — the panes Media's viewer
+# uses, see `quicklook_live.rs`.
+hyprforge-viewer = "0.1"
 # STL, 3MF and OBJ thumbnails in the grid, drawn the way the viewer's
 # own grid draws them — see `preview::thumbnail`.
 hyprforge-mesh = "0.1"

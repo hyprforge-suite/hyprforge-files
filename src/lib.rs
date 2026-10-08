@@ -46,6 +46,7 @@ pub mod preferences;
 pub mod preview;
 pub mod properties;
 pub mod quicklook;
+pub mod quicklook_live;
 pub mod search_jobs;
 pub mod session;
 pub mod start;

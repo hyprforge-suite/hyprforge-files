@@ -54,7 +54,9 @@ ones: Details, Large icons and Columns.
 
 **Quick Look** (Space) shows the focused entry large, over the window —
 the same readers as the preview pane, with the picture decoded for the
-card's size on your output's scale. The arrows move through the folder
+card's size on your output's scale. A video plays, with Media's bar
+under it, and a 3D model turns under a drag — the same panes Media's
+viewer draws. The arrows move through the folder
 with it open, Enter opens the file, and Space or Escape puts it away.
 A Space typed between two words of a search still types a space. It
 works in the open/save dialog too.

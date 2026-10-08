@@ -348,15 +348,29 @@ of it directly: the same 1336-pixel decode of a 37-megapixel phone
 photograph peaks at 19MB rather than 117MB in a process of its own, and
 a grid thumbnail at 9MB rather than 116MB.
 
-Not built: **playing video.** The card shows a video's frame, length and
-size. Playing it means libmpv, a player thread and a `shader` primitive
-(`hyprforge-media/src/film.rs`) in a card that closes on any key — not
-cheap, and a frame answers "which video is this". No 3D models either:
-an STL previews as its icon and facts. And the vision doc's "shared
-component multiple apps call into" is not this yet: the card lives in
-`hyprforge-files-core` and its readers in this crate, so Files and its
-open/save dialog share it and Media does not. Media's viewer already is
-the large view of a file; the piece worth sharing later is the readers.
+**Playing video and turning models — built** (2026-10-07). A video plays
+in the card and a 3D model turns under the pointer, through the panes
+Media's viewer draws: `hyprforge-viewer`, which took Media's `film.rs`
+and `model/` out of the app and put the player, its frame texture, the
+renderer and the hands on them — drag to turn, right-drag to pan, scroll
+to zoom about the pointer, the play bar — in one place. `src/quicklook_live.rs`
+holds the decision as a pure `step`:
+
+- **Nothing starts until the card has settled.** The still the card was
+  already reading comes first, and it already waits out a held arrow, so
+  stepping through fifty videos starts one player — the one stopped on.
+- **Nothing plays behind a closed card.** Closing or moving on drops the
+  pane, and dropping a `VideoPane` stops its player and its thread.
+  Measured in a nested Hyprland: 73 threads with a clip playing, 36 two
+  seconds after Space closed it, mpv's `vo` and `demux` gone.
+- **The card's header and key hint stay.** `Browser::quick_look_parts`
+  hands the window the card's top and bottom, and `quick_look_card` puts
+  the live pane between them, so the card does not change shape when a
+  still becomes a player.
+
+What is still Files' own is the card and its readers; Media does not
+call into them. Media's viewer already is the large view of a file, so
+pillar 8's "shared component" is the panes rather than the card.
 
 Column view (`hyprforge-files-core`'s `columns`) puts a pane for each
 folder on the way here to the left of the folder in view, from home when

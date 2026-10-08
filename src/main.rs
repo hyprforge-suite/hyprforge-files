@@ -269,6 +269,9 @@ fn main() -> iced::Result {
         compressing: None,
         tagging: None,
         picking_workspace: None,
+        ql_live: None,
+        ql_generation: 0,
+        ql_pixels: (0, 0),
         versions: None,
         bulk_rename: None,
         unlocking: None,
@@ -599,6 +602,10 @@ enum Message {
     TaggedRead(u64, String, Vec<Entry>, Vec<PathBuf>),
     /// From the desktop's notifications — see `notify`.
     Note(hyprforge_files::notify::NoteEvent),
+    /// For Quick Look's video, its model, and a model read for it.
+    QlVideo(hyprforge_viewer::video::VideoMessage),
+    QlModel(hyprforge_viewer::model_pane::ModelMessage),
+    QlModelLoaded(PathBuf, Result<hyprforge_viewer::model_pane::Loaded, String>),
     /// Another launch's folders, handed to this window — see `handoff`.
     HandedOff(hyprforge_files::start::Start),
     /// What the snapshots hold of this file.
@@ -917,6 +924,14 @@ struct App {
     /// "Open in New Window on Workspace…": the folder, and Hyprland's
     /// workspaces to choose from — see `handoff::workspaces`.
     picking_workspace: Option<(PathBuf, Vec<(String, String)>)>,
+    /// Quick Look's playing video or turning model, while the card shows
+    /// one — see `hyprforge_files::quicklook_live`.
+    ql_live: Option<hyprforge_files::quicklook_live::Live>,
+    /// Bumped per live pane, so a report from one since dropped is not
+    /// taken for the next.
+    ql_generation: u64,
+    /// The physical pixels the live video was last told it has.
+    ql_pixels: (u32, u32),
     /// "Previous Versions…": the file, and what the snapshots hold of it
     /// — `None` while still looking. See `hyprforge_files::versions`.
     versions: Option<(PathBuf, Option<VersionsFound>)>,
@@ -3983,6 +3998,106 @@ impl App {
         self.enqueue(Queued { id, kind: JobKind::Copy, dirs: vec![dir.to_path_buf()], what: QueuedWork::Paste { steps: vec![step] } })
     }
 
+    /// Quick Look's live pane, kept in step with the card — see
+    /// `hyprforge_files::quicklook_live`. After every message: what the
+    /// card shows can change by a key, a click, a listing arriving.
+    fn sync_quick_look(&mut self) -> Task<Message> {
+        use hyprforge_files::quicklook_live::{kind_of, step, Kind, Live, Step};
+        let browser = &self.pane(self.focused()).browser;
+        let showing = browser.quick_look_showing().map(Path::to_path_buf);
+        let settled = browser.quick_look_settled().is_some_and(|p| Some(p) == showing.as_deref());
+        let kind = showing.as_deref().and_then(|p| kind_of(p, self.mime.type_of(p)));
+        let task = match step(self.ql_live.as_ref().map(Live::path), showing.as_deref(), settled, kind) {
+            Step::Keep => Task::none(),
+            Step::Stop => {
+                // Dropping the pane stops the player and its thread.
+                self.ql_live = None;
+                Task::none()
+            }
+            Step::Start(path, Kind::Video) => {
+                self.ql_generation += 1;
+                self.ql_pixels = self.quick_look_pixels();
+                let (pane, task) = hyprforge_viewer::video::VideoPane::open(
+                    path,
+                    self.ql_generation,
+                    self.ql_pixels,
+                    false,
+                    false,
+                    "Enter opens it in your video player.",
+                );
+                self.ql_live = Some(Live::Video(pane));
+                task.map(Message::QlVideo)
+            }
+            Step::Start(path, Kind::Model) => {
+                self.ql_generation += 1;
+                self.ql_live = Some(Live::Model { path: path.clone(), pane: None, failed: None });
+                hyprforge_viewer::model_pane::load(path.clone()).map(move |r| Message::QlModelLoaded(path.clone(), r))
+            }
+        };
+        // The card follows the window; so do the video's frames.
+        let pixels = self.quick_look_pixels();
+        if let Some(Live::Video(pane)) = self.ql_live.as_mut() {
+            if pixels != self.ql_pixels {
+                self.ql_pixels = pixels;
+                pane.resize(pixels);
+            }
+        }
+        task
+    }
+
+    /// The card's middle, logical — where a live pane is drawn, less the
+    /// video bar's strip below it.
+    fn quick_look_box(&self) -> (f32, f32) {
+        let window = (self.last_window_size.0 as f32, self.last_window_size.1 as f32);
+        let (w, h) = hyprforge_files_core::browser::quick_look_picture_box(window, self.font_scale);
+        (w, (h - QL_BAR).max(1.0))
+    }
+
+    /// [`App::quick_look_box`] in physical pixels — what the player draws.
+    fn quick_look_pixels(&self) -> (u32, u32) {
+        let (w, h) = self.quick_look_box();
+        let k = self.output_scale.max(1.0);
+        ((w * k).round() as u32, (h * k).round() as u32)
+    }
+
+    /// The card's middle with the live pane in it, or `None` when there
+    /// is none for what the card shows.
+    fn quick_look_live_body(&self, showing: &Path) -> Option<Element<'_, Message>> {
+        use hyprforge_files::quicklook_live::Live;
+        let live = self.ql_live.as_ref().filter(|l| l.path() == showing)?;
+        let scale = self.font_scale;
+        let (w, h) = self.quick_look_box();
+        let size = Size::new(w, h);
+        let said = |text: String| -> Element<'_, Message> {
+            container(hyprforge_ui::widgets::meta_text(text, BASE_TEXT_SIZE, scale)).center(Length::Fill).into()
+        };
+        Some(match live {
+            Live::Video(pane) => {
+                let picture: Element<'_, Message> = match pane.film(size, scale) {
+                    Some(film) => film.map(Message::QlVideo),
+                    None => said(pane.error().map_or_else(|| "Loading\u{2026}".to_string(), str::to_string)),
+                };
+                let mut column = column![container(picture).width(Length::Fixed(w)).height(Length::Fixed(h))]
+                    .spacing(spacing::SM)
+                    .align_x(iced::Alignment::Center);
+                if pane.playing() {
+                    column = column.push(pane.bar(scale).map(Message::QlVideo));
+                }
+                column.into()
+            }
+            Live::Model { pane: Some(pane), .. } => {
+                let style = hyprforge_viewer::model::Style {
+                    draw_mode: hyprforge_mesh::style::DrawMode::default(),
+                    axes: false,
+                    backdrop: hyprforge_ui::theme::surface::root(),
+                };
+                pane.view(size, style, scale).map(Message::QlModel)
+            }
+            Live::Model { failed: Some(why), .. } => said(why.clone()),
+            Live::Model { .. } => said("Loading\u{2026}".to_string()),
+        })
+    }
+
     /// A window of its own for `path` — this same binary, never handed
     /// back to this window — on `workspace` when one is given.
     fn new_window(&mut self, path: &Path, workspace: Option<&str>) {
@@ -4260,6 +4375,8 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         use hyprforge_files::notify::{show, Note};
         let task = self.update_inner(message);
+        let live = self.sync_quick_look();
+        let task = Task::batch([task, live]);
         if self.notes {
             if let Some(text) = self.status.take() {
                 show(Note::Status(text));
@@ -4683,6 +4800,26 @@ impl App {
             }
             Message::InnerDrag(event) => self.inner_drag_event(event),
             Message::HandedOff(start) => self.open_handed(start),
+            Message::QlVideo(message) => {
+                if let Some(hyprforge_files::quicklook_live::Live::Video(pane)) = self.ql_live.as_mut() {
+                    pane.update(message);
+                }
+                Task::none()
+            }
+            Message::QlModel(message) => {
+                let (w, h) = self.quick_look_box();
+                if let Some(hyprforge_files::quicklook_live::Live::Model { pane: Some(pane), .. }) = self.ql_live.as_mut() {
+                    pane.update(message, Size::new(w, h));
+                }
+                Task::none()
+            }
+            Message::QlModelLoaded(path, result) => {
+                let generation = self.ql_generation;
+                if let Some(live) = self.ql_live.as_mut() {
+                    live.model_loaded(&path, result, generation);
+                }
+                Task::none()
+            }
             Message::VersionsFound(path, found) => {
                 // An answer for a sheet since closed, or for another file.
                 if let Some((open, result)) = self.versions.as_mut().filter(|(p, _)| *p == path) {
@@ -5599,6 +5736,20 @@ impl App {
         // right click chooses its pane before it opens anything.
         let pane = tab.pane();
         let id = pane.id;
+        // A video or a model in Quick Look: the card is drawn here, with
+        // the live pane in its middle — see `quicklook_live`.
+        if let Some(showing) = pane.browser.quick_look_showing() {
+            if let (Some(body), Some((header, keys))) = (self.quick_look_live_body(showing), pane.browser.quick_look_parts(scale)) {
+                let card = hyprforge_files_core::browser::quick_look_card(
+                    header.map(move |m| Message::Pane(id, m)),
+                    body,
+                    keys.map(move |m| Message::Pane(id, m)),
+                    size,
+                    Message::Pane(id, BrowserMessage::QuickLookClose),
+                );
+                return iced::widget::stack![window, card].into();
+            }
+        }
         match pane.browser.menu_overlay(scale, size) {
             Some(overlay) => iced::widget::stack![window, overlay.map(move |m| Message::Pane(id, m))].into(),
             None => window,
@@ -6146,6 +6297,9 @@ fn workspace_dialog<'a>(path: &Path, list: &[(String, String)], scale: FontScale
         scale,
     )
 }
+
+/// The height Quick Look leaves under a playing video for its bar.
+const QL_BAR: f32 = 44.0;
 
 /// The Tags sheet's field, which has the keyboard when it opens.
 const TAG_FIELD: &str = "tags-new";
@@ -7257,6 +7411,9 @@ mod tests {
             compressing: None,
             tagging: None,
             picking_workspace: None,
+            ql_live: None,
+            ql_generation: 0,
+            ql_pixels: (0, 0),
             versions: None,
             bulk_rename: None,
             unlocking: None,
