@@ -112,6 +112,11 @@ pub struct Finished<R> {
     /// folder and selects it.
     pub show: Option<PathBuf>,
     pub retry: Option<Retry<R>>,
+    /// The same again through the administrator helper, for the items
+    /// that were refused for permission — offered beside [`Self::retry`]
+    /// when the helper is installed and the job did not already run as
+    /// administrator.
+    pub admin_retry: Option<Retry<R>>,
     /// Why a failure has no retry, when it has none — said, because a
     /// failed row with no way forward reads as an omission otherwise.
     pub note: Option<String>,
@@ -208,7 +213,19 @@ impl<R> History<R> {
     pub fn take_retry(&mut self, id: JobId) -> Option<R> {
         let entry = self.entries.iter_mut().find(|f| f.id == id)?;
         entry.seen = true;
+        // Either button spends both: the two cover the same failed
+        // items, and pressing one then the other would queue them twice.
+        entry.admin_retry = None;
         entry.retry.take().map(|retry| retry.work)
+    }
+
+    /// Takes job `id`'s retry as administrator, once — and its ordinary
+    /// retry with it, for the reason [`Self::take_retry`] gives.
+    pub fn take_admin_retry(&mut self, id: JobId) -> Option<R> {
+        let entry = self.entries.iter_mut().find(|f| f.id == id)?;
+        entry.seen = true;
+        entry.retry = None;
+        entry.admin_retry.take().map(|retry| retry.work)
     }
 }
 
@@ -625,6 +642,7 @@ mod tests {
             reasons: Reasons::default(),
             show: None,
             retry: None,
+            admin_retry: None,
             note: None,
             seen: false,
         }
@@ -780,6 +798,24 @@ mod tests {
         history.push(entry);
         assert_eq!(history.take_retry(1), Some(()));
         assert_eq!(history.take_retry(1), None, "a double click queues nothing twice");
+    }
+
+    /// Retry and Retry as administrator cover the same failed items, so
+    /// pressing one spends the other: pressing both must not queue them
+    /// twice.
+    #[test]
+    fn either_retry_spends_both() {
+        let mut history = History::default();
+        for id in [1, 2] {
+            let mut entry = finished(id, Outcome::Failed);
+            entry.retry = Some(Retry { items: 1, work: () });
+            entry.admin_retry = Some(Retry { items: 1, work: () });
+            history.push(entry);
+        }
+        assert_eq!(history.take_admin_retry(1), Some(()));
+        assert_eq!(history.take_retry(1), None);
+        assert_eq!(history.take_retry(2), Some(()));
+        assert_eq!(history.take_admin_retry(2), None);
     }
 
     // --- reasons -----------------------------------------------------------

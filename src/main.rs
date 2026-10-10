@@ -3005,7 +3005,7 @@ impl App {
                 // dismissed. See `transfers_view::record`.
                 let shown_after = std::time::Duration::from_millis(self.config.behaviour.progress_after_ms);
                 let from_drop = self.from_drops.contains(&job);
-                transfers_view::record(&mut self.transfers, &finished, &summary, from_drop, shown_after);
+                transfers_view::record(&mut self.transfers, &finished, &summary, from_drop, shown_after, self.admin.is_some());
 
                 // The second half of a cut out of an archive: the paste
                 // has landed, so the members it came from can go. Only

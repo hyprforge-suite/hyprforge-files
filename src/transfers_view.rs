@@ -78,6 +78,9 @@ pub(crate) enum TransfersMessage {
     ShowQueue,
     Close,
     Retry(JobId),
+    /// The same, through the administrator helper — see
+    /// `transfers::Finished::admin_retry`.
+    RetryAsAdmin(JobId),
     /// Go to where a finished job put something, and select it.
     Show(PathBuf),
     ClearFinished,
@@ -95,6 +98,9 @@ pub(crate) enum RetryWork {
         from_drop: bool,
     },
     Archive(Work),
+    /// The items of a copy or move that were refused for permission,
+    /// run again by the administrator helper.
+    Admin { kind: JobKind, steps: Vec<PasteStep> },
 }
 
 /// Whether a failed run of `work` can simply be run again.
@@ -124,6 +130,7 @@ pub(crate) fn record(
     summary: &JobSummary,
     from_drop: bool,
     shown_after: Duration,
+    admin_available: bool,
 ) {
     let outcome = Outcome::of(summary);
     if outcome == Outcome::Done && finished.started.elapsed() < shown_after {
@@ -157,6 +164,21 @@ pub(crate) fn record(
         }
         _ => None,
     };
+    // Offered when the helper is there to run it, the job was not
+    // already its work, and something was refused for permission. A
+    // restore is not offered it: putting a file back also has to remove
+    // its `.trashinfo`, which the helper does not do.
+    let admin_retry = match &finished.kind {
+        JobKind::Copy | JobKind::Move
+            if admin_available && !finished.admin && outcome != Outcome::Done && !summary.denied.is_empty() =>
+        {
+            Some(Retry {
+                items: summary.denied.len(),
+                work: RetryWork::Admin { kind: finished.kind.clone(), steps: summary.denied.clone() },
+            })
+        }
+        _ => None,
+    };
     // Said whenever something failed that Retry does not cover — with
     // or without a Retry beside it, because a button that retries one
     // item of two reads as covering both.
@@ -183,6 +205,7 @@ pub(crate) fn record(
         // down, the archive it changed.
         show: summary.placed.first().map(|(_, landed)| landed.clone()).or_else(|| finished.archive.clone()),
         retry,
+        admin_retry,
         note,
         seen: outcome != Outcome::Failed,
     });
@@ -239,6 +262,10 @@ impl App {
                 Some(work) => self.retry(work),
                 None => Task::none(),
             },
+            TransfersMessage::RetryAsAdmin(id) => match self.transfers.history.take_admin_retry(id) {
+                Some(work) => self.retry(work),
+                None => Task::none(),
+            },
         }
     }
 
@@ -248,26 +275,19 @@ impl App {
     fn retry(&mut self, work: RetryWork) -> Task<Message> {
         match work {
             RetryWork::Paste { kind, steps, from_drop } => {
-                let mut dirs: Vec<PathBuf> = Vec::new();
-                let mut touch = |path: &Path| {
-                    if let Some(parent) = path.parent() {
-                        if !dirs.iter().any(|d| d == parent) {
-                            dirs.push(parent.to_path_buf());
-                        }
-                    }
-                };
-                for step in &steps {
-                    touch(&step.dest);
-                    if kind != JobKind::Copy {
-                        touch(&step.source);
-                    }
-                }
+                let dirs = touched_dirs(&kind, &steps);
                 let id = self.next_job_id;
                 self.next_job_id += 1;
                 if from_drop {
                     self.from_drops.insert(id);
                 }
                 self.enqueue(Queued { id, kind, dirs, what: QueuedWork::Paste { steps } })
+            }
+            RetryWork::Admin { kind, steps } => {
+                let dirs = touched_dirs(&kind, &steps);
+                let id = self.next_job_id;
+                self.next_job_id += 1;
+                self.enqueue(Queued { id, kind, dirs, what: QueuedWork::Admin { steps } })
             }
             RetryWork::Archive(work) => {
                 // A compression names a file that did not exist when it
@@ -287,6 +307,27 @@ impl App {
             }
         }
     }
+}
+
+/// The folders a paste of `steps` changes — every destination's, and
+/// for anything but a copy every source's — so the queue can keep two
+/// jobs on the same folder in order.
+fn touched_dirs(kind: &JobKind, steps: &[PasteStep]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut touch = |path: &Path| {
+        if let Some(parent) = path.parent() {
+            if !dirs.iter().any(|d| d == parent) {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    };
+    for step in steps {
+        touch(&step.dest);
+        if *kind != JobKind::Copy {
+            touch(&step.source);
+        }
+    }
+    dirs
 }
 
 // --- the control in the strip ----------------------------------------------
@@ -732,6 +773,19 @@ fn finished_row<'a>(entry: &Finished<RetryWork>, full: bool, scale: FontScale) -
             };
             top = top.push(secondary_button(label).on_press(Message::Transfers(TransfersMessage::Retry(entry.id))));
         }
+        if let Some(retry) = &entry.admin_retry {
+            // Counted when it covers fewer than Retry does: only what
+            // was refused for permission goes to the helper.
+            let label = match entry.retry.as_ref().map(|r| r.items) {
+                Some(all) if all > retry.items => {
+                    format!("Retry {} as administrator", transfers::plural(retry.items, "item", "items"))
+                }
+                _ => "Retry as administrator".to_string(),
+            };
+            top = top.push(
+                secondary_button(label).on_press(Message::Transfers(TransfersMessage::RetryAsAdmin(entry.id))),
+            );
+        }
     }
     let mut rows = column![top].spacing(spacing::XS);
     if full && entry.outcome == Outcome::Failed {
@@ -916,6 +970,84 @@ mod tests {
         let retried = app.jobs.iter().find(|j| j.id == started[0]).unwrap();
         assert_eq!(retried.kind, JobKind::Copy);
         assert_eq!(retried.dirs, [dir.path().join("to")]);
+    }
+
+    /// Retry as administrator is offered for what was refused for
+    /// permission — only when the helper is installed to run it, and
+    /// counting only those items when Retry covers more.
+    #[test]
+    fn retry_as_administrator_is_offered_only_for_what_was_refused_and_only_with_the_helper() {
+        let refused = step(Path::new("/src/locked.txt"), Path::new("/root-owned/locked.txt"));
+        let missing = step(Path::new("/src/gone.txt"), Path::new("/root-owned/gone.txt"));
+        let summary = || JobSummary {
+            failed: vec!["you don't have permission to write to /root-owned/locked.txt".into(), "gone".into()],
+            retry: vec![refused.clone(), missing.clone()],
+            denied: vec![refused.clone()],
+            ..JobSummary::default()
+        };
+
+        let mut without = app_for_test(&["/dir"]);
+        without.admin = None;
+        running(&mut without, 1, JobKind::Copy, a_while_ago());
+        finish(&mut without, 1, summary());
+        assert!(without.transfers.history.iter().next().unwrap().admin_retry.is_none(), "no helper, no offer");
+
+        let mut with = app_for_test(&["/dir"]);
+        with.admin = Some(std::sync::Arc::new(hyprforge_files::admin_client::AdminBackend::default()));
+        running(&mut with, 1, JobKind::Copy, a_while_ago());
+        finish(&mut with, 1, summary());
+        let entry = with.transfers.history.iter().next().unwrap();
+        assert_eq!(entry.retry.as_ref().map(|r| r.items), Some(2));
+        assert_eq!(
+            entry.admin_retry.as_ref().map(|r| &r.work),
+            Some(&RetryWork::Admin { kind: JobKind::Copy, steps: vec![refused] }),
+            "only the refused item goes to the helper"
+        );
+    }
+
+    /// A job the helper already ran is not offered to it again, and a
+    /// failure with nothing refused is not offered to it at all.
+    #[test]
+    fn retry_as_administrator_is_not_offered_where_it_cannot_help() {
+        let gone = step(Path::new("/src/gone.txt"), Path::new("/dir/gone.txt"));
+        let mut app = app_for_test(&["/dir"]);
+        app.admin = Some(std::sync::Arc::new(hyprforge_files::admin_client::AdminBackend::default()));
+        running(&mut app, 1, JobKind::Copy, a_while_ago());
+        finish(&mut app, 1, JobSummary { failed: vec!["gone".into()], retry: vec![gone.clone()], ..JobSummary::default() });
+        running(&mut app, 2, JobKind::Copy, a_while_ago());
+        app.jobs.last_mut().unwrap().admin = true;
+        finish(
+            &mut app,
+            2,
+            JobSummary { failed: vec!["refused".into()], retry: vec![gone.clone()], denied: vec![gone], ..JobSummary::default() },
+        );
+        assert!(app.transfers.history.iter().all(|e| e.admin_retry.is_none()));
+    }
+
+    /// Pressed, it queues the refused items as an administrator job.
+    /// Held behind a job landing at the same path, so the test never
+    /// starts the helper — which would ask for a password for real.
+    #[test]
+    fn retry_as_administrator_queues_the_refused_items_for_the_helper() {
+        let dest = PathBuf::from("/root-owned/locked.txt");
+        let refused = step(Path::new("/src/locked.txt"), &dest);
+        let mut app = app_for_test(&["/dir"]);
+        app.admin = Some(std::sync::Arc::new(hyprforge_files::admin_client::AdminBackend::default()));
+        running(&mut app, 1, JobKind::Copy, a_while_ago());
+        finish(
+            &mut app,
+            1,
+            JobSummary { failed: vec!["refused".into()], retry: vec![refused.clone()], denied: vec![refused], ..JobSummary::default() },
+        );
+        running(&mut app, 2, JobKind::Copy, Instant::now());
+        app.jobs.last_mut().unwrap().lands_at = vec![dest.clone()];
+
+        let _ = app.update(Message::Transfers(TransfersMessage::RetryAsAdmin(1)));
+        let _ = app.update(Message::Transfers(TransfersMessage::Retry(1)));
+        assert_eq!(app.queued.len(), 1, "one retry, and Retry is spent with it");
+        let queued = app.queued.front().unwrap();
+        assert!(matches!(&queued.what, QueuedWork::Admin { steps } if steps.len() == 1 && steps[0].dest == dest));
+        assert_eq!(app.jobs.len(), 1, "held, so the helper was never started");
     }
 
     /// The whole road, on a real disk: a copy that failed because its

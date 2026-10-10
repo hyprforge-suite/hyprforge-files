@@ -159,7 +159,8 @@ Copies, moves and archive work run in the background through a
 **queue**: a control in the tab strip shows overall progress, its
 popover lists each job with its rate and estimate and why a waiting one
 waits, and a queue view keeps the session's finished jobs, their
-failures, and a Retry wherever running the work again is safe.
+failures, and a Retry wherever running the work again is safe — and
+Retry as administrator for what was refused for permission.
 Ctrl+Shift+Y opens the popover and Ctrl+Shift+J the queue view, and
 both are in the Ctrl+K palette.
 

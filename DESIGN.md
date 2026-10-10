@@ -769,12 +769,6 @@ Still not built, each for its reason:
 - **Completed/Failed tabs.** The queue view's one list, newest first,
   with a coloured outcome per row, is short enough for a session; tabs
   would hide a failure behind a click.
-- **"Retry as administrator"** on a failed job. Folders can be opened
-  as administrator now (see "Administrator access" below), and a paste
-  into one goes through the helper; offering it on a job that already
-  failed needs `OpsError`'s permission kinds carried through
-  `JobSummary` as kinds rather than sentences, so the button can be
-  offered only where it would help.
 - **"Queue survives window close · resumes on reconnect".** Jobs are threads
   in this process, and the remote transfers that line is really about need
   phase I's mounts.
@@ -783,6 +777,16 @@ Still not built, each for its reason:
   because it would write what another job is writing — where starting it
   early is the data loss the queue exists to prevent. A button that is
   only sometimes safe is worse than no button.
+
+**"Retry as administrator"** sits beside Retry on a failed copy or move
+when the helper is installed and the job was not already its work. It
+waited on `hyprforge-fileops` saying which failures were for permission as
+data — `Report::denied`, from `OpsError::is_permission` — so the button is
+offered only where it could help, never by recognising a sentence. It runs
+only the refused items (counted when Retry covers more), through the same
+queue as an administrator paste; pressing either button spends both. A
+restore is not offered it, because putting a file back also removes its
+`.trashinfo`, which the helper does not do.
 
 Found and left alone, because it is `hyprforge-fileops`' and published:
 a file that cannot be *read* is reported as "you don't have permission to

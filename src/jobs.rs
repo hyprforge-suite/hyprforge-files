@@ -109,6 +109,11 @@ pub struct JobSummary {
     /// not offered again rather than leave them silently missing from
     /// the Retry button's count.
     pub partly: usize,
+    /// Of [`Self::retry`], the items that failed for want of permission
+    /// — `fileops`' `Report::denied`, decided from what the error was
+    /// and never from its sentence. What "Retry as administrator" runs:
+    /// running them again as this user would only be refused again.
+    pub denied: Vec<PasteStep>,
 }
 
 impl JobSummary {
@@ -244,6 +249,9 @@ fn run(
                         && report.source_removal_failed.is_none()
                     {
                         summary.retry.push(step.clone());
+                        if !report.denied.is_empty() {
+                            summary.denied.push(step.clone());
+                        }
                     } else if !report.failed.is_empty() && !report.cancelled {
                         summary.partly += 1;
                     }
@@ -508,6 +516,34 @@ mod tests {
         assert!(summary.complete());
         assert_eq!(fs::read_to_string(&b).unwrap(), "hello");
         assert!(a.exists());
+    }
+
+    /// What "Retry as administrator" is built on: an item refused for
+    /// permission is in `denied` as well as `retry`, and one that failed
+    /// for any other reason is in `retry` alone.
+    #[test]
+    fn an_item_refused_for_permission_is_marked_denied_and_others_are_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        fs::write(&a, "hello").unwrap();
+        let shut = dir.path().join("shut");
+        fs::create_dir(&shut).unwrap();
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes through a read-only folder, so this cannot be
+        // asked as root — and says so rather than passing silently.
+        if fs::write(shut.join("probe"), "").is_ok() {
+            fs::set_permissions(&shut, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("HYPRFORGE-SKIP: running as root, so a read-only folder refuses nothing");
+            return;
+        }
+        let refused = step(&a, &shut.join("a.txt"), OpKind::Copy);
+        let missing = step(&dir.path().join("never-was.txt"), &dir.path().join("copy.txt"), OpKind::Copy);
+        let (control, events) = start(1, vec![refused.clone(), missing.clone()], OnConflict::Ask);
+        let (summary, _) = drive(&control, events, never);
+        fs::set_permissions(&shut, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(summary.retry, vec![refused.clone(), missing]);
+        assert_eq!(summary.denied, vec![refused]);
     }
 
     #[test]
