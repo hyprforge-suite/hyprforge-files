@@ -6673,32 +6673,9 @@ mod field_focus {
     }
 }
 
-mod pointer {
-    use iced::{event, mouse, Event, Subscription};
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static X: AtomicU32 = AtomicU32::new(0);
-    static Y: AtomicU32 = AtomicU32::new(0);
-
-    /// Listens for pointer movement and never produces a message.
-    pub fn track<Message: 'static + Send>() -> Subscription<Message> {
-        event::listen_with(|event, _status, _window| {
-            if let Event::Mouse(mouse::Event::CursorMoved { position }) = event {
-                X.store(position.x.to_bits(), Ordering::Relaxed);
-                Y.store(position.y.to_bits(), Ordering::Relaxed);
-            }
-            None
-        })
-    }
-
-    /// The last pointer position seen, in window coordinates.
-    pub fn last() -> (f32, f32) {
-        (
-            f32::from_bits(X.load(Ordering::Relaxed)),
-            f32::from_bits(Y.load(Ordering::Relaxed)),
-        )
-    }
-}
+// Where the pointer last was, for opening a menu at it — shared with
+// every app that has one.
+use hyprforge_ui::widgets::pointer;
 
 /// Things to show on screen without a person driving the window, read
 /// from `HYPRFORGE_FILES_DEBUG` — a comma-separated list:
