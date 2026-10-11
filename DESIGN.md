@@ -363,6 +363,13 @@ holds the decision as a pure `step`:
   pane, and dropping a `VideoPane` stops its player and its thread.
   Measured in a nested Hyprland: 73 threads with a clip playing, 36 two
   seconds after Space closed it, mpv's `vo` and `demux` gone.
+- **An animated GIF moves** (2026-10-11): `Kind::Animation`, its frames
+  decoded by `hyprforge_image::decode_animation` inside a budget the
+  size of the card, played through `hyprforge_viewer::animation` on the
+  film. The card's own still shows while that decodes, and stays for a
+  GIF of one frame. The preview pane never animates — it is files-core's,
+  drawn for the dialog too, and two films at once would share iced's one
+  texture per kind of primitive.
 - **The card's header and key hint stay.** `Browser::quick_look_parts`
   hands the window the card's top and bottom, and `quick_look_card` puts
   the live pane between them, so the card does not change shape when a

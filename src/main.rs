@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use hyprforge_ui::widgets::{primary_button, scaled_text, secondary_button};
 use iced::keyboard::{self, key, Key};
-use iced::widget::{button, column, container, row};
+use iced::widget::{button, column, container, row, stack};
 use iced::{window, Background, Border, Color, Element, Length, Size, Subscription, Task, Theme};
 use std::path::{Path, PathBuf};
 
@@ -606,6 +606,11 @@ enum Message {
     QlVideo(hyprforge_viewer::video::VideoMessage),
     QlModel(hyprforge_viewer::model_pane::ModelMessage),
     QlModelLoaded(PathBuf, Result<hyprforge_viewer::model_pane::Loaded, String>),
+    /// Quick Look's GIF, decoded: its frames, or `None` for one that does
+    /// not move or could not be read as an animation.
+    QlAnimated(PathBuf, Option<hyprforge_viewer::animation::Animation>),
+    /// Quick Look's animation has shown its frame for as long as it asks.
+    QlNextFrame,
     /// Another launch's folders, handed to this window — see `handoff`.
     HandedOff(hyprforge_files::start::Start),
     /// What the snapshots hold of this file.
@@ -4075,6 +4080,25 @@ impl App {
                 self.ql_live = Some(Live::Model { path: path.clone(), pane: None, failed: None });
                 hyprforge_viewer::model_pane::load(path.clone()).map(move |r| Message::QlModelLoaded(path.clone(), r))
             }
+            Step::Start(path, Kind::Animation) => {
+                self.ql_generation += 1;
+                self.ql_live = Some(Live::Animation { path: path.clone(), playing: None });
+                // Bounded by the card, as its still is: every frame
+                // together inside what one picture that size may keep.
+                let (w, h) = self.quick_look_pixels();
+                let budget = hyprforge_image::Budget::for_viewport(hyprforge_image::ViewportPixels { width: w, height: h });
+                Task::perform(
+                    async move {
+                        let for_task = path.clone();
+                        let animation = tokio::task::spawn_blocking(move || animation_of(&for_task, &budget))
+                            .await
+                            .ok()
+                            .flatten();
+                        (path, animation)
+                    },
+                    |(path, animation)| Message::QlAnimated(path, animation),
+                )
+            }
         };
         // The card follows the window; so do the video's frames.
         let pixels = self.quick_look_pixels();
@@ -4137,6 +4161,17 @@ impl App {
             }
             Live::Model { failed: Some(why), .. } => said(why.clone()),
             Live::Model { .. } => said("Loading\u{2026}".to_string()),
+            // The first frame underneath, for iced's software renderer,
+            // where the film draws nothing: there the GIF stands still.
+            Live::Animation { playing: Some((animation, still)), .. } => stack![
+                container(iced::widget::image(still.clone())).center(Length::Fill),
+                iced::widget::shader(animation.program()).width(Length::Fixed(w)).height(Length::Fixed(h)),
+            ]
+            .width(Length::Fixed(w))
+            .height(Length::Fixed(h))
+            .into(),
+            // Decoding, or a GIF that does not move: the card's own still.
+            Live::Animation { playing: None, .. } => return None,
         })
     }
 
@@ -4875,6 +4910,18 @@ impl App {
                 let generation = self.ql_generation;
                 if let Some(live) = self.ql_live.as_mut() {
                     live.model_loaded(&path, result, generation);
+                }
+                Task::none()
+            }
+            Message::QlAnimated(path, animation) => {
+                if let Some(live) = self.ql_live.as_mut() {
+                    live.animation_loaded(&path, animation);
+                }
+                Task::none()
+            }
+            Message::QlNextFrame => {
+                if let Some(animation) = self.ql_live.as_mut().and_then(|l| l.animation_mut()) {
+                    animation.advance();
                 }
                 Task::none()
             }
@@ -5907,6 +5954,12 @@ impl App {
             // `hyprforge_files::handoff`.
             Subscription::run(hyprforge_files::handoff::serve).map(Message::HandedOff),
             if self.animating() { window::frames().map(Message::Frame) } else { Subscription::none() },
+            // Each of Quick Look's GIF frames for its own delay; keyed on
+            // the duration, so equal delays are one steady timer.
+            match self.ql_live.as_ref().and_then(|l| l.animation()) {
+                Some(animation) => iced::time::every(animation.delay()).map(|_| Message::QlNextFrame),
+                None => Subscription::none(),
+            },
             // Drives and shares: listed at once, then again whenever
             // UDisks2 or gvfs says something changed, a burst at a time.
             Subscription::run_with(self.devices.backends.clone(), hyprforge_files::devices::watch)
@@ -6025,6 +6078,26 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// "Moved 3 items to the Trash · Undo" — the moment after something was
 /// done is when taking it back is most wanted, and least likely to
 /// meet a folder that has moved on.
+/// A GIF's frames as Quick Look plays them, or `None` for one that does
+/// not move. A decode that fails is logged and shown as the still the
+/// card already has: that still decoded, so the picture is there.
+fn animation_of(path: &Path, budget: &hyprforge_image::Budget) -> Option<hyprforge_viewer::animation::Animation> {
+    let decoded = match hyprforge_image::decode_animation(path, budget) {
+        Ok(decoded) => decoded?,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "couldn't decode the animation");
+            return None;
+        }
+    };
+    let (width, height) = (decoded.size.width, decoded.size.height);
+    let frames = decoded
+        .frames
+        .into_iter()
+        .map(|frame| (hyprforge_video::Frame { width, height, pixels: frame.pixels }, frame.delay))
+        .collect();
+    hyprforge_viewer::animation::Animation::new(frames)
+}
+
 fn undo_notice<'a>(text: &str, scale: FontScale) -> Element<'a, Message> {
     row![
         scaled_text(text.to_string(), BASE_TEXT_SIZE, scale).width(Length::Fill),
