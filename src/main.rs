@@ -692,8 +692,12 @@ enum Message {
     /// Preferences' Clear Recent finished: how many files it forgot.
     RecentCleared(Result<usize, String>),
     /// An undo finished that moved things back: the moves it made, for
-    /// stars to follow, then what [`Message::Undone`] carries.
-    UndoneMoves(Vec<(PathBuf, PathBuf)>, Vec<PathBuf>, Vec<String>),
+    /// stars to follow, then what [`Message::Undone`] carries, then what
+    /// a redo of it would need.
+    UndoneMoves(Vec<(PathBuf, PathBuf)>, Vec<PathBuf>, Vec<String>, hyprforge_files_core::undo::Undone),
+    /// A redo finished: the folders it changed, anything it could not do
+    /// again, and the record of what it did, for Ctrl+Z.
+    Redone(Vec<PathBuf>, Vec<String>, Option<hyprforge_files_core::undo::Undoable>),
     /// What the drives-and-shares watch heard — see
     /// `hyprforge_files::devices`.
     Devices(hyprforge_files::devices::Event),
@@ -3187,6 +3191,20 @@ impl App {
     /// and whatever the undo settings say — an undo depth of 0 turns off
     /// taking things back, not keeping track of what is starred.
     fn record(&mut self, done: hyprforge_files_core::undo::Undoable) -> Task<Message> {
+        self.record_with(done, hyprforge_files_core::undo::UndoHistory::push)
+    }
+
+    /// [`Self::record`] for something a redo did again, which keeps the
+    /// redos behind it rather than forgetting them.
+    fn record_redone(&mut self, done: hyprforge_files_core::undo::Undoable) -> Task<Message> {
+        self.record_with(done, hyprforge_files_core::undo::UndoHistory::redone)
+    }
+
+    fn record_with(
+        &mut self,
+        done: hyprforge_files_core::undo::Undoable,
+        keep: fn(&mut hyprforge_files_core::undo::UndoHistory, hyprforge_files_core::undo::Undoable),
+    ) -> Task<Message> {
         let moves = done.moves();
         // A tag is on the file and moves with it by itself; the index of
         // what has it follows here, as the stars do.
@@ -3196,18 +3214,22 @@ impl App {
             self.change_tags(&hyprforge_files_core::tags::TagChange::Follow(moves.clone()))
         };
         let stars = Task::batch([self.follow_stars(moves), tags]);
-        let remembered = self.remember(done);
+        let remembered = self.remember(done, keep);
         Task::batch([stars, remembered])
     }
 
     /// Remembers something Ctrl+Z can take back, and offers it in the
     /// status bar for `undo-notice-seconds`.
-    fn remember(&mut self, done: hyprforge_files_core::undo::Undoable) -> Task<Message> {
+    fn remember(
+        &mut self,
+        done: hyprforge_files_core::undo::Undoable,
+        keep: fn(&mut hyprforge_files_core::undo::UndoHistory, hyprforge_files_core::undo::Undoable),
+    ) -> Task<Message> {
         if done.is_empty() || self.config.behaviour.undo_depth == 0 {
             return Task::none();
         }
         let text = done.describe();
-        self.undo.push(done);
+        keep(&mut self.undo, done);
         let seconds = self.config.behaviour.undo_notice_seconds;
         if seconds == 0 {
             return Task::none();
@@ -3249,13 +3271,33 @@ impl App {
                 // Stars follow an undone rename or move back — once it
                 // has happened, which is why the moves ride along.
                 let moves = done.undo_moves();
+                let kept = done.clone();
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || jobs::undo(done))
                             .await
-                            .unwrap_or_else(|e| (Vec::new(), vec![format!("Undo was interrupted: {e}")]))
+                            .unwrap_or_else(|e| (Vec::new(), vec![format!("Undo was interrupted: {e}")], Vec::new()))
                     },
-                    move |(dirs, errors)| Message::UndoneMoves(moves.clone(), dirs, errors),
+                    move |(dirs, errors, trashed)| {
+                        let undone = hyprforge_files_core::undo::Undone { done: kept.clone(), trashed };
+                        Message::UndoneMoves(moves.clone(), dirs, errors, undone)
+                    },
+                )
+            }
+            Action::Redo => {
+                self.notice = None;
+                self.undo_history_open = false;
+                let Some(undone) = self.undo.pop_redo() else {
+                    self.status = Some("There's nothing to redo.".to_string());
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || jobs::redo(undone))
+                            .await
+                            .unwrap_or_else(|e| (Vec::new(), vec![format!("Redo was interrupted: {e}")], None))
+                    },
+                    |(dirs, errors, redone)| Message::Redone(dirs, errors, redone),
                 )
             }
             Action::UndoHistory => {
@@ -4734,10 +4776,26 @@ impl App {
             Message::PasteFrom(into, clip) => self.paste_into(into, clip),
             Message::TrashTidied => Task::none(),
             // Only an undo that went through: one that could not put
-            // something back left it — and its star — where it was.
-            Message::UndoneMoves(moves, dirs, errors) => {
-                let stars = if errors.is_empty() { self.follow_stars(moves) } else { Task::none() };
+            // something back left it — and its star — where it was. The
+            // same goes for redo: a partial undo left a folder neither
+            // record describes, so there is nothing safe to do again.
+            Message::UndoneMoves(moves, dirs, errors, undone) => {
+                let stars = if errors.is_empty() {
+                    self.undo.undone(undone);
+                    self.follow_stars(moves)
+                } else {
+                    Task::none()
+                };
                 Task::batch([stars, self.update(Message::Undone(dirs, errors))])
+            }
+            // What went through is remembered whatever did not, so Ctrl+Z
+            // takes back exactly the part of the redo that happened.
+            Message::Redone(dirs, errors, redone) => {
+                if !errors.is_empty() {
+                    self.status = Some(format!("Couldn't redo everything: {}", errors.join(" ")));
+                }
+                let remembered = redone.map(|done| self.record_redone(done)).unwrap_or_else(Task::none);
+                Task::batch([remembered, self.refresh_dirs(&dirs)])
             }
             Message::RecentRecorded(Ok(())) => Task::none(),
             // Said, because a Recent that silently stopped keeping track
@@ -9620,7 +9678,7 @@ mod tests {
         assert_eq!(app.notice.as_ref().map(|(_, t)| t.as_str()), Some("Renamed 2 items"));
 
         let _ = app.update(key("Ctrl+Z"));
-        let (dirs, errors) = jobs::undo(hyprforge_files_core::undo::Undoable::RenamedAll(vec![
+        let (dirs, errors, _) = jobs::undo(hyprforge_files_core::undo::Undoable::RenamedAll(vec![
             (two.clone(), one.clone()),
             (one.clone(), two.clone()),
         ]));
@@ -9685,7 +9743,7 @@ mod tests {
         let _ = app.update(key("Ctrl+Z"));
         assert!(app.notice.is_none(), "the notice goes when its undo is used");
         // The undo runs as a task; stand in for it.
-        let (dirs, errors) = jobs::undo(hyprforge_files_core::undo::Undoable::Renamed {
+        let (dirs, errors, _) = jobs::undo(hyprforge_files_core::undo::Undoable::Renamed {
             from: a.clone(),
             to: b.clone(),
         });
@@ -9706,12 +9764,16 @@ mod tests {
         for tab in &app.tabs {
             assert_eq!(tab.browser().prefs().starred, std::slice::from_ref(&b), "every tab follows");
         }
-        let _ = app.update(Message::UndoneMoves(vec![(b.clone(), a.clone())], vec![], vec![]));
+        let undone = |from: &PathBuf, to: &PathBuf| hyprforge_files_core::undo::Undone {
+            done: hyprforge_files_core::undo::Undoable::Renamed { from: from.clone(), to: to.clone() },
+            trashed: Vec::new(),
+        };
+        let _ = app.update(Message::UndoneMoves(vec![(b.clone(), a.clone())], vec![], vec![], undone(&a, &b)));
         assert_eq!(app.last_prefs.starred, std::slice::from_ref(&a));
         // An undo that could not put it back leaves the star where the
         // file still is.
         let _ = app.update(Message::Renamed(app.tabs[0].pane().id, a.clone(), b.clone(), Ok(())));
-        let _ = app.update(Message::UndoneMoves(vec![(b.clone(), a.clone())], vec![], vec!["busy".into()]));
+        let _ = app.update(Message::UndoneMoves(vec![(b.clone(), a.clone())], vec![], vec!["busy".into()], undone(&a, &b)));
         assert_eq!(app.last_prefs.starred, [b]);
     }
 
@@ -9788,6 +9850,47 @@ mod tests {
         let mut app = app_for_test(&["/dir"]);
         let _ = app.update(key("Ctrl+Z"));
         assert!(app.status.as_deref().unwrap().contains("nothing to undo"));
+    }
+
+    /// Ctrl+Shift+Z with nothing to do again says so.
+    #[test]
+    fn redo_with_nothing_to_redo_says_so() {
+        let mut app = app_for_test(&["/dir"]);
+        let _ = app.update(key("Ctrl+Shift+Z"));
+        assert!(app.status.as_deref().unwrap().contains("nothing to redo"));
+    }
+
+    /// Only an undo that went through can be redone, and doing anything
+    /// new forgets it.
+    #[test]
+    fn a_complete_undo_can_be_redone_until_something_new_is_done() {
+        let mut app = app_for_test(&["/dir"]);
+        let undone = || hyprforge_files_core::undo::Undone {
+            done: hyprforge_files_core::undo::Undoable::MadeFolder("/dir/one".into()),
+            trashed: Vec::new(),
+        };
+        let _ = app.update(Message::UndoneMoves(vec![], vec![], vec!["busy".into()], undone()));
+        assert!(!app.undo.can_redo(), "a partial undo is not redoable");
+        let _ = app.update(Message::UndoneMoves(vec![], vec![], vec![], undone()));
+        assert!(app.undo.can_redo());
+        let _ = app.update(Message::FolderCreated(0, "/dir/two".into(), Ok(())));
+        assert!(!app.undo.can_redo(), "something new was done");
+    }
+
+    /// What a redo did goes back on the history for Ctrl+Z, without
+    /// forgetting the redos behind it.
+    #[test]
+    fn a_redo_is_remembered_for_undo_and_keeps_the_redos_behind_it() {
+        let mut app = app_for_test(&["/dir"]);
+        let made = |name: &str| hyprforge_files_core::undo::Undone {
+            done: hyprforge_files_core::undo::Undoable::MadeFolder(PathBuf::from("/dir").join(name)),
+            trashed: Vec::new(),
+        };
+        let _ = app.update(Message::UndoneMoves(vec![], vec![], vec![], made("one")));
+        let _ = app.update(Message::UndoneMoves(vec![], vec![], vec![], made("two")));
+        let _ = app.update(Message::Redone(vec![], vec![], Some(made("two").done)));
+        assert_eq!(app.undo.len(), 1);
+        assert!(app.undo.can_redo(), "\"one\" can still be redone");
     }
 
     /// A trash that moved nothing records nothing, so the Ctrl+Z meant
@@ -10879,7 +10982,7 @@ mod archive_tests {
         std::fs::create_dir(&made).unwrap();
         std::fs::write(made.join("inside.txt"), b"x").unwrap();
 
-        let (_dirs, errors) = jobs::undo(Undoable::Extracted(made.clone()));
+        let (_dirs, errors, _) = jobs::undo(Undoable::Extracted(made.clone()));
 
         // The trash is the real one on this machine, so the only thing
         // asserted is that the folder left *and* that nothing was
@@ -10895,7 +10998,7 @@ mod archive_tests {
     #[test]
     fn undoing_something_already_gone_says_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let (_dirs, errors) = jobs::undo(Undoable::Compressed(dir.path().join("never-made.zip")));
+        let (_dirs, errors, _) = jobs::undo(Undoable::Compressed(dir.path().join("never-made.zip")));
         assert!(errors.is_empty(), "{errors:?}");
     }
 

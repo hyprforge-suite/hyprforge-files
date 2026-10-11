@@ -105,6 +105,12 @@ Only the newest can be undone from there — each undo checks the folder
 is as that record left it, and taking an older one first would check
 against a state the newer one has since changed.
 
+**Redo** (Ctrl+Shift+Z or Ctrl+Y) does again what undo took back, with
+the same check first. Undoing a copy, an extraction or a new archive
+moved it to the Trash, so redoing one brings that same item back out.
+Only an undo that went through completely can be redone, and doing
+anything new forgets the redos, as in every other program.
+
 **Drives and servers** are in the sidebar. Devices lists removable
 drives and disk images, mounted or not: a click on one that is not
 mounted mounts it — over UDisks2, with no root, polkit deciding — and

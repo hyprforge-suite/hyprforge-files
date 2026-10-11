@@ -347,19 +347,22 @@ pub fn create_folder(path: &std::path::Path) -> Result<(), String> {
 }
 
 /// Takes back one recorded action. Returns the folders whose listings
-/// changed, and a sentence for each part that could not be undone.
+/// changed, a sentence for each part that could not be undone, and what
+/// the undo moved to the Trash — the copies, the extracted folder or the
+/// archive — which is what a redo restores.
 ///
 /// Every branch checks that the world still matches the record before
 /// touching anything, and refuses rather than guesses when it does not:
 /// a file renamed again since, a folder that has things in it now, a
 /// name that is taken again. Undoing a copy moves the copies to the
 /// Trash and never deletes them.
-pub fn undo(done: hyprforge_files_core::undo::Undoable) -> (Vec<std::path::PathBuf>, Vec<String>) {
+pub fn undo(done: hyprforge_files_core::undo::Undoable) -> (Vec<std::path::PathBuf>, Vec<String>, Trashed) {
     use hyprforge_files_core::undo::Undoable;
     use std::path::{Path, PathBuf};
 
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut errors = Vec::new();
+    let mut trashed: Trashed = Vec::new();
     let touched = |dirs: &mut Vec<PathBuf>, path: &Path| {
         if let Some(parent) = path.parent() {
             if !dirs.iter().any(|d| d == parent) {
@@ -433,7 +436,10 @@ pub fn undo(done: hyprforge_files_core::undo::Undoable) -> (Vec<std::path::PathB
                     continue;
                 }
                 match hyprforge_fileops::trash(&copy) {
-                    Ok(_) => touched(&mut dirs, &copy),
+                    Ok(item) => {
+                        touched(&mut dirs, &copy);
+                        trashed.push(record(item));
+                    }
                     Err(e) => errors.push(e.to_string()),
                 }
             }
@@ -445,7 +451,10 @@ pub fn undo(done: hyprforge_files_core::undo::Undoable) -> (Vec<std::path::PathB
         Undoable::Extracted(into) | Undoable::Compressed(into) => {
             if exists(&into) {
                 match hyprforge_fileops::trash(&into) {
-                    Ok(_) => touched(&mut dirs, &into),
+                    Ok(item) => {
+                        touched(&mut dirs, &into);
+                        trashed.push(record(item));
+                    }
                     Err(e) => errors.push(e.to_string()),
                 }
             }
@@ -460,7 +469,159 @@ pub fn undo(done: hyprforge_files_core::undo::Undoable) -> (Vec<std::path::PathB
             Err(e) => errors.push(format!("{}: {e}", name(&path))),
         },
     }
-    (dirs, errors)
+    (dirs, errors, trashed)
+}
+
+/// What went to the Trash, as `Undoable::Trashed` records it:
+/// `(stored, original, .trashinfo)`.
+pub type Trashed = Vec<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)>;
+
+fn record(item: hyprforge_fileops::TrashedItem) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    (item.trashed_file, item.original_path, item.info_file)
+}
+
+/// Does again what an undo took back. Returns the folders whose listings
+/// changed, a sentence for each part that could not be redone, and the
+/// record of what was redone — only the parts that went through, so
+/// Ctrl+Z after a partial redo takes back exactly what it did.
+///
+/// The same rule as [`undo`]: check the folder still matches before
+/// touching anything, and refuse rather than guess. A copy, an extraction
+/// or an archive comes back out of the Trash from where the undo put it,
+/// never by searching the Trash for something with the right name.
+pub fn redo(
+    undone: hyprforge_files_core::undo::Undone,
+) -> (Vec<std::path::PathBuf>, Vec<String>, Option<hyprforge_files_core::undo::Undoable>) {
+    use hyprforge_files_core::undo::Undoable;
+    use std::path::{Path, PathBuf};
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut errors = Vec::new();
+    let touched = |dirs: &mut Vec<PathBuf>, path: &Path| {
+        if let Some(parent) = path.parent() {
+            if !dirs.iter().any(|d| d == parent) {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    };
+    let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+    let name = |path: &Path| {
+        path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    };
+
+    // "Move `from` to `to` again" — shared by rename and move. `true` if
+    // it happened.
+    let again = |dirs: &mut Vec<PathBuf>, errors: &mut Vec<String>, from: &Path, to: &Path| -> bool {
+        if !exists(from) {
+            errors.push(format!("\u{201C}{}\u{201D} isn't there any more.", name(from)));
+        } else if exists(to) {
+            errors.push(format!("Something called \u{201C}{}\u{201D} is there now.", name(to)));
+        } else {
+            match rename(from, to) {
+                Ok(()) => {
+                    touched(dirs, from);
+                    touched(dirs, to);
+                    return true;
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        false
+    };
+
+    // Brings back what the undo trashed. The paths it went back to.
+    let restore = |dirs: &mut Vec<PathBuf>, errors: &mut Vec<String>, trashed: Trashed| -> Vec<PathBuf> {
+        let mut back = Vec::new();
+        for (stored, original, info) in trashed {
+            let item = hyprforge_fileops::TrashedItem {
+                original_path: original.clone(),
+                deleted_at: String::new(),
+                trashed_file: stored.clone(),
+                info_file: info,
+            };
+            match hyprforge_fileops::restore(&item) {
+                Ok(()) => {
+                    touched(dirs, &stored);
+                    touched(dirs, &original);
+                    back.push(original);
+                }
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        back
+    };
+
+    let redone = match undone.done {
+        Undoable::Trashed(items) => {
+            let mut again_trashed = Vec::new();
+            for (_, original, _) in items {
+                if !exists(&original) {
+                    errors.push(format!("\u{201C}{}\u{201D} isn't there any more.", name(&original)));
+                    continue;
+                }
+                match hyprforge_fileops::trash(&original) {
+                    Ok(item) => {
+                        touched(&mut dirs, &original);
+                        if let Some(stored) = item.trashed_file.parent() {
+                            if !dirs.iter().any(|d| d == stored) {
+                                dirs.push(stored.to_path_buf());
+                            }
+                        }
+                        again_trashed.push(record(item));
+                    }
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+            // Fresh records: the Trash gave each one a new stored name
+            // and `.trashinfo`, and the next undo has to restore those.
+            Some(Undoable::Trashed(again_trashed))
+        }
+        Undoable::Renamed { from, to } => {
+            again(&mut dirs, &mut errors, &from, &to).then_some(Undoable::Renamed { from, to })
+        }
+        // As one batch, for the reason its undo is one: a swap of two
+        // names cannot be done as single renames.
+        Undoable::RenamedAll(items) => {
+            for (was, now) in &items {
+                touched(&mut dirs, was);
+                touched(&mut dirs, now);
+            }
+            match hyprforge_fileops::batch::apply(&items) {
+                Ok(_) => Some(Undoable::RenamedAll(items)),
+                Err(failure) => {
+                    errors.push(crate::bulk_rename::describe_failure(&failure));
+                    None
+                }
+            }
+        }
+        Undoable::Moved(items) => {
+            let done = items
+                .into_iter()
+                .filter(|(was, now)| again(&mut dirs, &mut errors, was, now))
+                .collect();
+            Some(Undoable::Moved(done))
+        }
+        Undoable::Copied(_) => Some(Undoable::Copied(restore(&mut dirs, &mut errors, undone.trashed))),
+        Undoable::Extracted(into) => {
+            let back = restore(&mut dirs, &mut errors, undone.trashed);
+            back.contains(&into).then_some(Undoable::Extracted(into))
+        }
+        Undoable::Compressed(archive) => {
+            let back = restore(&mut dirs, &mut errors, undone.trashed);
+            back.contains(&archive).then_some(Undoable::Compressed(archive))
+        }
+        Undoable::MadeFolder(path) => match create_folder(&path) {
+            Ok(()) => {
+                touched(&mut dirs, &path);
+                Some(Undoable::MadeFolder(path))
+            }
+            Err(e) => {
+                errors.push(e);
+                None
+            }
+        },
+    };
+    (dirs, errors, redone.filter(|done| !done.is_empty()))
 }
 
 #[cfg(test)]
@@ -696,7 +857,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
         fs::write(&b, "x").unwrap();
-        let (dirs, errors) = undo(Undoable::Renamed { from: a.clone(), to: b.clone() });
+        let (dirs, errors, _) = undo(Undoable::Renamed { from: a.clone(), to: b.clone() });
         assert!(errors.is_empty(), "{errors:?}");
         assert!(a.exists() && !b.exists());
         assert_eq!(dirs, [dir.path().to_path_buf()]);
@@ -710,13 +871,13 @@ mod tests {
         let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
         let (errors_gone, errors_taken);
         {
-            let (_, errors) = undo(Undoable::Renamed { from: a.clone(), to: b.clone() });
+            let (_, errors, _) = undo(Undoable::Renamed { from: a.clone(), to: b.clone() });
             errors_gone = errors;
         }
         fs::write(&a, "someone else's").unwrap();
         fs::write(&b, "mine").unwrap();
         {
-            let (_, errors) = undo(Undoable::Renamed { from: a.clone(), to: b.clone() });
+            let (_, errors, _) = undo(Undoable::Renamed { from: a.clone(), to: b.clone() });
             errors_taken = errors;
         }
         assert!(errors_gone[0].contains("isn't there"), "{errors_gone:?}");
@@ -736,7 +897,7 @@ mod tests {
             (dir.path().join("a"), there.join("a")),
             (dir.path().join("b"), there.join("b")),
         ];
-        let (_, errors) = undo(Undoable::Moved(moved));
+        let (_, errors, _) = undo(Undoable::Moved(moved));
         assert!(errors.is_empty(), "{errors:?}");
         assert!(dir.path().join("a").exists() && dir.path().join("b").exists());
     }
@@ -747,13 +908,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let empty = dir.path().join("New folder");
         fs::create_dir(&empty).unwrap();
-        let (_, errors) = undo(Undoable::MadeFolder(empty.clone()));
+        let (_, errors, _) = undo(Undoable::MadeFolder(empty.clone()));
         assert!(errors.is_empty() && !empty.exists());
 
         let used = dir.path().join("New folder 2");
         fs::create_dir(&used).unwrap();
         fs::write(used.join("keep.txt"), "x").unwrap();
-        let (_, errors) = undo(Undoable::MadeFolder(used.clone()));
+        let (_, errors, _) = undo(Undoable::MadeFolder(used.clone()));
         assert!(errors[0].contains("has things in it"), "{errors:?}");
         assert!(used.join("keep.txt").exists());
     }
@@ -775,7 +936,7 @@ mod tests {
         .unwrap();
         assert!(!original.exists());
 
-        let (_, errors) = undo(Undoable::Trashed(vec![(
+        let (_, errors, _) = undo(Undoable::Trashed(vec![(
             item.trashed_file.clone(),
             item.original_path.clone(),
             item.info_file.clone(),
@@ -783,6 +944,107 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(fs::read_to_string(&original).unwrap(), "hello");
         assert!(!item.info_file.exists(), "the record went with it");
+    }
+
+    // --- redo ---------------------------------------------------------------
+
+    use hyprforge_files_core::undo::Undone;
+
+    fn undone(done: Undoable) -> Undone {
+        Undone { done, trashed: Vec::new() }
+    }
+
+    /// Undo then redo leaves the rename as it was done, and hands back
+    /// the same record so Ctrl+Z can take it back again.
+    #[test]
+    fn redoing_a_rename_renames_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        fs::write(&b, "x").unwrap();
+        let renamed = Undoable::Renamed { from: a.clone(), to: b.clone() };
+        let (_, errors, _) = undo(renamed.clone());
+        assert!(errors.is_empty() && a.exists());
+        let (dirs, errors, redone) = redo(undone(renamed.clone()));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(b.exists() && !a.exists());
+        assert_eq!(redone, Some(renamed));
+        assert_eq!(dirs, [dir.path().to_path_buf()]);
+    }
+
+    /// The folder moved on after the undo: a redo refuses rather than
+    /// replacing what is there now, and records nothing to undo.
+    #[test]
+    fn a_redo_onto_a_name_taken_since_is_refused_and_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        fs::write(&a, "mine").unwrap();
+        fs::write(&b, "someone else's").unwrap();
+        let (_, errors, redone) = redo(undone(Undoable::Renamed { from: a.clone(), to: b.clone() }));
+        assert!(errors[0].contains("is there now"), "{errors:?}");
+        assert_eq!(redone, None);
+        assert_eq!(fs::read_to_string(&a).unwrap(), "mine");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "someone else's");
+    }
+
+    /// A move redone in part records only the part it did, so the next
+    /// Ctrl+Z does not try to move back something that never went.
+    #[test]
+    fn a_partial_redo_records_only_what_it_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let there = dir.path().join("there");
+        fs::create_dir(&there).unwrap();
+        fs::write(dir.path().join("a"), "1").unwrap();
+        let moved = vec![
+            (dir.path().join("a"), there.join("a")),
+            (dir.path().join("gone"), there.join("gone")),
+        ];
+        let (_, errors, redone) = redo(undone(Undoable::Moved(moved)));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(redone, Some(Undoable::Moved(vec![(dir.path().join("a"), there.join("a"))])));
+        assert!(there.join("a").exists());
+    }
+
+    #[test]
+    fn redoing_a_new_folder_makes_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("New folder");
+        let (_, errors, redone) = redo(undone(Undoable::MadeFolder(folder.clone())));
+        assert!(errors.is_empty() && folder.is_dir());
+        assert_eq!(redone, Some(Undoable::MadeFolder(folder)));
+    }
+
+    /// Undoing a copy trashed it; redoing brings back exactly what the
+    /// undo trashed, from where it was put. Driven through a trash in a
+    /// temporary directory, never the real one.
+    #[test]
+    fn redoing_a_copy_restores_what_its_undo_trashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("copy.txt");
+        fs::write(&copy, "hello").unwrap();
+        let item = hyprforge_fileops::trash_into(
+            &hyprforge_fileops::fs::mock::MockFilesystem::new(),
+            &dir.path().join("Trash"),
+            &copy,
+        )
+        .unwrap();
+        let undone = Undone {
+            done: Undoable::Copied(vec![copy.clone()]),
+            trashed: vec![(item.trashed_file.clone(), item.original_path.clone(), item.info_file.clone())],
+        };
+        let (_, errors, redone) = redo(undone);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "hello");
+        assert!(!item.info_file.exists(), "the record went with it");
+        assert_eq!(redone, Some(Undoable::Copied(vec![copy])));
+    }
+
+    /// An extraction whose folder could not come back is not recorded:
+    /// Ctrl+Z would otherwise trash whatever is called that now.
+    #[test]
+    fn an_extraction_that_did_not_come_back_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, redone) = redo(undone(Undoable::Extracted(dir.path().join("sample"))));
+        assert_eq!(redone, None);
     }
 
     #[test]

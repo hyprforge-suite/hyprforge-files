@@ -1792,8 +1792,16 @@ missing or hidden):
   first from the notice's History button, the palette and the
   empty-space menu. Only the newest row is a button: each undo checks the
   folder is as its record left it (`jobs::undo`), and an older one taken
-  first would be checked against a state the newer one changed. No redo
-  yet — Ctrl+Shift+Z is left unbound for it.
+  first would be checked against a state the newer one changed.
+- **Redo** (2026-10-11; Ctrl+Shift+Z, Ctrl+Y). `jobs::redo` does the
+  undone thing again under the same rule as `jobs::undo`: check first,
+  refuse in a sentence. A copy, extraction or new archive comes back out
+  of the Trash from the records its undo kept (`undo::Undone::trashed`),
+  never by searching the Trash for a name. Only a complete undo is
+  redoable, since a partial one left a folder no record describes; a
+  redo that goes through in part records just that part for Ctrl+Z.
+  Anything new forgets every redo (`UndoHistory::push`); a redo itself
+  does not (`UndoHistory::redone`).
 
 Checked in a nested compositor at 1.25 scale with a virtual pointer: a
 band across the grid, the automatic scroll past the bottom edge with the
