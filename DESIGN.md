@@ -788,9 +788,10 @@ queue as an administrator paste; pressing either button spends both. A
 restore is not offered it, because putting a file back also removes its
 `.trashinfo`, which the helper does not do.
 
-Found and left alone, because it is `hyprforge-fileops`' and published:
-a file that cannot be *read* is reported as "you don't have permission to
-write to" its source path.
+A file that cannot be *read* was once reported as "you don't have
+permission to write to" its source path; `hyprforge-fileops` says so
+correctly now (`OpsError::ReadDenied`), and it counts as a permission
+failure, so it is offered Retry as administrator too.
 
 Clicked through in the nested compositor (2026-10-03), with a virtual
 pointer and a virtual keyboard, over copies of a scratch tree — a 24 GiB
