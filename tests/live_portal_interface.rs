@@ -53,7 +53,7 @@ fn methods_of(xml: &str, interface: &str) -> BTreeMap<String, (String, String)> 
 }
 
 #[tokio::test]
-#[ignore = "reads the installed xdg-desktop-portal interface; run by check.sh"]
+#[ignore = "reads the installed xdg-desktop-portal interface; run by the suite's live tier"]
 async fn the_service_declares_exactly_the_methods_the_portal_calls() {
     if !Path::new(INSTALLED).exists() {
         eprintln!("HYPRFORGE-SKIP: xdg-desktop-portal's FileChooser interface XML is not installed ({INSTALLED})");
@@ -117,7 +117,7 @@ async fn the_service_declares_exactly_the_methods_the_portal_calls() {
 /// still up; then C arrives. C's dialog must start, and all three calls
 /// must come back.
 #[tokio::test]
-#[ignore = "starts a private dbus-daemon; run by check.sh"]
+#[ignore = "starts a private dbus-daemon; run by the suite's live tier"]
 async fn a_request_arriving_after_another_finished_still_gets_its_dialog() {
     if std::process::Command::new("dbus-daemon").arg("--version").output().is_err() {
         eprintln!("HYPRFORGE-SKIP: dbus-daemon is not installed, so there is no private bus to serve on");

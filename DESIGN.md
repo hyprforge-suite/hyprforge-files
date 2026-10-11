@@ -889,7 +889,7 @@ second is the "Remote" phase A left absent, in the `info` role it
 reserved. The talking is a new library crate, `hyprforge-volumes`,
 built in the D-Bus module order CLAUDE.md lays down: plain data, pure
 decisions, backend traits with mocks, then the clients, and a read-only
-`check.sh` tier against the real UDisks2.
+`tools/hf` live tier against the real UDisks2.
 
 - **Which drives.** UDisks2's own hints decide, the way GNOME's volume
   monitor reads them: a filesystem (or a locked encrypted container),
@@ -1326,7 +1326,7 @@ Checked:
   - An Open call returned the picture's URI and the filter in use.
   - A Save onto an existing name asked before replacing.
   - `Close` took the window away and answered "cancelled".
-- `check.sh` has a tier that serves the interface on a bus of its own and
+- `tools/hf` has a live check that serves the interface on a bus of its own and
   compares it, method by method, with the installed XML. It was made to
   fail once on purpose.
 
@@ -1872,7 +1872,7 @@ does not make it one.
   volume monitors, whose own protocol is `org.gtk.Private.…`. The
   fixtures are real output copied from public bug reports — a Samsung
   phone's (2025) and a Nikon camera's — not written from memory, and a
-  `check.sh` tier holds the parser to the `gio` installed here.
+  `tools/hf` live tier holds the parser to the `gio` installed here.
 - **Not installed is a row, not an absence.** This machine has neither
   backend, and the person chose not to install them; so the kernel's
   own USB listing (sysfs, no daemon) is read too, for an interface that
