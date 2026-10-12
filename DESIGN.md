@@ -918,11 +918,21 @@ decisions, backend traits with mocks, then the clients, and a read-only
   click while it runs asks nothing. A refusal is a sentence on the status
   line, one per kind: something has a file open on it; the system's
   policy said no; the password prompt was cancelled; it is not there any
-  more; it is encrypted. An unmount that runs past five minutes says not
+  more. An unmount that runs past five minutes says not
   to unplug yet — that one must never sound like success. Eject says
   "can be removed" when it is.
 - **Eject** unmounts everything on the same drive first, then powers a
   stick off, opens a tray, or detaches a disk image.
+- **Encrypted drives** (LUKS, BitLocker) show marked *Locked*. A click,
+  or Mount, asks for the passphrase in a prompt over the window and
+  unlocks and mounts in one step (`VolumeBackend::unlock`); a wrong
+  passphrase is said in the prompt, which asks again with the field
+  cleared. Unmounting locks it again, and Eject locks every encrypted
+  volume on the drive before powering it off, so no mapping is left
+  onto a stick that has gone. Unlocked, it is still a stick — its kind
+  and eject come from the container, not the device-mapper device
+  inside it. The open/save dialog has no prompt of its own and says to
+  unlock the drive in Files.
 - **Plugged and unplugged.** Every signal UDisks2 sends from under its
   root, and the bus's word when UDisks2 itself starts or stops, means
   *look again*. A burst — dozens for one stick — settles for 300 ms
@@ -989,9 +999,6 @@ polkit password, UDisks2 stopped, and a kernel network mount.
 
 Left out, each for its reason:
 
-- **Unlocking an encrypted drive.** It shows, marked *Locked*, and says
-  so when clicked. Unlocking is a passphrase prompt and a second
-  device to clean up after; worth doing, and its own piece.
 - **Browsing the network for servers** (gvfs's `network://`). A list of
   whatever answered a broadcast is a different feature from "connect
   to this address".

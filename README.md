@@ -127,7 +127,8 @@ installed, is said in the sidebar or the dialog rather than hidden.
 gvfs's MTP or gPhoto2 backend and the eject mark lets go of it. A
 locked phone is asked to be unlocked rather than shown empty, and one
 plugged in with no backend to read it is a row saying which package to
-install (`gvfs-mtp`, `gvfs-gphoto2`).
+install (`gvfs-mtp`, `gvfs-gphoto2`). An **encrypted drive** opens with
+its passphrase, and locks again when it is unmounted or ejected.
 
 A folder on screen **keeps itself up to date**: a download finishing, a
 file saved from an editor or a build writing its output shows up without

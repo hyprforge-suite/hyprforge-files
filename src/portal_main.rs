@@ -551,6 +551,14 @@ impl Dialog {
             // Only a click on a drive reaches here — the dialog's menus
             // offer no drive actions — and it mounts, so the stick can
             // be opened and saved to.
+            // No passphrase prompt here — a file chooser asking for a
+            // drive's key is a dialog inside a dialog — so it says where
+            // to unlock it instead of doing nothing.
+            Outcome::Devices(hyprforge_files_core::devices::Ask::Unlock { id, .. }) => {
+                let label = self.devices.devices().volume(&id).map_or_else(|| "This drive".to_string(), |v| format!("\u{201C}{}\u{201D}", v.label));
+                self.status = Some(format!("{label} is encrypted — unlock it in Files, then choose it here."));
+                Task::none()
+            }
             Outcome::Devices(ask) => match self.devices.ask(ask, 0) {
                 Some(work) => {
                     let outcome = self.browser.update(BrowserMessage::DevicesChanged(self.devices.snapshot()));

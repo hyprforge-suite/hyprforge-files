@@ -14,7 +14,7 @@ use hyprforge_files_core::devices::Ask;
 use hyprforge_secret::Secret;
 use hyprforge_ui::theme::{spacing, FontScale, BASE_TEXT_SIZE};
 use hyprforge_ui::widgets::{meta_text, primary_button, scaled_text, secondary_button};
-use hyprforge_volumes::{ConnectError, Gvfs};
+use hyprforge_volumes::{ConnectError, Gvfs, Operation, VolumeError, VolumeId};
 use iced::widget::{column, row, text_input, Id, Space};
 use iced::{Element, Length, Task};
 use std::path::PathBuf;
@@ -41,6 +41,40 @@ pub(super) enum ConnectMessage {
     Choose(usize),
     Cancel,
     Ended(Result<Option<PathBuf>, ConnectError>),
+}
+
+/// The passphrase prompt for an encrypted drive, while it is open.
+///
+/// The passphrase is a [`Secret`] from the keystroke on, like the
+/// Connect dialog's password, and it goes to UDisks2 and nowhere else —
+/// never kept past the attempt, never written down.
+pub(super) struct DriveUnlock {
+    id: VolumeId,
+    label: String,
+    /// Go there once it is open: a click on the row, not Mount from a
+    /// menu.
+    open: bool,
+    /// The tab that asked, which is where it opens.
+    tab: u64,
+    passphrase: Secret<String>,
+    /// The last attempt's failure — a wrong passphrase is said here,
+    /// beside the field to fix it in.
+    error: Option<String>,
+    /// An attempt is running. UDisks2 cannot be stopped part-way, so
+    /// the prompt waits for it rather than pretending to cancel.
+    running: bool,
+}
+
+/// What the passphrase prompt's controls say.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum DriveUnlockMessage {
+    Passphrase(Secret<String>),
+    Submit,
+    Cancel,
+}
+
+fn passphrase_id() -> Id {
+    Id::new("unlock-drive-passphrase")
 }
 
 /// The address field, so the dialog can put the cursor in it.
@@ -94,6 +128,16 @@ impl App {
     /// share disconnected. A mount opens in the pane that asked.
     pub(super) fn ask_devices(&mut self, at: At, ask: Ask) -> Task<Message> {
         let tab = self.pane(at).id;
+        if let Ask::Unlock { id, open } = ask {
+            let Some(volume) = self.devices.devices().volume(&id) else { return Task::none() };
+            if self.devices.devices().busy.contains_key(&id) {
+                return Task::none();
+            }
+            let label = volume.label.clone();
+            self.drive_unlock =
+                Some(DriveUnlock { id, label, open, tab, passphrase: Secret::default(), error: None, running: false });
+            return iced::widget::operation::focus(passphrase_id());
+        }
         match self.devices.ask(ask, tab) {
             Some(work) => Task::batch([self.broadcast_devices(), Task::perform(work, Message::DeviceDone)]),
             None => Task::none(),
@@ -103,6 +147,24 @@ impl App {
     pub(super) fn device_done(&mut self, done: Done) -> Task<Message> {
         let finished = self.devices.done(done);
         let mut tasks = vec![self.broadcast_devices()];
+        if let Some((id, again)) = &finished.unlock_ended {
+            if let Some(prompt) = self.drive_unlock.as_mut().filter(|p| &p.id == id) {
+                if *again {
+                    // Asked again, with the refused passphrase gone —
+                    // it is not offered back.
+                    prompt.running = false;
+                    prompt.passphrase = Secret::default();
+                    prompt.error = Some(hyprforge_volumes::sentence(
+                        Operation::Unlock,
+                        &prompt.label,
+                        &VolumeError::WrongPassphrase,
+                    ));
+                    tasks.push(iced::widget::operation::focus(passphrase_id()));
+                } else {
+                    self.drive_unlock = None;
+                }
+            }
+        }
         if let Some(status) = finished.status {
             self.status = Some(status);
         }
@@ -114,6 +176,41 @@ impl App {
         }
         tasks.push(self.leave(finished.left.into_iter().collect()));
         Task::batch(tasks)
+    }
+
+    pub(super) fn drive_unlock_update(&mut self, message: DriveUnlockMessage) -> Task<Message> {
+        let Some(prompt) = &mut self.drive_unlock else { return Task::none() };
+        match message {
+            DriveUnlockMessage::Passphrase(secret) => {
+                prompt.passphrase = secret;
+                prompt.error = None;
+                Task::none()
+            }
+            DriveUnlockMessage::Cancel => {
+                if !prompt.running {
+                    self.drive_unlock = None;
+                }
+                Task::none()
+            }
+            DriveUnlockMessage::Submit => {
+                // An empty passphrase is not a guess worth sending.
+                if prompt.running || prompt.passphrase.expose().is_empty() {
+                    return Task::none();
+                }
+                let (id, open, tab) = (prompt.id.clone(), prompt.open, prompt.tab);
+                let passphrase = prompt.passphrase.clone();
+                match self.devices.unlock(id, passphrase, open, tab) {
+                    Some(work) => {
+                        if let Some(prompt) = &mut self.drive_unlock {
+                            prompt.running = true;
+                            prompt.error = None;
+                        }
+                        Task::batch([self.broadcast_devices(), Task::perform(work, Message::DeviceDone)])
+                    }
+                    None => Task::none(),
+                }
+            }
+        }
     }
 
     pub(super) fn open_connect(&mut self) -> Task<Message> {
@@ -192,6 +289,45 @@ impl App {
         }
         task
     }
+}
+
+/// The passphrase prompt for an encrypted drive.
+pub(super) fn drive_unlock_dialog<'a>(prompt: &'a DriveUnlock, scale: FontScale) -> Element<'a, Message> {
+    let size = scale.apply(BASE_TEXT_SIZE);
+    let body = if prompt.running {
+        "Unlocking\u{2026}".to_string()
+    } else {
+        "This drive is encrypted. Enter its passphrase to open it.".to_string()
+    };
+    // `secure`, as every password field here is.
+    let mut field = text_input("Passphrase", prompt.passphrase.expose()).id(passphrase_id()).secure(true).size(size).width(Length::Fill);
+    if !prompt.running {
+        field = field
+            .on_input(|t| Message::DriveUnlock(DriveUnlockMessage::Passphrase(Secret::new(t))))
+            .on_submit(Message::DriveUnlock(DriveUnlockMessage::Submit));
+    }
+    let mut extra = column![
+        field,
+        meta_text("Locked again when it is unmounted or ejected, and never written to disk.", BASE_TEXT_SIZE, scale),
+    ]
+    .spacing(spacing::SM);
+    if let Some(error) = &prompt.error {
+        extra = extra.push(
+            scaled_text(error.clone(), BASE_TEXT_SIZE, scale).style(|_t: &iced::Theme| iced::widget::text::Style {
+                color: Some(hyprforge_ui::theme::error()),
+            }),
+        );
+    }
+    let mut cancel = secondary_button("Cancel");
+    let mut unlock = primary_button("Unlock");
+    if !prompt.running {
+        cancel = cancel.on_press(Message::DriveUnlock(DriveUnlockMessage::Cancel));
+        if !prompt.passphrase.expose().is_empty() {
+            unlock = unlock.on_press(Message::DriveUnlock(DriveUnlockMessage::Submit));
+        }
+    }
+    let buttons = row![Space::new().width(Length::Fill), cancel, unlock].spacing(spacing::SM);
+    dialog(format!("Unlock \u{201C}{}\u{201D}", prompt.label), body, Some(extra.into()), buttons.into(), scale)
 }
 
 /// The dialog: an address, and — when the server asks — a name and
@@ -350,6 +486,82 @@ mod tests {
         assert_eq!(app.tabs[1].browser().current_dir(), Path::new("/run/media/alex/A"));
         assert_eq!(app.tabs[0].browser().current_dir(), Path::new("/home/alex"));
         assert!(app.status.is_none());
+    }
+
+    fn locked(label: &str) -> Volume {
+        Volume { locked: true, filesystem: None, ..stick(label, None) }
+    }
+
+    fn type_passphrase(app: &mut App, passphrase: &str) {
+        let _ = app.update(Message::DriveUnlock(DriveUnlockMessage::Passphrase(Secret::new(passphrase.to_string()))));
+    }
+
+    /// A click on a locked drive opens the prompt and starts nothing: no
+    /// "Unlocking…" until there is a passphrase to unlock with, and an
+    /// empty one is not sent.
+    #[test]
+    fn a_locked_drive_asks_for_its_passphrase_before_anything_starts() {
+        let (mut app, mock, _) = app_with(vec![locked("SECRET")]);
+        let _ = app.update(Message::Browser(BrowserMessage::Device(DeviceMessage::Open(VolumeId("/b/SECRET".into())))));
+        let prompt = app.drive_unlock.as_ref().expect("a prompt opens");
+        assert_eq!(prompt.label, "SECRET");
+        assert!(prompt.open, "a click goes there once it opens");
+        let _ = app.update(Message::DriveUnlock(DriveUnlockMessage::Submit));
+        assert!(app.devices.devices().busy.is_empty(), "an empty passphrase is not sent");
+        assert!(mock.calls().is_empty());
+    }
+
+    /// A wrong passphrase keeps the prompt, says so in it — not on the
+    /// status line too — and drops what was typed; the right one closes
+    /// it and opens the drive in the tab that clicked.
+    #[test]
+    fn a_wrong_passphrase_asks_again_and_the_right_one_opens_the_drive() {
+        let (mut app, _, _) = app_with(vec![locked("SECRET")]);
+        let id = VolumeId("/b/SECRET".into());
+        let _ = app.update(Message::Browser(BrowserMessage::Device(DeviceMessage::Open(id.clone()))));
+        type_passphrase(&mut app, "wrong");
+        let _ = app.update(Message::DriveUnlock(DriveUnlockMessage::Submit));
+        assert!(app.drive_unlock.as_ref().unwrap().running);
+        assert_eq!(app.devices.devices().busy.get(&id), Some(&Operation::Unlock));
+        let _ = app.update(Message::DeviceDone(Done::Volume {
+            id: id.clone(),
+            op: Operation::Unlock,
+            result: Err(VolumeError::WrongPassphrase),
+        }));
+        let prompt = app.drive_unlock.as_ref().expect("still asking");
+        assert!(!prompt.running);
+        assert!(prompt.passphrase.expose().is_empty(), "the refused passphrase is not offered back");
+        assert!(prompt.error.as_deref().unwrap().contains("didn't unlock"), "{:?}", prompt.error);
+        assert!(app.status.is_none());
+
+        type_passphrase(&mut app, "right");
+        let _ = app.update(Message::DriveUnlock(DriveUnlockMessage::Submit));
+        let _ = app.update(Message::DeviceDone(Done::Volume {
+            id,
+            op: Operation::Unlock,
+            result: Ok(Some("/run/media/alex/SECRET".into())),
+        }));
+        assert!(app.drive_unlock.is_none());
+        assert_eq!(app.tabs[0].browser().current_dir(), Path::new("/run/media/alex/SECRET"));
+    }
+
+    /// Escape closes the prompt — but not while UDisks2 is part-way
+    /// through, which nothing here can stop.
+    #[test]
+    fn escape_closes_the_prompt_unless_an_unlock_is_running() {
+        let (mut app, _, _) = app_with(vec![locked("SECRET")]);
+        let _ = app.update(Message::Browser(BrowserMessage::Device(DeviceMessage::Open(VolumeId("/b/SECRET".into())))));
+        type_passphrase(&mut app, "pass");
+        let _ = app.update(Message::DriveUnlock(DriveUnlockMessage::Submit));
+        let _ = app.update(Message::EscapeInField);
+        assert!(app.drive_unlock.is_some(), "an unlock is running");
+        let _ = app.update(Message::DeviceDone(Done::Volume {
+            id: VolumeId("/b/SECRET".into()),
+            op: Operation::Unlock,
+            result: Err(VolumeError::WrongPassphrase),
+        }));
+        let _ = app.update(Message::EscapeInField);
+        assert!(app.drive_unlock.is_none());
     }
 
     #[test]

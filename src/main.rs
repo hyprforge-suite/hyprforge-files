@@ -266,6 +266,7 @@ fn main() -> iced::Result {
         // neither still opens a window, and says so in the sidebar.
         devices: hyprforge_files::devices::DeviceHost::new(hyprforge_files::devices::Backends::system(), true),
         connecting: None,
+        drive_unlock: None,
         compressing: None,
         tagging: None,
         picking_workspace: None,
@@ -710,6 +711,8 @@ enum Message {
     DeviceDone(hyprforge_files::devices::Done),
     /// The Connect to Server dialog — see `devices_view`.
     Connect(ConnectMessage),
+    /// The passphrase prompt for an encrypted drive — see `devices_view`.
+    DriveUnlock(devices_view::DriveUnlockMessage),
     /// Move the keyboard to the other pane of the split tab in front —
     /// Tab, once the layout has said no text field is holding it.
     OtherPane,
@@ -926,6 +929,8 @@ struct App {
     devices: hyprforge_files::devices::DeviceHost,
     /// The Connect to Server dialog, while it is open.
     connecting: Option<devices_view::Connecting>,
+    /// The passphrase prompt for an encrypted drive, while it is open.
+    drive_unlock: Option<devices_view::DriveUnlock>,
     /// An open "Compress\u{2026}" dialog.
     compressing: Option<Compressing>,
     /// The "Tags…" sheet, while it is open — see `tags_sheet`.
@@ -5162,11 +5167,17 @@ impl App {
             Message::Devices(event) => self.heard_devices(event),
             Message::DeviceDone(done) => self.device_done(done),
             Message::Connect(message) => self.connect_update(message),
+            Message::DriveUnlock(message) => self.drive_unlock_update(message),
             Message::EscapeInField => {
                 // Escape in the Tags sheet's field closes the sheet.
                 if self.tagging.is_some() {
                     self.tagging = None;
                     return Task::none();
+                }
+                // The drive's passphrase prompt closes on Escape, unless
+                // an attempt is running — see `DriveUnlock::running`.
+                if self.drive_unlock.is_some() {
+                    return self.drive_unlock_update(devices_view::DriveUnlockMessage::Cancel);
                 }
                 // The Connect to Server dialog's fields keep Escape: it
                 // stops an attempt, or closes the dialog.
@@ -5802,6 +5813,9 @@ impl App {
         // reachable until it is answered or dismissed.
         if let Some(unlocking) = &self.unlocking {
             return iced::widget::stack![window, unlock_dialog(unlocking, scale)].into();
+        }
+        if let Some(prompt) = &self.drive_unlock {
+            return iced::widget::stack![window, devices_view::drive_unlock_dialog(prompt, scale)].into();
         }
         if let Some(open) = &self.connecting {
             return iced::widget::stack![window, devices_view::connect_dialog(open, self.devices.gvfs(), scale)]
@@ -7516,6 +7530,7 @@ mod tests {
                 true,
             ),
             connecting: None,
+        drive_unlock: None,
             compressing: None,
             tagging: None,
             picking_workspace: None,

@@ -95,6 +95,9 @@ pub struct Finished {
     /// A mount point that went away: a tab standing inside it should
     /// leave, because what it is showing is no longer there.
     pub left: Option<PathBuf>,
+    /// An unlock of this drive ended — `true` when its passphrase was
+    /// wrong and the prompt should ask again rather than close.
+    pub unlock_ended: Option<(VolumeId, bool)>,
 }
 
 /// The window's drives and shares, and what is happening to them.
@@ -222,6 +225,9 @@ impl DeviceHost {
                     Done::Volume { id, op: Operation::Mount, result }
                 })
             }
+            // Not work yet: the passphrase has to be asked for first, and
+            // the host does that before it calls `unlock`.
+            Ask::Unlock { .. } => return None,
             Ask::Unmount(id) => {
                 if !self.state.begin(&id, Operation::Unmount) {
                     return None;
@@ -288,6 +294,25 @@ impl DeviceHost {
         Some(work)
     }
 
+    /// Unlocks the encrypted drive `id` with `passphrase` and mounts it,
+    /// going there in `tab` afterwards when `open` — the work an
+    /// [`Ask::Unlock`] becomes once its prompt is answered. `None` when
+    /// something is already being done to it.
+    pub fn unlock(&mut self, id: VolumeId, passphrase: hyprforge_secret::Secret<String>, open: bool, tab: u64) -> Option<Work> {
+        if !self.state.begin(&id, Operation::Unlock) {
+            return None;
+        }
+        if open {
+            self.opens.insert(id.clone(), tab);
+        }
+        let volumes = self.backends.volumes.clone();
+        self.publish();
+        Some(Box::pin(async move {
+            let result = volumes.unlock(&id, &passphrase).await.map(Some);
+            Done::Volume { id, op: Operation::Unlock, result }
+        }))
+    }
+
     /// Takes in how some work ended.
     pub fn done(&mut self, done: Done) -> Finished {
         let finished = match done {
@@ -296,10 +321,15 @@ impl DeviceHost {
                 let label = before.as_ref().map_or_else(|| "the drive".to_string(), |v| v.label.clone());
                 let opener = self.opens.remove(&id);
                 self.state.finish(&id, op, &result);
+                let unlock_ended =
+                    (op == Operation::Unlock).then(|| (id.clone(), result == Err(VolumeError::WrongPassphrase)));
                 match (&result, op) {
-                    (Err(e), _) => Finished { status: Some(sentence(op, &label, e)), ..Finished::default() },
-                    (Ok(Some(point)), Operation::Mount) => {
-                        Finished { open: opener.map(|tab| (tab, point.clone())), ..Finished::default() }
+                    // The prompt says this one, beside the field to fix
+                    // it in; a status line too would say it twice.
+                    (Err(VolumeError::WrongPassphrase), _) => Finished { unlock_ended, ..Finished::default() },
+                    (Err(e), _) => Finished { status: Some(sentence(op, &label, e)), unlock_ended, ..Finished::default() },
+                    (Ok(Some(point)), Operation::Mount | Operation::Unlock) => {
+                        Finished { open: opener.map(|tab| (tab, point.clone())), unlock_ended, ..Finished::default() }
                     }
                     (Ok(_), Operation::Unmount | Operation::Eject) => Finished {
                         left: before.and_then(|v| v.mount_point),
@@ -454,6 +484,34 @@ mod tests {
         let mut host = DeviceHost::new(backends, true);
         host.heard(Event::Volumes(Ok(volumes)));
         (host, mock)
+    }
+
+    /// The whole round, against the backend: a wrong passphrase is told
+    /// apart from every other failure, the right one opens the drive in
+    /// the tab that clicked, and unmounting locks it again.
+    #[tokio::test]
+    async fn a_drive_unlocks_with_its_passphrase_and_locks_again_on_unmount() {
+        let secret = Volume { locked: true, filesystem: None, ..stick("S", None) };
+        let id = secret.id.clone();
+        let (mut host, mock) = host(vec![secret]);
+        mock.set_passphrase(&id, "right");
+        assert!(host.ask(Ask::Unlock { id: id.clone(), open: true }, 7).is_none(), "nothing starts before a passphrase");
+
+        let wrong = host.unlock(id.clone(), hyprforge_secret::Secret::new("wrong".into()), true, 7).unwrap().await;
+        let finished = host.done(wrong);
+        assert_eq!(finished.unlock_ended, Some((id.clone(), true)));
+        assert_eq!(finished.status, None, "the prompt says it, beside the field");
+
+        let right = host.unlock(id.clone(), hyprforge_secret::Secret::new("right".into()), true, 7).unwrap().await;
+        let finished = host.done(right);
+        assert_eq!(finished.unlock_ended, Some((id.clone(), false)));
+        assert_eq!(finished.open, Some((7, PathBuf::from("/run/media/mock/S"))));
+        assert!(!host.devices().volume(&id).unwrap().locked);
+
+        let unmounted = host.ask(Ask::Unmount(id.clone()), 7).unwrap().await;
+        host.done(unmounted);
+        host.heard(Event::Volumes(mock.volumes().await));
+        assert!(host.devices().volume(&id).unwrap().locked, "locked again");
     }
 
     #[tokio::test]
