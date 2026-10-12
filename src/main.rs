@@ -266,6 +266,7 @@ fn main() -> iced::Result {
         // neither still opens a window, and says so in the sidebar.
         devices: hyprforge_files::devices::DeviceHost::new(hyprforge_files::devices::Backends::system(), true),
         connecting: None,
+        dividing: false,
         drive_unlock: None,
         compressing: None,
         tagging: None,
@@ -336,6 +337,12 @@ fn main() -> iced::Result {
         if split.tab < app.tabs.len() {
             restoring.push(app.open_second_pane(split.tab, split.second));
             app.tabs[split.tab].focused = split.focused.min(1);
+            // Read through the same clamp a drag goes through: a ratio
+            // written by hand, or by a window much wider than this one,
+            // must not leave a pane too narrow to use.
+            if let Some(ratio) = split.ratio {
+                app.tabs[split.tab].ratio = hyprforge_ui::widgets::split_ratio(ratio * width_of(&app), width_of(&app), MIN_PANE_WIDTH);
+            }
         }
     }
     // A window not reopening last time's tabs opens a new one — split,
@@ -716,6 +723,14 @@ enum Message {
     /// Move the keyboard to the other pane of the split tab in front —
     /// Tab, once the layout has said no text field is holding it.
     OtherPane,
+    /// The split's divider was grabbed; the pointer is followed until
+    /// the button comes up.
+    DividerPressed,
+    /// A double click on the divider: even halves again.
+    DividerReset,
+    /// The pointer moved while the divider was held, to this x.
+    DividerMoved(f32),
+    DividerReleased,
 }
 
 /// One listing: a [`Browser`] (directory, selection, back/forward
@@ -773,11 +788,14 @@ impl Pane {
 struct Tab {
     panes: Vec<Pane>,
     focused: usize,
+    /// The left pane's share of the width, split: where the divider was
+    /// dragged to. Kept while unsplit, so splitting again puts it back.
+    ratio: f32,
 }
 
 impl Tab {
     fn new(id: u64, browser: Browser) -> Tab {
-        Tab { panes: vec![Pane::new(id, browser)], focused: 0 }
+        Tab { panes: vec![Pane::new(id, browser)], focused: 0, ratio: EVEN_SPLIT }
     }
 
     /// The pane with the keyboard.
@@ -929,6 +947,8 @@ struct App {
     devices: hyprforge_files::devices::DeviceHost,
     /// The Connect to Server dialog, while it is open.
     connecting: Option<devices_view::Connecting>,
+    /// The split's divider is being dragged.
+    dividing: bool,
     /// The passphrase prompt for an encrypted drive, while it is open.
     drive_unlock: Option<devices_view::DriveUnlock>,
     /// An open "Compress\u{2026}" dialog.
@@ -4497,6 +4517,30 @@ impl App {
                 }
                 Task::none()
             }
+            Message::DividerPressed => {
+                self.dividing = true;
+                Task::none()
+            }
+            Message::DividerMoved(x) => {
+                if self.dividing {
+                    let room = (width_of(self) - hyprforge_ui::widgets::SPLIT_HANDLE_WIDTH).max(0.0);
+                    // The pointer is on the handle's middle, so half the
+                    // handle comes off before the left pane's share.
+                    let left = x - hyprforge_ui::widgets::SPLIT_HANDLE_WIDTH / 2.0;
+                    self.tabs[self.active].ratio = hyprforge_ui::widgets::split_ratio(left, room, MIN_PANE_WIDTH);
+                }
+                Task::none()
+            }
+            // The session keeps the ratio by itself: `update_and_remember`
+            // sees the tab change, and its save waits for the drag to settle.
+            Message::DividerReleased => {
+                self.dividing = false;
+                Task::none()
+            }
+            Message::DividerReset => {
+                self.tabs[self.active].ratio = EVEN_SPLIT;
+                Task::none()
+            }
             Message::OtherPane => {
                 let other = 1 - self.active_tab().focused.min(1);
                 self.focus_pane(other);
@@ -5897,15 +5941,22 @@ impl App {
             let id = pane.id;
             return pane.browser.view(scale, width).map(move |m| Message::Pane(id, m));
         }
-        let half = ((width - SPLIT_DIVIDER) / 2.0).max(0.0);
+        // The handle's width comes out of the panes', and what is left is
+        // shared by the tab's ratio — the same clamp as a drag, so a
+        // window made narrower never leaves a pane below its minimum.
+        let room = (width - hyprforge_ui::widgets::SPLIT_HANDLE_WIDTH).max(0.0);
+        let ratio = hyprforge_ui::widgets::split_ratio(tab.ratio * room, room, MIN_PANE_WIDTH);
+        let left = (room * ratio).floor();
+        let widths = [left, room - left];
         let mut both = row![].height(Length::Fill);
         for (index, pane) in tab.panes.iter().enumerate() {
             if index > 0 {
-                both = both.push(hyprforge_ui::widgets::vertical_divider());
+                both = both.push(hyprforge_ui::widgets::split_handle(Message::DividerPressed, Message::DividerReset));
             }
             let chrome = if index == 0 { Chrome::Full } else { Chrome::Bare };
             let id = pane.id;
-            let view = pane.browser.view_as(scale, half, chrome).map(move |m| Message::Pane(id, m));
+            let pane_width = widths[index.min(1)];
+            let view = pane.browser.view_as(scale, pane_width, chrome).map(move |m| Message::Pane(id, m));
             // A click on a pane's empty space chooses it too, the way it
             // does in every two-pane file manager. Only presses nothing in
             // the pane captured reach this — a row or a button handles its
@@ -5913,7 +5964,7 @@ impl App {
             let view: Element<'a, Message> = iced::widget::mouse_area(view).on_press(Message::FocusPane(id)).into();
             let focused = index == tab.focused;
             both = both.push(
-                column![pane_edge(focused), view].width(Length::FillPortion(1)).height(Length::Fill),
+                column![pane_edge(focused), view].width(Length::Fixed(pane_width)).height(Length::Fill),
             );
         }
         both.into()
@@ -5960,6 +6011,9 @@ impl App {
             edits,
             window::resize_events().map(|(_, size)| Message::WindowResized(size)),
             pointer::track(),
+            // Only while the divider is held: every pointer move becomes
+            // a message then, and none does otherwise.
+            if self.dividing { iced::event::listen_with(divider_drag) } else { Subscription::none() },
             iced::event::listen_with(field_escape),
             Subscription::run(hyprforge_files::dnd::events).map(Message::Dnd),
             hyprforge_files::inner_drag::events().map(Message::InnerDrag),
@@ -6056,7 +6110,12 @@ impl App {
                 .enumerate()
                 .filter_map(|(index, tab)| {
                     let second = tab.panes.get(1)?;
-                    Some(Split { tab: index, second: second.browser.current_dir().to_path_buf(), focused: tab.focused })
+                    Some(Split {
+                        tab: index,
+                        second: second.browser.current_dir().to_path_buf(),
+                        focused: tab.focused,
+                        ratio: (tab.ratio != EVEN_SPLIT).then_some(tab.ratio),
+                    })
                 })
                 .collect(),
         }
@@ -7084,7 +7143,29 @@ fn tab_button_style(status: button::Status, is_active: bool) -> button::Style {
 /// `Theme::rounding`) rather than a value this app invented.
 /// The line between the two panes of a split tab, in logical pixels —
 /// what the two halves' widths leave room for.
-const SPLIT_DIVIDER: f32 = 1.0;
+/// While the divider is held: where the pointer goes, and when the button
+/// comes up. A release anywhere ends the drag — over another widget, or
+/// outside the window, where a press that started on the handle still
+/// reports its release.
+fn divider_drag(event: iced::Event, _status: iced::event::Status, _window: window::Id) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => Some(Message::DividerMoved(position.x)),
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => Some(Message::DividerReleased),
+        _ => None,
+    }
+}
+
+/// Even halves: a split nobody has dragged.
+const EVEN_SPLIT: f32 = 0.5;
+
+/// The narrowest a pane of a split may be dragged: a path bar and a
+/// column of names still fit, and the sidebar has its rail.
+const MIN_PANE_WIDTH: f32 = 280.0;
+
+/// The window's width, as the panes are laid out in.
+fn width_of(app: &App) -> f32 {
+    app.last_window_size.0 as f32
+}
 
 /// How tall the strip over a pane is that says it has the keyboard.
 const PANE_EDGE: f32 = 2.0;
@@ -7530,6 +7611,7 @@ mod tests {
                 true,
             ),
             connecting: None,
+        dividing: false,
         drive_unlock: None,
             compressing: None,
             tagging: None,
@@ -10389,7 +10471,7 @@ mod tests {
             Session {
                 tabs: vec![PathBuf::from("/a"), PathBuf::from("/b")],
                 active: 1,
-                splits: vec![Split { tab: 1, second: PathBuf::from("/c"), focused: 1 }],
+                splits: vec![Split { tab: 1, second: PathBuf::from("/c"), focused: 1, ratio: None }],
             }
         );
 
@@ -10400,6 +10482,35 @@ mod tests {
         }
         restored.active = saved.active;
         assert_eq!(restored.session_now(), saved);
+    }
+
+    /// The divider follows the pointer while it is held and only then,
+    /// stops short of squeezing a pane below its minimum, comes back to
+    /// even on a double click, and the session keeps a dragged split.
+    #[test]
+    fn the_split_divider_drags_within_limits_and_is_remembered() {
+        let mut app = app_for_test(&["/dir"]);
+        app.last_window_size = (1207, 800);
+        split(&mut app);
+        let handle = hyprforge_ui::widgets::SPLIT_HANDLE_WIDTH;
+        let room = 1207.0 - handle;
+
+        let _ = app.update(Message::DividerMoved(500.0));
+        assert_eq!(app.active_tab().ratio, EVEN_SPLIT, "not held: nothing moves");
+
+        let _ = app.update(Message::DividerPressed);
+        let _ = app.update(Message::DividerMoved(400.0 + handle / 2.0));
+        assert_eq!(app.active_tab().ratio, 400.0 / room);
+        let _ = app.update(Message::DividerMoved(5.0));
+        assert_eq!(app.active_tab().ratio, MIN_PANE_WIDTH / room, "the left pane keeps its minimum");
+        let _ = app.update(Message::DividerReleased);
+        let _ = app.update(Message::DividerMoved(900.0));
+        assert_eq!(app.active_tab().ratio, MIN_PANE_WIDTH / room, "let go: nothing moves");
+        assert_eq!(app.session_now().splits[0].ratio, Some(MIN_PANE_WIDTH / room));
+
+        let _ = app.update(Message::DividerReset);
+        assert_eq!(app.active_tab().ratio, EVEN_SPLIT);
+        assert_eq!(app.session_now().splits[0].ratio, None, "even halves are written as before");
     }
 
     /// "Open new tabs split" applies to tabs opened from now on — not to

@@ -1763,7 +1763,12 @@ the tab beside it can stay one listing.
   and to the window's first tab when it is not reopening last time's;
   restored tabs come back as they were saved.
 
-Not built: dragging the divider. The halves are equal.
+- **The divider drags** (`hyprforge_ui::widgets::split_handle`): the
+  tab keeps the left pane's share, a drag stops 280 pixels short of
+  either edge (`split_ratio`, which a narrower window goes through too),
+  and a double click puts the halves back even. The session keeps a
+  dragged split as `ratio` on its `[[split]]`; an even one writes none,
+  so the file reads as before and an older Files ignores the key.
 
 ## Selection, typing, free space and undo history — built
 

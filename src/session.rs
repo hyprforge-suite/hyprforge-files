@@ -53,7 +53,7 @@ use std::time::Duration;
 pub const CHECK_WITHIN: Duration = Duration::from_millis(500);
 
 /// What is kept.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Session {
     /// Each tab's folder, left to right — a split tab's left pane's.
@@ -66,7 +66,7 @@ pub struct Session {
 }
 
 /// One split tab's second pane.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Split {
     /// Which of [`Session::tabs`] this is.
     pub tab: usize,
@@ -76,6 +76,11 @@ pub struct Split {
     /// else, hand-written, is read as the left.
     #[serde(default)]
     pub focused: usize,
+    /// The left pane's share of the width, when the divider was dragged;
+    /// absent for even halves, so a file from before the divider moved —
+    /// and every split nobody dragged — reads and writes as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<f32>,
 }
 
 impl Session {
@@ -117,7 +122,8 @@ impl Session {
             }
             if let Some(second) = second {
                 let focused = split.map_or(0, |s| s.focused).min(1);
-                splits.push(Split { tab: tabs.len(), second, focused });
+                let ratio = split.and_then(|s| s.ratio);
+                splits.push(Split { tab: tabs.len(), second, focused, ratio });
             }
             tabs.push(kept);
         }
@@ -275,7 +281,7 @@ mod tests {
     }
 
     fn split(tab: usize, second: &str, focused: usize) -> Split {
-        Split { tab, second: PathBuf::from(second), focused }
+        Split { tab, second: PathBuf::from(second), focused, ratio: None }
     }
 
     #[test]
@@ -436,4 +442,19 @@ mod tests {
         assert_eq!(restored.active, 2);
         assert_eq!(restored.folders().len(), 4);
     }
+
+    /// A dragged split keeps its ratio across a save; an even one, and
+    /// every file from before the divider moved, has none written.
+    #[test]
+    fn a_split_ratio_is_written_only_when_it_was_dragged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("files-session.toml");
+        let mut session = Session { tabs: vec![PathBuf::from("/a")], active: 0, splits: vec![split(0, "/b", 0)] };
+        save_to(&path, &session).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("ratio"));
+        session.splits[0].ratio = Some(0.3);
+        save_to(&path, &session).unwrap();
+        assert_eq!(load_from(&path).unwrap(), Some(session));
+    }
+
 }
