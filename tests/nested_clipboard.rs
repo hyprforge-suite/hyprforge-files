@@ -89,7 +89,7 @@ fn clip(verb: ClipVerb, paths: &[&str]) -> FileClip {
 /// Files copied here are offered in every form another file manager or
 /// a terminal looks for, and `wl-paste` reads each back as written.
 #[test]
-#[ignore]
+#[ignore = "disposable: changes a compositor or the clipboard; tools/hf test disposable"]
 fn files_copied_here_are_pasteable_elsewhere() {
     let Some(display) = nested_display() else { return };
     let board = SystemClipboard::new();
@@ -115,7 +115,7 @@ fn files_copied_here_are_pasteable_elsewhere() {
 
 /// A URI list another application copied is read back as files to paste.
 #[test]
-#[ignore]
+#[ignore = "disposable: changes a compositor or the clipboard; tools/hf test disposable"]
 fn files_copied_elsewhere_are_pasteable_here() {
     let Some(display) = nested_display() else { return };
     wl(&display, "wl-copy", &["--type", "text/uri-list"], Some("file:///home/x/r%C3%A9sum%C3%A9.pdf\r\n"));
@@ -127,7 +127,7 @@ fn files_copied_elsewhere_are_pasteable_here() {
 /// Text copied elsewhere since is not files, even though this app still
 /// remembers some: the system clipboard is the truth.
 #[test]
-#[ignore]
+#[ignore = "disposable: changes a compositor or the clipboard; tools/hf test disposable"]
 fn text_copied_elsewhere_since_means_there_is_nothing_to_paste() {
     let Some(display) = nested_display() else { return };
     let board = SystemClipboard::new();
@@ -141,7 +141,7 @@ fn text_copied_elsewhere_since_means_there_is_nothing_to_paste() {
 /// After a move, the clipboard is emptied only if it still holds what
 /// this app put there.
 #[test]
-#[ignore]
+#[ignore = "disposable: changes a compositor or the clipboard; tools/hf test disposable"]
 fn clearing_leaves_someone_elses_copy_alone() {
     let Some(display) = nested_display() else { return };
     let board = SystemClipboard::new();
