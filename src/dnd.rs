@@ -188,12 +188,29 @@ impl Dnd {
                 return;
             }
         };
-        // SAFETY: the pointer is winit's `wl_display`, which lives as long
-        // as its event loop — the whole life of this process, since this
-        // app has one window and exits when it closes. The foreign
-        // backend never closes a display it did not open.
+        // SAFETY: the pointer is winit's `wl_display`, alive now — this
+        // runs while the window exists. It is *not* alive for the whole
+        // process, which this comment once said: winit disconnects it
+        // when its event loop ends, before the process exits, while this
+        // window's state is still being dropped and the worker below is
+        // still running. See the `forget` that follows for what that
+        // costs if anything here is still holding on.
         let backend = unsafe { Backend::from_foreign_display(display.cast()) };
         let connection = Connection::from_backend(backend);
+        // One reference that is never released, on purpose. The last
+        // reference to a wayland-backend connection runs its teardown:
+        // `wl_proxy_destroy` on every proxy it made and
+        // `wl_event_queue_destroy` on its queue, with no way to know the
+        // display under them is gone. On a borrowed display that winit has
+        // already disconnected, that is a use after free, and it was this
+        // window's commonest crash: 32 SIGSEGVs in 30 days, every one in
+        // `wl_proxy_destroy` under `ConnectionState::drop` — on the main
+        // thread when the window's state was dropped after the event loop,
+        // and on `files-dnd` and `files-drag-out` when the worker woke to
+        // a dead connection and let go of the last copy. Nothing needs the
+        // teardown: these objects live as long as the window, and the
+        // window as long as the process.
+        std::mem::forget(connection.clone());
         let (ready, press, outgoing) = (self.ready.clone(), self.press.clone(), self.outgoing.clone());
         let spawned = std::thread::Builder::new()
             .name("files-dnd".into())
@@ -334,6 +351,10 @@ fn run_worker(
     let _ = ready.set(Ready { connection, queue: qh, manager, device });
     loop {
         if let Err(e) = queue.blocking_dispatch(&mut state) {
+            // The usual cause is the window closing: winit has
+            // disconnected the display. Returning drops this worker's
+            // copies, which is safe only because `attach` keeps one
+            // reference that is never released — see there.
             tracing::warn!(error = %e, "the drag worker lost its connection");
             return;
         }
