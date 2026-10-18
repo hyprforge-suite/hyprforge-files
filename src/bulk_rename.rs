@@ -607,8 +607,8 @@ pub fn archive_edits(
     let mut edits = Vec::with_capacity(steps.len());
     for step in steps {
         let (Some((from_archive, from)), Some((to_archive, to))) = (
-            hyprforge_files_core::archive::split(&step.from),
-            hyprforge_files_core::archive::split(&step.to),
+            hyprforge_files_core::archive::member_of(&step.from),
+            hyprforge_files_core::archive::member_of(&step.to),
         ) else {
             return None;
         };

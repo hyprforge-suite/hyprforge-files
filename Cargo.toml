@@ -153,6 +153,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 tempfile = "3"
 
 [dev-dependencies]
+# The ignored render test only: draws the window to a PNG to look at.
+iced_tiny_skia = { version = "0.14.1", default-features = false }
+iced_runtime = "0.14"
+tiny-skia = "0.11"
 # Building an encrypted zip by hand, to prove the window opens a password
 # prompt rather than reporting a failure. This crate's own writer will
 # not produce one — encrypting an archive is not a thing it offers.

@@ -68,7 +68,7 @@ impl App {
     }
 
     fn apply_bulk_rename(&mut self, tab_id: u64, renames: Vec<(PathBuf, PathBuf)>) -> Task<Message> {
-        let in_archive = renames.first().is_some_and(|(from, _)| hyprforge_files_core::archive::split(from).is_some());
+        let in_archive = renames.first().is_some_and(|(from, _)| hyprforge_files_core::archive::member_of(from).is_some());
         if in_archive {
             let neighbours = self.bulk_rename.as_ref().map(|(_, s)| s.request().neighbours.clone()).unwrap_or_default();
             self.bulk_rename = None;

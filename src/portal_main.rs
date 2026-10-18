@@ -525,7 +525,7 @@ impl Dialog {
                 },
                 |(path, result)| Message::FolderMade(path, result),
             ),
-            Outcome::Rename { from, to } if hyprforge_files_core::archive::split(&from).is_none() => Task::perform(
+            Outcome::Rename { from, to } if hyprforge_files_core::archive::member_of(&from).is_none() => Task::perform(
                 async move {
                     let (source, target) = (from, to.clone());
                     let result = tokio::task::spawn_blocking(move || hyprforge_files::jobs::rename(&source, &target))

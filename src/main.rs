@@ -1953,7 +1953,7 @@ impl App {
             // Offered and never applied — writing back rewrites the
             // whole archive, and doing that because a text editor
             // autosaved is not a decision this app gets to make.
-            Outcome::Activated(path) if hyprforge_files_core::archive::split(&path).is_some() => {
+            Outcome::Activated(path) if hyprforge_files_core::archive::member_of(&path).is_some() => {
                 self.open_from_archive(path)
             }
             Outcome::Activated(path) => {
@@ -2128,7 +2128,7 @@ impl App {
             Outcome::DeletePermanently(paths)
                 if paths
                     .first()
-                    .is_some_and(|p| hyprforge_files_core::archive::split(p).is_some()) =>
+                    .is_some_and(|p| hyprforge_files_core::archive::member_of(p).is_some()) =>
             {
                 self.edit_archive(paths.first().cloned().unwrap_or_default(), |members| {
                     members.into_iter().map(hyprforge_archive::Edit::Remove).collect()
@@ -2219,7 +2219,7 @@ impl App {
                 if clip
                     .paths
                     .first()
-                    .is_some_and(|p| hyprforge_files_core::archive::split(p).is_some()) =>
+                    .is_some_and(|p| hyprforge_files_core::archive::member_of(p).is_some()) =>
             {
                 let scratch = self.scratch.clone();
                 let paths = clip.paths.clone();
@@ -2229,7 +2229,7 @@ impl App {
                 let unlock = clip
                     .paths
                     .first()
-                    .and_then(|p| hyprforge_files_core::archive::split(p))
+                    .and_then(|p| hyprforge_files_core::archive::member_of(p))
                     .map(|(archive, _)| self.keyring.unlock_for(&archive))
                     .unwrap_or_default();
 
@@ -2244,7 +2244,7 @@ impl App {
                         let archive = clip
                             .paths
                             .first()
-                            .and_then(|p| hyprforge_files_core::archive::split(p))
+                            .and_then(|p| hyprforge_files_core::archive::member_of(p))
                             .map(|(archive, _)| archive)?;
                         Some(CutFromArchive {
                             archive,
@@ -2252,7 +2252,7 @@ impl App {
                                 .paths
                                 .iter()
                                 .filter_map(|p| {
-                                    hyprforge_files_core::archive::split(p).map(|(_, m)| m)
+                                    hyprforge_files_core::archive::member_of(p).map(|(_, m)| m)
                                 })
                                 .filter(|m| !m.is_empty())
                                 .collect(),
@@ -2267,7 +2267,7 @@ impl App {
                             let mut copies = Vec::with_capacity(paths.len());
                             for path in &paths {
                                 let Some((archive, member)) =
-                                    hyprforge_files_core::archive::split(path)
+                                    hyprforge_files_core::archive::member_of(path)
                                 else {
                                     continue;
                                 };
@@ -2357,7 +2357,7 @@ impl App {
                 iced::widget::operation::select_range(id, 0, select),
             ]),
             Outcome::Rename { from, to }
-                if hyprforge_files_core::archive::split(&from).is_some() =>
+                if hyprforge_files_core::archive::member_of(&from).is_some() =>
             {
                 let (Some((archive, member)), Some((_, target))) = (
                     hyprforge_files_core::archive::split(&from),
@@ -3736,7 +3736,7 @@ impl App {
         // An archive's members, dragged inside the window: not paths a
         // paste can read, so they are extracted where they land.
         if let hyprforge_files_core::drop::DropFrom::Inside(paths) = &from {
-            if paths.first().is_some_and(|p| hyprforge_files_core::archive::split(p).is_some()) {
+            if paths.first().is_some_and(|p| hyprforge_files_core::archive::member_of(p).is_some()) {
                 use hyprforge_files::inner_drag::{members_drop, MembersDrop};
                 return match members_drop(paths, &into, hyprforge_files_core::archive::split) {
                     MembersDrop::Extract { archive, members, prefix, into } => {
@@ -3915,7 +3915,7 @@ impl App {
         if paths.is_empty() {
             return Task::none();
         }
-        if let Some((archive, _)) = paths.first().and_then(|p| hyprforge_files_core::archive::split(p)) {
+        if let Some((archive, _)) = paths.first().and_then(|p| hyprforge_files_core::archive::member_of(p)) {
             return self.start_archive_drag(archive, paths);
         }
         let drag = self.drag.clone();
@@ -9049,6 +9049,72 @@ mod tests {
         wait_until("the copy", || std::fs::read_dir(dir.path()).unwrap().count() == 2);
     }
 
+    /// Draws the window on a real folder to `$SHOTS/files.png`, at this
+    /// machine's 1.6 output scale and the installed look — a tool, not a
+    /// check (the suite's `manual` tier). What the person sees is the
+    /// only evidence for a layout bug, and nothing else here can show it.
+    #[test]
+    #[ignore = "manual: draws the window to $SHOTS; a tool, never run automatically"]
+    fn render_the_window() {
+        let Ok(shots) = std::env::var("SHOTS") else {
+            eprintln!("HYPRFORGE-SKIP: render_the_window draws only with $SHOTS set");
+            return;
+        };
+        use iced::{Color, Rectangle};
+        use iced_runtime::core::renderer::Style;
+        use iced_runtime::user_interface::{Cache, UserInterface};
+        hyprforge_ui::theme::init(hyprforge_appearance::look::resolve());
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["Quarterly report.pdf", "holiday-photos.zip", "notes.txt", "a very long file name that will not fit in its column at all.md", "Jaggery"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("Projects")).unwrap();
+        let mut app = app_on(dir.path());
+        app.font_scale = FontScale(hyprforge_ui::theme::active().font_scale);
+        for (name, w, h) in [("files", 1280.0f32, 800.0f32), ("files-half", 770.0, 930.0)] {
+            app.last_window_size = (w as u32, h as u32);
+            let scale = 1.6f32;
+            let (pw, ph) = ((w * scale) as u32, (h * scale) as u32);
+            let theme = hyprforge_ui::theme::active();
+            let font = iced::Font::with_name(Box::leak(theme.font.clone().into_boxed_str()));
+            let mut renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(font, iced::Pixels(theme.font_size)));
+            let size = Size::new(w, h);
+            let mut ui = UserInterface::build(app.view(), size, Cache::default(), &mut renderer);
+            ui.draw(&mut renderer, &app.theme(), &Style { text_color: Color::WHITE }, iced::mouse::Cursor::Unavailable);
+            let iced::Renderer::Secondary(mut skia) = renderer else { unreachable!() };
+            let mut pixmap = tiny_skia::Pixmap::new(pw, ph).unwrap();
+            let mut mask = tiny_skia::Mask::new(pw, ph).unwrap();
+            skia.draw(&mut pixmap.as_mut(), &mut mask, &iced_tiny_skia::graphics::Viewport::with_physical_size(Size::new(pw, ph), scale), &[Rectangle::with_size(size)], Color::BLACK);
+            drop(ui);
+            for px in pixmap.data_mut().chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            pixmap.save_png(std::path::Path::new(&shots).join(format!("{name}.png"))).unwrap();
+        }
+    }
+
+    /// A zip is a file to copy, whatever browsing into one makes of it.
+    /// The archive backend answers `is_dir` for the zip itself so a
+    /// navigation can land on it; copying it must copy the file.
+    #[test]
+    fn a_zip_is_copied_and_pasted_as_a_file() {
+        let from = tempfile::tempdir().unwrap();
+        let to = tempfile::tempdir().unwrap();
+        // The smallest valid zip: an end-of-central-directory record.
+        let mut empty_zip = b"PK\x05\x06".to_vec();
+        empty_zip.extend([0u8; 18]);
+        std::fs::write(from.path().join("bundle.zip"), &empty_zip).unwrap();
+        let mut app = app_on(from.path());
+        let _ = app.update(key("Ctrl+A"));
+        let _ = app.update(key("Ctrl+C"));
+        let clip = app.clipboard.get();
+        assert_eq!(clip.as_ref().map(|c| c.paths.clone()), Some(vec![from.path().join("bundle.zip")]), "the zip is on the clipboard");
+        let _ = app.update(Message::PasteFrom(to.path().to_path_buf(), clip));
+        assert_eq!(app.status, None, "nothing refused");
+        wait_until("the zip copied", || to.path().join("bundle.zip").is_file());
+        assert_eq!(std::fs::read(to.path().join("bundle.zip")).unwrap(), empty_zip);
+    }
+
     /// A cut that fully landed empties the clipboard — its files are no
     /// longer where it says they are — and every tab stops offering Paste.
     #[test]
@@ -9255,6 +9321,23 @@ mod tests {
 
         assert!(to.exists() && !from.exists());
         assert_eq!(app.active_tab().browser().selected_shown(), [to]);
+    }
+
+    /// Renaming a zip renames the file. Before 2026-10-18 it was taken
+    /// for a member of itself and refused: "That name can't be used
+    /// inside an archive."
+    #[test]
+    fn a_zip_is_renamed_like_any_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut empty_zip = b"PK\x05\x06".to_vec();
+        empty_zip.extend([0u8; 18]);
+        std::fs::write(dir.path().join("a.zip"), &empty_zip).unwrap();
+        let mut app = app_on(dir.path());
+        let _ = app.update(key("Down"));
+        let _ = app.update(key("F2"));
+        let _ = app.update(Message::Browser(BrowserMessage::RenameInput("b.zip".into())));
+        let _ = app.update(Message::Browser(BrowserMessage::RenameCommit));
+        assert_eq!(app.status, None, "nothing refused");
     }
 
     /// Escape in the rename field reaches the browser even though the
