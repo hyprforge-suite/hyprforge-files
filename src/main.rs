@@ -387,6 +387,9 @@ fn main() -> iced::Result {
             application_id: APP_ID.to_string(),
             ..window::settings::PlatformSpecific::default()
         },
+        // The close button asks rather than acts, so it goes through
+        // `App::quit` — which stops the drag worker first.
+        exit_on_close_request: false,
         ..window::Settings::default()
     })
     .run();
@@ -449,6 +452,9 @@ fn run_file_manager1(args: Vec<std::ffi::OsString>) -> ! {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Message {
+    /// The titlebar's close button: closes the application, through
+    /// `App::quit`.
+    CloseWindow,
     /// For the pane that has the keyboard, in the tab in front — what a
     /// key resolves against. The view never sends this: what it sends
     /// says which pane it came from ([`Message::Pane`]).
@@ -4369,29 +4375,38 @@ impl App {
         self.handle_outcome(at, outcome)
     }
 
+    /// Closes the application: the last tab closing, or the titlebar's
+    /// close button, which iced is told not to act on by itself so that
+    /// it comes here too. A one-window process: closing the window is
+    /// closing the application.
+    fn quit(&mut self) -> Task<Message> {
+        // Written now rather than after the usual pause: the process ends
+        // with this message, before any timer could fire. One small local
+        // file, the same budget the window's own startup spends reading it.
+        if self.last_prefs.restore_tabs {
+            if let Some((path, session)) = self.session.now() {
+                let session = keep_as(session);
+                if let Err(e) = hyprforge_files::session::save_to(&path, &session) {
+                    tracing::warn!("{e}");
+                }
+            }
+        }
+        // Before the event loop ends, not after: winit disconnects its
+        // display then, and the drag worker dispatching on it was this
+        // window's last crash — see `Dnd::stop`.
+        self.drag.stop();
+        iced::exit()
+    }
+
     /// `Ctrl+W`, or a tab's own close button. See [`neighbour_after_close`]
     /// for the "which neighbour" decision this applies.
     fn close_tab(&mut self, index: usize) -> Task<Message> {
         match neighbour_after_close(self.tabs.len(), index) {
             TabCloseOutcome::NoSuchTab => Task::none(),
             TabCloseOutcome::WindowShouldClose => {
-                // Written now rather than after the usual pause: the
-                // process ends with this message, before any timer could
-                // fire. One small local file, the same budget the
-                // window's own startup spends reading it.
-                if self.last_prefs.restore_tabs {
-                    if let Some((path, session)) = self.session.now() {
-                        let session = keep_as(session);
-                        if let Err(e) = hyprforge_files::session::save_to(&path, &session) {
-                            tracing::warn!("{e}");
-                        }
-                    }
-                }
+                let task = self.quit();
                 self.tabs.clear();
-                // A one-window process: closing its only tab closes the
-                // window by closing the whole application, same as the
-                // titlebar's own close button would.
-                iced::exit()
+                task
             }
             TabCloseOutcome::Activate(next) => {
                 self.tabs.remove(index);
@@ -5654,6 +5669,7 @@ impl App {
             // One bounds check, not two spellings of it: clicking a tab
             // and `Ctrl+N` differ only in which affordance asked, and
             // nothing downstream cares which.
+            Message::CloseWindow => self.quit(),
             Message::SwitchTab(index) => {
                 self.jump_to_tab(index);
                 Task::none()
@@ -6010,6 +6026,9 @@ impl App {
             keys,
             edits,
             window::resize_events().map(|(_, size)| Message::WindowResized(size)),
+            // The titlebar's close button, which iced no longer acts on
+            // by itself — see `App::quit`.
+            window::close_requests().map(|_| Message::CloseWindow),
             pointer::track(),
             // Only while the divider is held: every pointer move becomes
             // a message then, and none does otherwise.

@@ -146,6 +146,11 @@ pub struct Dnd {
     attached: OnceLock<()>,
     /// The serial of the left press still being held, if one is.
     press: Arc<Mutex<Option<u32>>>,
+    /// The worker's way out: a byte written here wakes it from waiting
+    /// on the compositor, and it returns while the display is still
+    /// alive. And the word it sends back when it has.
+    stop: Mutex<Option<std::os::fd::OwnedFd>>,
+    stopped: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// The paths being dragged out right now, if a drag started here is
     /// under way — which is how a drop onto this window knows it came
     /// from this window.
@@ -211,12 +216,45 @@ impl Dnd {
         // teardown: these objects live as long as the window, and the
         // window as long as the process.
         std::mem::forget(connection.clone());
+        let Some((wake, woken)) = stop_pipe() else {
+            tracing::warn!("no pipe for the drag worker's stop; dragging files out is unavailable");
+            return;
+        };
+        let (done, stopped) = std::sync::mpsc::channel();
         let (ready, press, outgoing) = (self.ready.clone(), self.press.clone(), self.outgoing.clone());
-        let spawned = std::thread::Builder::new()
-            .name("files-dnd".into())
-            .spawn(move || run_worker(connection, ready, press, outgoing));
-        if let Err(e) = spawned {
-            tracing::warn!(error = %e, "the drag worker could not start");
+        let spawned = std::thread::Builder::new().name("files-dnd".into()).spawn(move || {
+            run_worker(connection, ready, press, outgoing, woken);
+            let _ = done.send(());
+        });
+        match spawned {
+            Ok(_) => {
+                *self.stop.lock().unwrap_or_else(|p| p.into_inner()) = Some(wake);
+                *self.stopped.lock().unwrap_or_else(|p| p.into_inner()) = Some(stopped);
+            }
+            Err(e) => tracing::warn!(error = %e, "the drag worker could not start"),
+        }
+    }
+
+    /// Stops the worker and waits for it, while winit's display is still
+    /// alive. Call before the window closes: once its event loop ends,
+    /// winit disconnects the display, and a worker still dispatching on
+    /// it is reading freed memory — the `wl_proxy_destroy` SIGSEGV on
+    /// `files-dnd` that outlived the `forget` in [`Self::attach`]
+    /// (2026-10-17 20:50, with only four threads left in the process).
+    ///
+    /// Bounded: a worker that does not answer within half a second is
+    /// left, and closing goes on — a window that will not close is a
+    /// worse failure than the crash this prevents, which happens after
+    /// everything worth keeping is saved.
+    pub fn stop(&self) {
+        let Some(wake) = self.stop.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
+        // SAFETY: a valid pipe end this owns, and one byte from a valid
+        // buffer.
+        let _ = unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&wake), [1u8].as_ptr().cast(), 1) };
+        if let Some(stopped) = self.stopped.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            if stopped.recv_timeout(std::time::Duration::from_millis(500)).is_err() {
+                tracing::warn!("the drag worker did not stop in time; closing anyway");
+            }
         }
     }
 
@@ -318,6 +356,7 @@ fn run_worker(
     ready: Arc<OnceLock<Ready>>,
     press: Arc<Mutex<Option<u32>>>,
     outgoing: Arc<Mutex<Option<Vec<PathBuf>>>>,
+    woken: std::os::fd::OwnedFd,
 ) {
     let (globals, mut queue) = match registry_queue_init::<State>(&connection) {
         Ok(found) => found,
@@ -348,17 +387,77 @@ fn run_worker(
     };
     // The capabilities event, and with it this worker's own pointer,
     // arrive on the first dispatch — before any drag could be asked for.
-    let _ = ready.set(Ready { connection, queue: qh, manager, device });
+    let _ = ready.set(Ready { connection: connection.clone(), queue: qh, manager, device });
+    // `blocking_dispatch` waits on the compositor alone, and nothing can
+    // wake it — so a window closing could only race it. This waits on
+    // the compositor *and* the stop pipe, and returns the moment
+    // `Dnd::stop` writes, while the display is still alive.
     loop {
-        if let Err(e) = queue.blocking_dispatch(&mut state) {
-            // The usual cause is the window closing: winit has
-            // disconnected the display. Returning drops this worker's
-            // copies, which is safe only because `attach` keeps one
-            // reference that is never released — see there.
+        if let Err(e) = queue.dispatch_pending(&mut state) {
             tracing::warn!(error = %e, "the drag worker lost its connection");
             return;
         }
+        if let Err(e) = connection.flush() {
+            if !matches!(&e, wayland_client::backend::WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock) {
+                tracing::warn!(error = %e, "the drag worker lost its connection");
+                return;
+            }
+        }
+        // `None`: events are already queued — dispatch them first.
+        let Some(guard) = queue.prepare_read() else { continue };
+        match wait(std::os::fd::AsRawFd::as_raw_fd(&guard.connection_fd()), std::os::fd::AsRawFd::as_raw_fd(&woken)) {
+            Wake::Stop => return,
+            Wake::Compositor => {
+                if let Err(e) = guard.read() {
+                    if !matches!(&e, wayland_client::backend::WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock) {
+                        tracing::warn!(error = %e, "the drag worker lost its connection");
+                        return;
+                    }
+                }
+            }
+        }
     }
+}
+
+/// What woke the worker.
+#[derive(Debug, PartialEq, Eq)]
+enum Wake {
+    Compositor,
+    Stop,
+}
+
+/// Waits until the compositor has something to read or the stop pipe
+/// has been written; a stop wins if both arrive together. An interrupted
+/// wait is retried.
+fn wait(display: std::os::fd::RawFd, stop: std::os::fd::RawFd) -> Wake {
+    loop {
+        let mut fds = [libc::pollfd { fd: display, events: libc::POLLIN, revents: 0 }, libc::pollfd { fd: stop, events: libc::POLLIN, revents: 0 }];
+        // SAFETY: two valid pollfds in a buffer this owns.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Wake::Stop;
+        }
+        if fds[1].revents != 0 {
+            return Wake::Stop;
+        }
+        if fds[0].revents != 0 {
+            return Wake::Compositor;
+        }
+    }
+}
+
+/// A pipe for the worker's stop: write end, read end.
+fn stop_pipe() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: a buffer for two fds, which on success this then owns.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return None;
+    }
+    // SAFETY: both just made, and owned by nothing else.
+    unsafe { Some((std::os::fd::FromRawFd::from_raw_fd(fds[1]), std::os::fd::FromRawFd::from_raw_fd(fds[0]))) }
 }
 
 /// What a data source carries: every type it offered and the bytes for
@@ -600,5 +699,62 @@ impl Dispatch<WlDataSource, Offer> for State {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    fn poke(fd: &std::os::fd::OwnedFd) {
+        // SAFETY: a valid pipe end this test owns, one byte from a valid
+        // buffer.
+        unsafe { libc::write(fd.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+    }
+
+    /// The worker's wait returns the moment the stop pipe is written, with
+    /// the compositor silent — which is what lets a closing window stop it
+    /// while the display is still alive, where `blocking_dispatch` could
+    /// only be raced.
+    #[test]
+    fn a_stop_wakes_the_wait_with_the_compositor_silent() {
+        let (wake, woken) = stop_pipe().unwrap();
+        let (_silent_end, silent) = stop_pipe().unwrap();
+        let waiter = std::thread::spawn(move || wait(silent.as_raw_fd(), woken.as_raw_fd()));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        poke(&wake);
+        assert_eq!(waiter.join().unwrap(), Wake::Stop);
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+    }
+
+    /// Both ready at once: stopping wins, so a busy compositor cannot keep
+    /// a closing window waiting.
+    #[test]
+    fn a_stop_wins_over_a_busy_compositor() {
+        let (wake, woken) = stop_pipe().unwrap();
+        let (busy_end, busy) = stop_pipe().unwrap();
+        poke(&busy_end);
+        poke(&wake);
+        assert_eq!(wait(busy.as_raw_fd(), woken.as_raw_fd()), Wake::Stop);
+    }
+
+    /// The compositor alone wakes it to read.
+    #[test]
+    fn the_compositor_alone_wakes_it_to_read() {
+        let (_wake, woken) = stop_pipe().unwrap();
+        let (busy_end, busy) = stop_pipe().unwrap();
+        poke(&busy_end);
+        assert_eq!(wait(busy.as_raw_fd(), woken.as_raw_fd()), Wake::Compositor);
+    }
+
+    /// A window that never attached — no Wayland, or closed before it
+    /// could — closes at once.
+    #[test]
+    fn stopping_a_worker_that_never_started_returns_at_once() {
+        let started = std::time::Instant::now();
+        Dnd::new().stop();
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 }
