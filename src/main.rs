@@ -7258,7 +7258,10 @@ fn tab_widget(index: usize, tab: &Tab, is_active: bool, scale: FontScale) -> Ele
     // The button first, so the stack sizes to the label rather than
     // stretching across the strip — see `tabstrip::outline`'s own doc.
     let width = scale.apply(hyprforge_files::tabstrip::TAB_WIDTH);
-    iced::widget::stack![
+    // A middle click closes the tab, any tab — what every browser and
+    // file manager does, and the one way to close an inactive tab
+    // without switching to it first (its × is only on the active one).
+    iced::widget::mouse_area(iced::widget::stack![
         button(container(content).center_y(Length::Fill).padding([0, TAB_PADDING_X]))
             .on_press(Message::SwitchTab(index))
             .width(Length::Fixed(width))
@@ -7266,7 +7269,8 @@ fn tab_widget(index: usize, tab: &Tab, is_active: bool, scale: FontScale) -> Ele
             .padding(0)
             .style(move |_t: &Theme, status| tab_button_style(status, is_active)),
         hyprforge_files::tabstrip::outline(is_active, width, height),
-    ]
+    ])
+    .on_middle_press(Message::CloseTab(index))
     .into()
 }
 
@@ -8537,6 +8541,33 @@ mod tests {
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(app.active, 1, "the tab that slid into slot 1 (originally /c) is the sensible neighbour");
         assert_eq!(app.tabs[app.active].browser().current_dir(), Path::new("/c"));
+    }
+
+    /// A middle click on a tab closes it — an inactive one too, which
+    /// has no × of its own. Through the drawn view, so the click has to
+    /// land on what is really on screen.
+    #[test]
+    fn a_middle_click_closes_the_tab_under_it() {
+        let mut app = app_for_test(&["/one", "/two"]);
+        let size = Size::new(1280.0, 800.0);
+        let messages = {
+            let mut sim = iced_test::Simulator::with_size(iced::Settings::default(), size, app.view());
+            let at = sim.find("two").ok().and_then(|t| t.visible_bounds()).expect("the second tab's label is on screen").center();
+            sim.point_at(at);
+            use iced::mouse::{Button, Event as M};
+            let _ = sim.simulate([
+                iced::Event::Mouse(M::CursorMoved { position: at }),
+                iced::Event::Mouse(M::ButtonPressed(Button::Middle)),
+                iced::Event::Mouse(M::ButtonReleased(Button::Middle)),
+            ]);
+            sim.into_messages().collect::<Vec<_>>()
+        };
+        assert!(messages.iter().any(|m| matches!(m, Message::CloseTab(1))), "no CloseTab(1) from a middle click: {} message(s)", messages.len());
+        for m in messages {
+            let _ = app.update(m);
+        }
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].browser().current_dir(), Path::new("/one"), "the other tab stays");
     }
 
     #[test]
