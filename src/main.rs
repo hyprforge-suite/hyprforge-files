@@ -11436,7 +11436,7 @@ mod archive_tests {
 
         let pending = app.cut_from_archive.as_ref().expect("the newer cut stands");
         assert_eq!(pending.members, ["payload/docs/guide.txt"]);
-        assert_eq!(pending.copies, [guide.clone()], "the copies of the members it will remove");
+        assert_eq!(pending.copies, std::slice::from_ref(&guide), "the copies of the members it will remove");
         assert_eq!(app.clipboard.get().map(|c| c.paths), Some(vec![guide]), "and the clipboard holds those");
     }
 
