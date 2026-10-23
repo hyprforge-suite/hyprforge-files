@@ -38,6 +38,16 @@ use std::time::Duration;
 /// How long a window gets to take a request.
 const ANSWER: Duration = Duration::from_secs(2);
 
+/// The longest request line read. A real one is a few folders' paths;
+/// past this the sender is not another launch of Files.
+const MAX_LINE: u64 = 64 * 1024;
+
+/// How long the window waits after its socket fails to accept, before
+/// trying again. Out of descriptors (`EMFILE`) the accept fails at once,
+/// every time, and retrying straight away spins a core for as long as
+/// that lasts.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(250);
+
 /// The folder every window's socket is in. `None` without
 /// `$XDG_RUNTIME_DIR`, which a session always sets — and without which
 /// there is nowhere private to put a socket, so no window serves one and
@@ -317,10 +327,18 @@ fn serve_in(dir: Option<PathBuf>) -> impl iced::futures::Stream<Item = Start> {
             }
         };
         loop {
-            let Ok((stream, _)) = listener.accept().await else { continue };
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
+            };
             let (read, mut write) = stream.into_split();
             let mut line = String::new();
-            let mut reader = tokio::io::BufReader::new(read);
+            // Bounded in size as well as time: a line that never ends
+            // stops at `MAX_LINE`, fails to parse, and is refused.
+            let mut reader = tokio::io::BufReader::new(tokio::io::AsyncReadExt::take(read, MAX_LINE));
             let read = tokio::time::timeout(ANSWER, reader.read_line(&mut line)).await;
             let Ok(Ok(_)) = read else { continue };
             let Ok(wire) = serde_json::from_str::<Wire>(&line) else {
@@ -428,5 +446,33 @@ mod tests {
         let got = tokio::time::timeout(Duration::from_secs(5), heard.next()).await.unwrap();
         assert_eq!(got, Some(start));
         assert_eq!(asked.await.unwrap().trim(), "ok");
+    }
+
+    /// F8: a request is one short line, and the read of it was bounded
+    /// in time but not in size — a line that never ends was gathered
+    /// for as long as it kept coming. Past `MAX_LINE` it is refused.
+    #[tokio::test]
+    async fn a_request_line_that_never_ends_is_refused_once_it_is_too_long() {
+        use iced::futures::StreamExt;
+        let runtime = tempfile::tempdir().unwrap();
+        let mut heard = Box::pin(serve_in(Some(runtime.path().to_path_buf())));
+        let path = socket_in(runtime.path());
+        let asked = tokio::task::spawn_blocking(move || {
+            for _ in 0..50 {
+                if path.exists() {
+                    let mut stream = UnixStream::connect(&path).unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let _ = stream.write_all(&vec![b'a'; MAX_LINE as usize + 1024]);
+                    let mut answer = String::new();
+                    let _ = BufReader::new(stream).read_line(&mut answer);
+                    return answer;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            String::new()
+        });
+        // Nothing is heard; polled only so the window's side runs.
+        let _ = tokio::time::timeout(Duration::from_secs(1), heard.next()).await;
+        assert_eq!(asked.await.unwrap().trim(), "not a request");
     }
 }
