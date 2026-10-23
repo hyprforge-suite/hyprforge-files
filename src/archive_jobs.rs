@@ -315,7 +315,17 @@ fn run(
                 // batch can go partly wrong. Each reports its own
                 // sentence.
                 match backend.extract_with(&archive, &request, unlock, &mut reporter) {
-                    Ok(report) => absorb(&mut summary, &archive, &dest, report),
+                    Ok(report) => {
+                        absorb(&mut summary, &archive, &dest, report);
+                        // Some members were locked: stop here, as a
+                        // locked archive does below. The window retries
+                        // this archive once it has the password and
+                        // starts the ones after it afresh — had they run
+                        // already, that would unpack them twice.
+                        if summary.needs_password.is_some() {
+                            break;
+                        }
+                    }
                     Err(e) if e.cancelled() => {
                         summary.cancelled = true;
                         break;

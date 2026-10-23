@@ -1415,8 +1415,12 @@ enum AfterUnlock {
     Listing { tab: u64, dir: PathBuf },
     /// Open this member.
     Open(PathBuf),
-    /// Run this archive job again.
-    Extract(PathBuf),
+    /// Run this archive job again — the job that asked, not a stand-in
+    /// for it. Every retry was once a whole extraction beside the
+    /// archive, so an edit that needed the password became an unpack,
+    /// Extract To lost its folder and extracting chosen members unpacked
+    /// all of them.
+    Retry(archive_jobs::Work),
 }
 
 /// The process's unpacking area, made the first time something needs
@@ -1596,11 +1600,12 @@ struct RunningJob {
     lands_at: Vec<PathBuf>,
     /// "3 items to Downloads" — what the transfers popover calls it.
     subject: String,
-    /// The work again, for an archive job whose failure leaves nothing
-    /// behind, so it can be offered as a retry — see
-    /// `transfers_view::retryable`. `None` for a paste, whose retry is
-    /// the items its summary names.
-    retry: Option<archive_jobs::Work>,
+    /// The work, for an archive job: what a password prompt runs again
+    /// once it is answered, and — for work whose failure leaves nothing
+    /// behind, `transfers_view::retryable` — what a failure offers to
+    /// retry. `None` for a paste, whose retry is the items its summary
+    /// names.
+    work: Option<archive_jobs::Work>,
 }
 
 /// Work that has been asked for and has not started yet.
@@ -2933,8 +2938,8 @@ impl App {
             QueuedWork::Archive { work, .. } => work.archive().map(Path::to_path_buf),
             QueuedWork::Paste { .. } | QueuedWork::Admin { .. } => None,
         };
-        let retry = match &what {
-            QueuedWork::Archive { work, .. } => transfers_view::retryable(work).then(|| work.clone()),
+        let work = match &what {
+            QueuedWork::Archive { work, .. } => Some(work.clone()),
             QueuedWork::Paste { .. } | QueuedWork::Admin { .. } => None,
         };
         self.transfers.batch.started(id);
@@ -2965,7 +2970,7 @@ impl App {
             conflict: None,
             apply_to_rest: false,
             subject,
-            retry,
+            work,
             items: jobs::Items::default(),
             lands_at,
         });
@@ -3030,13 +3035,16 @@ impl App {
                 if self.jobs.is_empty() && self.queued.is_empty() {
                     self.transfers.batch.clear();
                 }
-                // Before the report: this is not a failure to describe,
-                // it is a question to ask, and a status line saying the
-                // extraction went wrong would sit there contradicting
-                // the prompt that follows it.
-                if let Some(archive) = summary.needs_password.clone() {
-                    return self.ask_for_password(archive.clone(), AfterUnlock::Extract(archive));
-                }
+                // A job that stopped for a password is a question to ask —
+                // but asked *after* the rest of this, not instead of it.
+                // Returning early to ask skipped the pump, so a job queued
+                // behind this one on the same archive waited forever, and
+                // the refresh, the history and the undo record with it.
+                // The report is safe to keep: it says nothing about a
+                // failure (those go to the panel), so it cannot
+                // contradict the prompt.
+                let asking = summary.needs_password.clone();
+                let task = 'finished: {
                 if let Some(message) = job_report(&finished.kind, &summary) {
                     self.status = Some(message);
                 }
@@ -3057,7 +3065,7 @@ impl App {
                 // refresh, so the two land in one batch.
                 let next = self.pump();
                 let refresh = Task::batch([self.refresh_dirs(&finished.dirs), next]);
-                    return Task::batch([refresh, remove]);
+                    break 'finished Task::batch([refresh, remove]);
                 }
                 // A cut that fully landed leaves the clipboard pointing at
                 // files that are no longer there. Emptied off the thread
@@ -3132,7 +3140,7 @@ impl App {
                         },
                         |()| Message::TrashTidied,
                     );
-                    return Task::batch([refresh, tidied]);
+                    break 'finished Task::batch([refresh, tidied]);
                 }
                 let from_drop = self.from_drops.remove(&job);
                 if finished.kind == JobKind::Move && summary.complete() && !from_drop {
@@ -3143,10 +3151,52 @@ impl App {
                         },
                         |()| Message::ClipboardCleared,
                     );
-                    return Task::batch([refresh, cleared]);
+                    break 'finished Task::batch([refresh, cleared]);
                 }
                 refresh
+                };
+                match asking {
+                    Some(archive) => {
+                        let (retry, rest) = self.unlock_retry(finished.work.as_ref(), archive.clone());
+                        Task::batch([task, rest, self.ask_for_password(archive, AfterUnlock::Retry(retry))])
+                    }
+                    None => task,
+                }
             }
+        }
+    }
+
+    /// What to run again once `archive`'s password arrives, for a job
+    /// running `work` that stopped to ask for it — and, started now, the
+    /// part of that job the password has nothing to do with.
+    ///
+    /// The job that asked, not a stand-in: an edit is retried as that
+    /// edit, chosen members as those members, Extract To into its folder.
+    /// Extracting several archives stops at the first locked one (see
+    /// `archive_jobs::run`), so the ones before it are done; the retry is
+    /// that one alone, and the ones after it go on now rather than
+    /// waiting behind a prompt that may be cancelled. Not all of them in
+    /// the retry: a job over several archives is handed no password at
+    /// all — see `start_archive_job` — so it would only ask again.
+    fn unlock_retry(&mut self, work: Option<&archive_jobs::Work>, archive: PathBuf) -> (archive_jobs::Work, Task<Message>) {
+        match work {
+            Some(archive_jobs::Work::Extract { archives, into }) => {
+                let rest: Vec<PathBuf> = archives
+                    .iter()
+                    .position(|a| *a == archive)
+                    .map(|at| archives[at + 1..].to_vec())
+                    .unwrap_or_default();
+                let rest = if rest.is_empty() {
+                    Task::none()
+                } else {
+                    self.start_archive_job(archive_jobs::Work::Extract { archives: rest, into: into.clone() })
+                };
+                (archive_jobs::Work::Extract { archives: vec![archive], into: into.clone() }, rest)
+            }
+            Some(other) => (other.clone(), Task::none()),
+            // Every archive job carries its work; this is a job built by
+            // hand, and unpacking beside the archive is the old answer.
+            None => (archive_jobs::Work::Extract { archives: vec![archive], into: None }, Task::none()),
         }
     }
 
@@ -5538,12 +5588,7 @@ impl App {
                         None => Task::none(),
                     },
                     AfterUnlock::Open(path) => self.open_from_archive(path),
-                    AfterUnlock::Extract(archive) => {
-                        self.start_archive_job(archive_jobs::Work::Extract {
-                            archives: vec![archive],
-                            into: None,
-                        })
-                    }
+                    AfterUnlock::Retry(work) => self.start_archive_job(work),
                 }
             }
             Message::ArchiveMemberReady {
@@ -7057,7 +7102,7 @@ impl DebugShow {
             }),
             apply_to_rest: false,
             subject: String::new(),
-            retry: None,
+            work: None,
             items: jobs::Items::default(),
             lands_at: Vec::new(),
         });
@@ -9272,7 +9317,7 @@ mod tests {
             conflict: None,
             apply_to_rest: false,
             subject: String::new(),
-            retry: None,
+            work: None,
             items: jobs::Items::default(),
             lands_at: Vec::new(),
         });
@@ -9308,7 +9353,7 @@ mod tests {
             conflict: Some(Collision { source: "/a/x".into(), dest: "/dir/x".into() }),
             apply_to_rest: false,
             subject: String::new(),
-            retry: None,
+            work: None,
             items: jobs::Items::default(),
             lands_at: Vec::new(),
         });
@@ -9373,7 +9418,7 @@ mod tests {
             conflict: None,
             apply_to_rest: false,
             subject: String::new(),
-            retry: None,
+            work: None,
             items: jobs::Items::default(),
             lands_at: Vec::new(),
         });
@@ -9653,7 +9698,7 @@ mod tests {
             conflict: None,
             apply_to_rest: false,
             subject: String::new(),
-            retry: None,
+            work: None,
             items: jobs::Items::default(),
             lands_at: Vec::new(),
         }
@@ -10288,7 +10333,7 @@ mod tests {
             conflict: None,
             apply_to_rest: false,
             subject: String::new(),
-            retry: None,
+            work: None,
             items: jobs::Items::default(),
             lands_at: Vec::new(),
         });
@@ -11140,7 +11185,7 @@ mod archive_tests {
             conflict: None,
             apply_to_rest: false,
             subject: String::new(),
-            retry: None,
+            work: None,
             items: jobs::Items::default(),
             lands_at: Vec::new(),
         });
@@ -11155,9 +11200,100 @@ mod archive_tests {
 
         assert_eq!(
             app.unlocking.as_ref().map(|u| u.then.clone()),
-            Some(AfterUnlock::Extract(archive))
+            Some(AfterUnlock::Retry(archive_jobs::Work::Extract { archives: vec![archive], into: None }))
         );
         assert!(app.status.is_none(), "the prompt is the report");
+    }
+
+    /// The job `start_archive_job` just began — the newest running one.
+    fn newest_job(app: &App) -> &RunningJob {
+        app.jobs.iter().max_by_key(|j| j.id).expect("a job is running")
+    }
+
+    fn finished_needing_password(app: &mut App, job: JobId, archive: &Path) {
+        let _ = app.update(Message::Job(JobEvent::Finished {
+            job,
+            summary: JobSummary { needs_password: Some(archive.to_path_buf()), ..JobSummary::default() },
+        }));
+    }
+
+    /// J1: the Finished handler returned to ask for the password before
+    /// it pumped the queue, so a second edit waiting on the same archive
+    /// — `may_start` serialises them — never started, prompt answered or
+    /// not.
+    #[test]
+    fn a_job_that_stops_for_a_password_lets_the_queue_behind_it_move_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("locked.zip");
+        let mut app = app_for_test(&[dir.path().to_str().unwrap()]);
+        let edit = |member: &str| archive_jobs::Work::Edit {
+            archive: archive.clone(),
+            edits: vec![hyprforge_archive::Edit::Remove(member.to_string())],
+        };
+        let _ = app.start_archive_job(edit("a"));
+        let first = newest_job(&app).id;
+        let _ = app.start_archive_job(edit("b"));
+        assert_eq!(app.queued.len(), 1, "the second edit waits on the first");
+
+        finished_needing_password(&mut app, first, &archive);
+
+        assert!(app.unlocking.is_some(), "the password is still asked for");
+        assert!(app.queued.is_empty(), "and the edit behind it has started");
+    }
+
+    /// J1: every retry used to be a whole extraction beside the archive,
+    /// whatever had asked. An edit that needed the password became an
+    /// unpack — and the edit itself was never made.
+    #[test]
+    fn the_job_run_after_a_password_is_the_one_that_asked_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("locked.zip");
+        let mut app = app_for_test(&[dir.path().to_str().unwrap()]);
+        let edit = archive_jobs::Work::Edit {
+            archive: archive.clone(),
+            edits: vec![hyprforge_archive::Edit::Remove("a".to_string())],
+        };
+        let _ = app.start_archive_job(edit.clone());
+        let first = newest_job(&app).id;
+
+        finished_needing_password(&mut app, first, &archive);
+        let _ = app.update(Message::UnlockTyped("dummy".to_string()));
+        let _ = app.update(Message::UnlockConfirm);
+
+        let again = newest_job(&app);
+        assert_ne!(again.id, first);
+        assert_eq!(again.kind, JobKind::Archive { doing: edit.doing(), undo: ArchiveUndo::Nothing }, "an edit, run again");
+        assert_eq!(again.work.as_ref(), Some(&edit), "with the same edits");
+    }
+
+    /// J1: extracting several archives stops at the first that needs a
+    /// password. The retry is that one, into the folder that was asked
+    /// for; the ones after it go on at once rather than being dropped.
+    #[test]
+    fn extracting_several_archives_retries_the_locked_one_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let [done, locked, later] = ["done.zip", "locked.zip", "later.zip"].map(|n| dir.path().join(n));
+        let into = dir.path().join("out");
+        let mut app = app_for_test(&[dir.path().to_str().unwrap()]);
+        let _ = app.start_archive_job(archive_jobs::Work::Extract {
+            archives: vec![done.clone(), locked.clone(), later.clone()],
+            into: Some(into.clone()),
+        });
+        let first = newest_job(&app).id;
+
+        finished_needing_password(&mut app, first, &locked);
+
+        assert_eq!(
+            app.unlocking.as_ref().map(|u| u.then.clone()),
+            Some(AfterUnlock::Retry(archive_jobs::Work::Extract { archives: vec![locked], into: Some(into.clone()) }))
+        );
+        assert!(app.queued.is_empty());
+        let rest = app.jobs.iter().find(|j| j.id != first);
+        assert_eq!(
+            rest.and_then(|j| j.work.clone()),
+            Some(archive_jobs::Work::Extract { archives: vec![later], into: Some(into) }),
+            "the archives after the locked one are not dropped"
+        );
     }
 
     // --- what mockup `1j` draws, end to end ---------------------------

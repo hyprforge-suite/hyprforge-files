@@ -160,7 +160,7 @@ pub(crate) fn record(
             })
         }
         (JobKind::Archive { .. }, Outcome::Failed) if !summary.cancelled => {
-            finished.retry.clone().map(|work| Retry { items: 1, work: RetryWork::Archive(work) })
+            finished.work.clone().filter(retryable).map(|work| Retry { items: 1, work: RetryWork::Archive(work) })
         }
         _ => None,
     };
@@ -889,7 +889,7 @@ mod tests {
             conflict: None,
             apply_to_rest: false,
             subject: "\u{201C}a.txt\u{201D} to b".to_string(),
-            retry: None,
+            work: None,
             items: Default::default(),
             lands_at: Vec::new(),
         });
@@ -1117,7 +1117,7 @@ mod tests {
 
         let mut app = app_for_test(&["/dir"]);
         running(&mut app, 1, JobKind::Archive { doing: "Updating", undo: ArchiveUndo::Nothing }, a_while_ago());
-        app.jobs[0].retry = Some(edit.clone());
+        app.jobs[0].work = Some(edit.clone());
         finish(&mut app, 1, JobSummary { failed: vec!["disk full".into()], ..JobSummary::default() });
         let entry = app.transfers.history.iter().next().unwrap();
         assert_eq!(entry.retry.as_ref().map(|r| &r.work), Some(&RetryWork::Archive(edit)));
