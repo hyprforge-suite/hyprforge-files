@@ -95,6 +95,59 @@ const BTN_LEFT: u32 = 0x110;
 /// failed rather than left hanging.
 const DROP_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Whether the window's display may still be used from here.
+///
+/// The display is winit's, borrowed, and winit disconnects it when its
+/// event loop ends. Every thread here that talks to it — the worker,
+/// the drop reader, an archive drag's cancel on the unpacking thread —
+/// does so inside [`Self::while_open`], which holds this lock for the
+/// length of the call. [`Dnd::stop`] takes the same lock to say the
+/// window is closing, so once it has, nothing new starts, and anything
+/// already under way has finished. Without it each of those threads
+/// could wake after the close and destroy a proxy, or flush, on freed
+/// memory: the class of crash behind the `wl_proxy_destroy` SIGSEGVs.
+///
+/// Whatever is skipped is leaked, not destroyed — a proxy the process
+/// never frees in the moments before it exits, which costs nothing.
+#[derive(Clone, Default)]
+struct Life(Arc<Mutex<Phase>>);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Open,
+    /// `Dnd::stop` has begun and is waiting for the worker. The display
+    /// is still alive — the window is blocked in `stop` — so the worker
+    /// may still let go of what it holds, but nothing starts.
+    Stopping,
+    /// `Dnd::stop` has returned. The display may be gone at any moment.
+    Closed,
+}
+
+impl Life {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Phase> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Runs `use_display` if the window is not closing, holding off
+    /// [`Dnd::stop`] until it returns. `None` when it was not run.
+    fn while_open<T>(&self, use_display: impl FnOnce() -> T) -> Option<T> {
+        let phase = self.lock();
+        (*phase == Phase::Open).then(use_display)
+    }
+
+    fn begin_stopping(&self) {
+        let mut phase = self.lock();
+        if *phase == Phase::Open {
+            *phase = Phase::Stopping;
+        }
+    }
+
+    fn close(&self) {
+        *self.lock() = Phase::Closed;
+    }
+}
+
 /// What a drag over the window tells it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DropEvent {
@@ -155,6 +208,11 @@ pub struct Dnd {
     /// under way — which is how a drop onto this window knows it came
     /// from this window.
     outgoing: Arc<Mutex<Option<Vec<PathBuf>>>>,
+    /// Whether the display may still be used — see [`Life`].
+    life: Life,
+    /// The gate of the newest drag out of an archive, so closing the
+    /// window can stop its unpacking and forget its cancel.
+    live: Mutex<Option<Arc<Gate>>>,
 }
 
 /// What a drag needs from the worker: the connection it joined and the
@@ -221,9 +279,9 @@ impl Dnd {
             return;
         };
         let (done, stopped) = std::sync::mpsc::channel();
-        let (ready, press, outgoing) = (self.ready.clone(), self.press.clone(), self.outgoing.clone());
+        let (ready, press, outgoing, life) = (self.ready.clone(), self.press.clone(), self.outgoing.clone(), self.life.clone());
         let spawned = std::thread::Builder::new().name("files-dnd".into()).spawn(move || {
-            run_worker(connection, ready, press, outgoing, woken);
+            run_worker(connection, ready, press, outgoing, life, woken);
             let _ = done.send(());
         });
         match spawned {
@@ -245,17 +303,34 @@ impl Dnd {
     /// Bounded: a worker that does not answer within half a second is
     /// left, and closing goes on — a window that will not close is a
     /// worse failure than the crash this prevents, which happens after
-    /// everything worth keeping is saved.
+    /// everything worth keeping is saved. Left, but not loose: it, and
+    /// every other thread here, uses the display only while [`Life`]
+    /// says it may, and once this returns it never may again.
+    ///
+    /// An archive drag still unpacking is abandoned — it stops at its
+    /// next member rather than holding the closing process for up to
+    /// [`drag_out::DEADLINE`] — and the cancel it would run on a failure
+    /// is forgotten, since that cancel destroys a proxy.
     pub fn stop(&self) {
-        let Some(wake) = self.stop.lock().unwrap_or_else(|p| p.into_inner()).take() else { return };
-        // SAFETY: a valid pipe end this owns, and one byte from a valid
-        // buffer.
-        let _ = unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&wake), [1u8].as_ptr().cast(), 1) };
-        if let Some(stopped) = self.stopped.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            if stopped.recv_timeout(std::time::Duration::from_millis(500)).is_err() {
-                tracing::warn!("the drag worker did not stop in time; closing anyway");
+        self.life.begin_stopping();
+        if let Some(gate) = self.live.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            gate.forget_on_fail();
+            gate.abandon();
+        }
+        let wake = self.stop.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(wake) = wake {
+            // SAFETY: a valid pipe end this owns, and one byte from a
+            // valid buffer.
+            let _ = unsafe { libc::write(std::os::fd::AsRawFd::as_raw_fd(&wake), [1u8].as_ptr().cast(), 1) };
+            if let Some(stopped) = self.stopped.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                if stopped.recv_timeout(std::time::Duration::from_millis(500)).is_err() {
+                    tracing::warn!("the drag worker did not stop in time; closing anyway");
+                }
             }
         }
+        // Waits for anything still inside `while_open` — the worker
+        // included, if it did not stop in time — and is the last word.
+        self.life.close();
     }
 
     /// Starts dragging, offered as `offers` — `(type, content)` pairs,
@@ -296,6 +371,9 @@ impl Dnd {
         let Some(ready) = self.ready.get() else {
             return Err("Dragging out needs a Wayland compositor with drag-and-drop.".to_string());
         };
+        if self.life.while_open(|| ()).is_none() {
+            return Ok(false);
+        }
         let Some(serial) = *self.press.lock().unwrap_or_else(|p| p.into_inner()) else {
             // The button came up before the drag could start — a flick
             // too quick to be a drag after all. Nothing to say.
@@ -334,11 +412,19 @@ impl Dnd {
             // with nothing behind it. Destroying the source is the
             // protocol's way to cancel a drag in flight. Twice is
             // harmless: a request on a destroyed proxy is dropped.
-            let (source, connection, outgoing) = (source.clone(), ready.connection.clone(), self.outgoing.clone());
+            //
+            // Run on the unpacking thread, which can finish after the
+            // window has closed: hence `while_open`, and `Dnd::stop`
+            // forgetting it besides.
+            let (source, connection, outgoing, life) =
+                (source.clone(), ready.connection.clone(), self.outgoing.clone(), self.life.clone());
+            *self.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(gate.clone());
             gate.on_fail(move || {
                 *outgoing.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                source.destroy();
-                let _ = connection.flush();
+                let _ = life.while_open(|| {
+                    source.destroy();
+                    let _ = connection.flush();
+                });
             });
         }
         ready
@@ -356,6 +442,7 @@ fn run_worker(
     ready: Arc<OnceLock<Ready>>,
     press: Arc<Mutex<Option<u32>>>,
     outgoing: Arc<Mutex<Option<Vec<PathBuf>>>>,
+    life: Life,
     woken: std::os::fd::OwnedFd,
 ) {
     let (globals, mut queue) = match registry_queue_init::<State>(&connection) {
@@ -384,6 +471,7 @@ fn run_worker(
         at: (0.0, 0.0),
         events: events_channel().0.clone(),
         connection: connection.clone(),
+        life: life.clone(),
     };
     // The capabilities event, and with it this worker's own pointer,
     // arrive on the first dispatch — before any drag could be asked for.
@@ -392,22 +480,50 @@ fn run_worker(
     // wake it — so a window closing could only race it. This waits on
     // the compositor *and* the stop pipe, and returns the moment
     // `Dnd::stop` writes, while the display is still alive.
+    //
+    // Every call into the display is made holding `life` (see [`Life`]),
+    // so a worker that missed `Dnd::stop`'s half-second still touches
+    // nothing once it has returned. Only the wait itself is made without
+    // it — holding it there would hold up `stop` for as long as the
+    // compositor is quiet.
     loop {
-        if let Err(e) = queue.dispatch_pending(&mut state) {
-            tracing::warn!(error = %e, "the drag worker lost its connection");
-            return;
-        }
-        if let Err(e) = connection.flush() {
-            if !matches!(&e, wayland_client::backend::WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock) {
+        let guard = {
+            let phase = life.lock();
+            if *phase != Phase::Open {
+                return;
+            }
+            if let Err(e) = queue.dispatch_pending(&mut state) {
                 tracing::warn!(error = %e, "the drag worker lost its connection");
                 return;
             }
-        }
-        // `None`: events are already queued — dispatch them first.
-        let Some(guard) = queue.prepare_read() else { continue };
-        match wait(std::os::fd::AsRawFd::as_raw_fd(&guard.connection_fd()), std::os::fd::AsRawFd::as_raw_fd(&woken)) {
-            Wake::Stop => return,
-            Wake::Compositor => {
+            if let Err(e) = connection.flush() {
+                if !matches!(&e, wayland_client::backend::WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock) {
+                    tracing::warn!(error = %e, "the drag worker lost its connection");
+                    return;
+                }
+            }
+            // `None`: events are already queued — dispatch them first.
+            let Some(guard) = queue.prepare_read() else { continue };
+            guard
+        };
+        let wake = wait(std::os::fd::AsRawFd::as_raw_fd(&guard.connection_fd()), std::os::fd::AsRawFd::as_raw_fd(&woken));
+        let phase = life.lock();
+        match (*phase, wake) {
+            // `stop` gave up waiting and returned: the display may be
+            // gone, and dropping the read guard would call into it
+            // (`wl_display_cancel_read`). Leaked instead.
+            (Phase::Closed, _) => {
+                std::mem::forget(guard);
+                return;
+            }
+            // `stop` is still waiting, so the display is alive; the
+            // guard is let go while `phase` is still held, before `stop`
+            // can close.
+            (Phase::Stopping, _) | (_, Wake::Stop) => {
+                drop(guard);
+                return;
+            }
+            (Phase::Open, Wake::Compositor) => {
                 if let Err(e) = guard.read() {
                     if !matches!(&e, wayland_client::backend::WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock) {
                         tracing::warn!(error = %e, "the drag worker lost its connection");
@@ -479,6 +595,7 @@ struct State {
     at: (f64, f64),
     events: UnboundedSender<DropEvent>,
     connection: Connection,
+    life: Life,
 }
 
 /// The types an offer said it has, collected as they are announced —
@@ -583,7 +700,7 @@ impl Dispatch<WlDataDevice, ()> for State {
                     finish(&offer);
                     let _ = state.events.unbounded_send(DropEvent::Dropped { x, y, from: DropFrom::Inside(paths) });
                 } else {
-                    receive_drop(offer, (x, y), state.events.clone(), state.connection.clone());
+                    receive_drop(offer, (x, y), state.events.clone(), state.connection.clone(), state.life.clone());
                 }
                 let _ = state.connection.flush();
             }
@@ -616,7 +733,13 @@ fn finish(offer: &WlDataOffer) {
 
 /// Reads another application's dropped files, off the worker's thread
 /// and bounded — see the module doc.
-fn receive_drop(offer: WlDataOffer, (x, y): (f64, f64), events: UnboundedSender<DropEvent>, connection: Connection) {
+fn receive_drop(
+    offer: WlDataOffer,
+    (x, y): (f64, f64),
+    events: UnboundedSender<DropEvent>,
+    connection: Connection,
+    life: Life,
+) {
     let (mut reader, writer) = match std::io::pipe() {
         Ok(pair) => pair,
         Err(e) => {
@@ -646,8 +769,12 @@ fn receive_drop(offer: WlDataOffer, (x, y): (f64, f64), events: UnboundedSender<
             Ok(Err(e)) => DropEvent::Failed(format!("The dropped files could not be read: {e}")),
             Err(_) => DropEvent::Failed("The application the files came from never handed them over.".to_string()),
         };
-        finish(&offer);
-        let _ = connection.flush();
+        // Up to `DROP_READ_TIMEOUT` after the drop, so the window may
+        // have closed since — see `Life`.
+        let _ = life.while_open(|| {
+            finish(&offer);
+            let _ = connection.flush();
+        });
         let _ = events.unbounded_send(event);
     });
     if let Err(e) = spawned {
@@ -747,6 +874,48 @@ mod tests {
         let (busy_end, busy) = stop_pipe().unwrap();
         poke(&busy_end);
         assert_eq!(wait(busy.as_raw_fd(), woken.as_raw_fd()), Wake::Compositor);
+    }
+
+    /// H1/H2: every off-thread use of the connection goes through
+    /// `Life::while_open`. Once the window has begun closing, the work is
+    /// not done at all — a proxy left alone is a leak of a few bytes for
+    /// the last moments of the process, and one destroyed on a display
+    /// winit has disconnected is the SIGSEGV this module keeps meeting.
+    ///
+    /// Asked of `Life` and not of the closures themselves: each holds a
+    /// `WlDataSource` or `WlDataOffer`, and there is no making one of
+    /// those without a compositor.
+    #[test]
+    fn nothing_touches_the_display_once_the_window_has_begun_closing() {
+        let life = Life::default();
+        assert_eq!(life.while_open(|| 1), Some(1), "open: the work is done");
+        life.begin_stopping();
+        assert_eq!(life.while_open(|| 2), None, "stopping: the work is skipped");
+        life.close();
+        assert_eq!(life.while_open(|| 3), None, "closed: still skipped");
+    }
+
+    /// H1: stopping abandons the drag out of an archive that is still
+    /// unpacking — so it stops at its next member rather than holding
+    /// the closing window for up to `drag_out::DEADLINE` — and drops the
+    /// cancel it would have run on a failure, which destroys a proxy
+    /// from the unpacking thread long after the window is gone.
+    #[test]
+    fn stopping_abandons_the_drag_under_way_and_forgets_its_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Gate::new(dir.path().join("drag"));
+        let dnd = Dnd::new();
+        *dnd.live.lock().unwrap() = Some(gate.clone());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        gate.on_fail(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+
+        dnd.stop();
+        gate.finish(Err("too late".to_string()));
+
+        assert!(gate.abandoned(), "the unpacking is told to stop");
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst), "the cancel never runs after close");
+        assert!(dnd.life.while_open(|| ()).is_none());
     }
 
     /// A window that never attached — no Wayland, or closed before it

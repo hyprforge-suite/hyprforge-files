@@ -475,6 +475,15 @@ impl Gate {
         }
     }
 
+    /// Drops the cancel [`Self::on_fail`] was given, unrun. For a window
+    /// that is closing: the cancel destroys a proxy on the window's
+    /// display, and a failure arriving after the close would run it on
+    /// a display that is gone.
+    pub fn forget_on_fail(&self) {
+        let forgotten = self.lock().on_fail.take();
+        drop(forgotten);
+    }
+
     fn remove(&self) {
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
