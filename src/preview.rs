@@ -11,8 +11,9 @@
 //! - an archive: its top level, through the backend that already
 //!   browses one as a folder;
 //! - pictures: decoded to the pane's width by `hyprforge-image`, the
-//!   same budgeted decode the grid uses; an SVG is handed to iced as
-//!   the file, which draws it at whatever size the pane is;
+//!   same budgeted decode the grid uses; an SVG is read here, capped
+//!   and refused if it names any file outside itself, and handed to
+//!   iced as bytes, which it draws at whatever size the pane is;
 //! - PDFs, video and audio: another program, `pdftoppm` or `ffmpeg`,
 //!   through `hyprforge_process::output` with its timeout, asked for a
 //!   picture already scaled to the pane — so what comes back is a few
@@ -73,8 +74,11 @@ fn file(path: &Path, kind: &str, mime: &hyprforge_mime::MimeDb, backend: &dyn Fs
     if hyprforge_image::format::looks_decodable(path) {
         return Some(picture(path, edge));
     }
+    // Read here, capped and checked — see `Picture::untrusted_svg`. One
+    // that is refused shows the listing's details, as any file does.
     if kind == "image/svg+xml" || kind == "image/svg+xml-compressed" {
-        return Some(Preview { picture: Some(Picture::from_path(path)), ..Preview::default() });
+        let picture = Picture::untrusted_svg(path, hyprforge_files_core::preview::SVG_BYTES);
+        return Some(Preview { picture, ..Preview::default() });
     }
     if kind == "application/pdf" {
         return Some(pdf(path, edge));
@@ -176,14 +180,16 @@ pub fn thumbnail(
     let source = hyprforge_files_core::preview::source_of(path).filter(|s| allowed.allows(*s))?;
     let size = Size::for_edge(edge);
     let edge = size.edge();
-    // Drawn by iced from the file itself, at whatever size: there is
-    // nothing to store.
-    if source == Source::Svg {
-        return Some((Picture::from_path(path), edge));
-    }
     let stamp = Stamp::of(path).ok()?;
     if !allowed.allows_size(stamp.size) {
         return None;
+    }
+    // Drawn by iced at whatever size: there is nothing to store. After
+    // the size cap, not before it, and read here as bytes rather than
+    // handed over as a path — see `Picture::untrusted_svg` for what iced
+    // does with a path.
+    if source == Source::Svg {
+        return Picture::untrusted_svg(path, hyprforge_files_core::preview::SVG_BYTES).map(|p| (p, edge));
     }
     if source == Source::Picture && stamp.size <= SMALL_PICTURE {
         return decode_rgba(path, edge).map(|rgba| (raster(rgba), edge));
@@ -566,6 +572,31 @@ fn run(command: &mut Command) -> Result<Option<Vec<u8>>, Unavailable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D2: an SVG went to iced as a path before the size cap was looked
+    /// at, and iced's SVG reader then read whatever file its
+    /// `<image href>` named.
+    #[test]
+    fn an_svg_thumbnail_keeps_to_the_size_cap_and_reads_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let mime = hyprforge_mime::MimeDb::default();
+        let capped = hyprforge_files_core::config::Thumbnails { max_file_mb: 1, ..Default::default() };
+        let big = dir.path().join("big.svg");
+        let mut text = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg">"#);
+        text.push_str(&"<!-- padding -->".repeat(80_000));
+        text.push_str("</svg>");
+        std::fs::write(&big, text).unwrap();
+        assert!(thumbnail(&big, 128, None, &mime, &capped).is_none(), "bigger than the cap");
+
+        let reaching = dir.path().join("reaching.svg");
+        std::fs::write(&reaching, r#"<svg xmlns="http://www.w3.org/2000/svg"><image href="/dev/zero"/></svg>"#).unwrap();
+        let open = hyprforge_files_core::config::Thumbnails::default();
+        assert!(thumbnail(&reaching, 128, None, &mime, &open).is_none(), "names a file outside itself");
+
+        let fine = dir.path().join("fine.svg");
+        std::fs::write(&fine, r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#).unwrap();
+        assert!(matches!(thumbnail(&fine, 128, None, &mime, &open), Some((Picture::Svg(_), _))));
+    }
 
     #[test]
     fn a_short_text_file_is_shown_whole_and_says_so() {

@@ -248,8 +248,11 @@ fn user_icon(path: &Path) -> Option<hyprforge_files_core::preview::Picture> {
     if !path.is_file() {
         return None;
     }
+    // Chosen by the user, but from anywhere — a file they were sent
+    // included — so read as any listing's SVG is: see
+    // `Picture::untrusted_svg`.
     if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
-        return Some(Picture::from_path(path));
+        return Picture::untrusted_svg(path, hyprforge_files_core::preview::SVG_BYTES);
     }
     let decoded = hyprforge_image::decode_to_fit(path, &hyprforge_image::Budget::for_edge(ICON_SIZE * ICON_SCALE)).ok()?;
     Some(Picture::Raster(iced::widget::image::Handle::from_rgba(decoded.size.width, decoded.size.height, decoded.pixels)))
