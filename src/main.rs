@@ -295,6 +295,7 @@ fn main() -> iced::Result {
         notes: false,
         noted_undo: 0,
         undo_history_open: false,
+        undoing: false,
         next_job_id: 1,
         modifiers: keyboard::Modifiers::default(),
         clicks: ClickTracker::new(),
@@ -1047,6 +1048,11 @@ struct App {
     noted_undo: u64,
     /// Whether the undo history popover is open — see `undo_view`.
     undo_history_open: bool,
+    /// An undo or redo is running on a worker. A second waits for it:
+    /// two at once ran in either order, and the second step back of the
+    /// same file — a rename of a rename — failed or landed wrong when it
+    /// went first.
+    undoing: bool,
     next_job_id: JobId,
     last_window_size: (u32, u32),
     /// Bumped by every resize event, so only the *last* one in a drag
@@ -3400,6 +3406,10 @@ impl App {
     /// action vocabulary, which the dialog host does not have.
     fn perform_window(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::Undo | Action::Redo if self.undoing => {
+                self.status = Some("The last undo is still going.".to_string());
+                Task::none()
+            }
             Action::Undo => {
                 self.notice = None;
                 // The history's own Undo button lands here too; what it
@@ -3414,6 +3424,7 @@ impl App {
                 // has happened, which is why the moves ride along.
                 let moves = done.undo_moves();
                 let kept = done.clone();
+                self.undoing = true;
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || jobs::undo(done))
@@ -3433,6 +3444,7 @@ impl App {
                     self.status = Some("There's nothing to redo.".to_string());
                     return Task::none();
                 };
+                self.undoing = true;
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || jobs::redo(undone))
@@ -5041,6 +5053,7 @@ impl App {
             // same goes for redo: a partial undo left a folder neither
             // record describes, so there is nothing safe to do again.
             Message::UndoneMoves(moves, dirs, errors, undone) => {
+                self.undoing = false;
                 let stars = if errors.is_empty() {
                     self.undo.undone(undone);
                     self.follow_stars(moves)
@@ -5052,6 +5065,7 @@ impl App {
             // What went through is remembered whatever did not, so Ctrl+Z
             // takes back exactly the part of the redo that happened.
             Message::Redone(dirs, errors, redone) => {
+                self.undoing = false;
                 if !errors.is_empty() {
                     self.status = Some(format!("Couldn't redo everything: {}", errors.join(" ")));
                 }
@@ -7841,6 +7855,7 @@ mod tests {
             notes: false,
             noted_undo: 0,
             undo_history_open: false,
+            undoing: false,
             next_job_id: 1,
             modifiers: keyboard::Modifiers::default(),
             clicks: ClickTracker::new(),
@@ -8892,6 +8907,18 @@ mod tests {
 
         let state = format!("{:?}", app.tabs[0].browser());
         assert!(state.contains("Error(DirError"), "not still loading: {state}");
+    }
+
+    /// J16: Ctrl+Z twice in quick succession ran two undos at once, in
+    /// either order.
+    #[test]
+    fn a_second_undo_waits_for_the_first_to_finish() {
+        let mut app = app_for_test(&["/a"]);
+        let _ = app.record(hyprforge_files_core::undo::Undoable::Copied(vec![PathBuf::from("/a/one")]));
+        let _ = app.record(hyprforge_files_core::undo::Undoable::Copied(vec![PathBuf::from("/a/two")]));
+        let _ = app.perform_window(Action::Undo);
+        let _ = app.perform_window(Action::Undo);
+        assert!(app.undo.pop().is_some(), "the second is still there to undo");
     }
 
     /// J18: a second prompt asked for while one was open replaced it,
