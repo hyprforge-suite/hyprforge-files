@@ -4967,21 +4967,25 @@ impl App {
                     self.pane_mut(at).browser.set_archive(archive);
                 }
                 // An encrypted archive — very often a 7z, whose header
-                // can be encrypted so it will not even list. Asked here
-                // rather than shown as an error, because an error with
-                // no way to answer it is a dead end.
-                if result.as_ref().err().map(|e| e.kind)
+                // can be encrypted so it will not even list. Asked here,
+                // not only shown as an error, because an error with no
+                // way to answer it is a dead end.
+                let ask = if result.as_ref().err().map(|e| e.kind)
                     == Some(hyprforge_files_core::DirErrorKind::PasswordRequired)
                 {
-                    if let Some((archive, _)) = hyprforge_files_core::archive::split(&path) {
-                        return self.ask_for_password(
-                            archive,
-                            AfterUnlock::Listing { tab: pane_id, dir: path },
-                        );
-                    }
-                }
+                    hyprforge_files_core::archive::split(&path).map(|(archive, _)| {
+                        self.ask_for_password(archive, AfterUnlock::Listing { tab: pane_id, dir: path.clone() })
+                    })
+                } else {
+                    None
+                };
+                // The listing hears the refusal as well as the prompt
+                // being asked: behind the prompt it says why there is
+                // nothing, and a prompt that is cancelled leaves it
+                // saying so rather than "Loading…" for good. A password
+                // given reads the folder again — see `UnlockConfirm`.
                 let outcome = self.pane_mut(at).browser.update(BrowserMessage::DirLoaded(path, result));
-                let task = self.handle_outcome(at, outcome);
+                let task = Task::batch([self.handle_outcome(at, outcome), ask.unwrap_or_else(Task::none)]);
                 #[cfg(debug_assertions)]
                 let task = {
                     let mut show = std::mem::take(&mut self.debug_show);
@@ -8828,6 +8832,31 @@ mod tests {
         let mut app = app_for_test(&["/a"]);
         let _ = app.close_tab(5);
         assert_eq!(app.tabs.len(), 1, "an out-of-range close must be a no-op, not a panic");
+    }
+
+    /// J17: an archive that would not list without a password asked for
+    /// one and never told the listing, so cancelling the prompt left the
+    /// pane on "Loading…" with nothing more coming.
+    #[test]
+    fn cancelling_a_password_for_a_listing_leaves_the_pane_saying_why() {
+        // A real file: whether a path is an archive is asked of the disk.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.7z");
+        std::fs::write(&archive, b"").unwrap();
+        let mut app = app_for_test(&[archive.to_str().unwrap()]);
+        let id = app.tabs[0].panes[0].id;
+        let generation = app.tabs[0].panes[0].read_generation;
+        let refused = DirError {
+            message: "It needs a password.".to_string(),
+            kind: hyprforge_files_core::DirErrorKind::PasswordRequired,
+        };
+        let _ = app.update(Message::DirLoaded(id, generation, archive.clone(), Err(refused)));
+        assert!(app.unlocking.is_some(), "it asks");
+
+        let _ = app.update(Message::UnlockCancel);
+
+        let state = format!("{:?}", app.tabs[0].browser());
+        assert!(state.contains("Error(DirError"), "not still loading: {state}");
     }
 
     /// J19: closing a tab behind the one in front moved the window to
