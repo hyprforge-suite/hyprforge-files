@@ -5414,9 +5414,14 @@ impl App {
                 // The stars too: a save that started before the latest
                 // star must not hand back a list without it.
                 let starred = std::mem::take(&mut self.last_prefs.starred);
+                // Saved searches and tags as well, for the same reason.
+                let searches = std::mem::take(&mut self.last_prefs.searches);
+                let tags = std::mem::take(&mut self.last_prefs.tags);
                 self.last_prefs = prefs;
                 self.last_prefs.pinned = pinned;
                 self.last_prefs.starred = starred;
+                self.last_prefs.searches = searches;
+                self.last_prefs.tags = tags;
                 Task::none()
             }
             Message::ChooseApp(id) => {
@@ -7588,6 +7593,10 @@ fn merge_tab_prefs(on_disk: &Prefs, mut from_tab: Prefs) -> Prefs {
     // written.
     from_tab.searches = on_disk.searches.clone();
     from_tab.starred = on_disk.starred.clone();
+    // And the tags. Missing once, so a tab changing its sort wrote back
+    // the tags it opened with, undoing every tag added or taken off
+    // since, in any window.
+    from_tab.tags = on_disk.tags.clone();
     from_tab.window_width = on_disk.window_width;
     from_tab.window_height = on_disk.window_height;
     from_tab
@@ -8548,6 +8557,39 @@ mod tests {
             let _ = app.update(Message::UnlockTyped("dummy".to_string()));
             let _ = app.update(Message::UnlockConfirm);
         });
+    }
+
+    /// J15: a tab's tags are the copy it opened with, and writing them
+    /// over the file put back whatever another window — or this one,
+    /// since — had tagged or untagged.
+    #[test]
+    fn a_tab_saving_its_view_keeps_the_tags_on_disk() {
+        let mut on_disk = Prefs::default();
+        on_disk.tags.insert("work".into(), vec![PathBuf::from("/now.txt")]);
+        let mut from_tab = Prefs::default();
+        from_tab.tags.insert("work".into(), vec![PathBuf::from("/then.txt")]);
+        assert_eq!(merge_tab_prefs(&on_disk, from_tab).tags, on_disk.tags);
+    }
+
+    /// J15: a save that started before the latest tag or saved search
+    /// must not hand back a list without it — the rule `PrefsSaved`
+    /// already kept for pins and stars.
+    #[test]
+    fn a_save_finishing_late_keeps_the_newer_tags_and_searches() {
+        let mut app = app_for_test(&["/a"]);
+        app.last_prefs.tags.insert("work".into(), vec![PathBuf::from("/a/x.txt")]);
+        app.last_prefs.searches = vec![hyprforge_files_core::search::SmartFolder {
+            name: "notes".into(),
+            query: "notes".into(),
+            folder: PathBuf::from("/a"),
+            subfolders: true,
+        }];
+        let (tags, searches) = (app.last_prefs.tags.clone(), app.last_prefs.searches.clone());
+
+        let _ = app.update(Message::PrefsSaved(Ok(Prefs::default())));
+
+        assert_eq!(app.last_prefs.tags, tags);
+        assert_eq!(app.last_prefs.searches, searches);
     }
 
     /// A tab saving its view settings must not put back pins or a window
