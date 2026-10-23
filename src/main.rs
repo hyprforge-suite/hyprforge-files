@@ -4500,7 +4500,16 @@ impl App {
             TabCloseOutcome::WindowShouldClose => self.quit(),
             TabCloseOutcome::Activate(next) => {
                 self.tabs.remove(index);
-                self.active = next;
+                // The neighbour only when the tab in front is the one
+                // that closed. A middle click on a tab behind it — or its
+                // close button — leaves the one being worked in in front;
+                // it only moves down a place if the closed one was left
+                // of it.
+                self.active = match index.cmp(&self.active) {
+                    std::cmp::Ordering::Equal => next,
+                    std::cmp::Ordering::Less => self.active - 1,
+                    std::cmp::Ordering::Greater => self.active,
+                };
                 Task::none()
             }
         }
@@ -8757,7 +8766,9 @@ mod tests {
     #[test]
     fn closing_a_middle_tab_activates_the_one_that_slides_into_its_place() {
         let mut app = app_for_test(&["/a", "/b", "/c"]);
-        app.active = 2; // doesn't matter which tab is active for this
+        // The tab in front is the one closed: a tab behind it closing
+        // leaves it in front — see `closing_a_background_tab_keeps_the_tab_in_front`.
+        app.active = 1;
         let _ = app.close_tab(1);
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(app.active, 1, "the tab that slid into slot 1 (originally /c) is the sensible neighbour");
@@ -8794,6 +8805,7 @@ mod tests {
     #[test]
     fn closing_the_rightmost_tab_activates_the_new_last_tab() {
         let mut app = app_for_test(&["/a", "/b", "/c"]);
+        app.active = 2;
         let _ = app.close_tab(2);
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(app.active, 1, "there is no slot to slide into past the end; the new last tab is picked");
@@ -8816,6 +8828,20 @@ mod tests {
         let mut app = app_for_test(&["/a"]);
         let _ = app.close_tab(5);
         assert_eq!(app.tabs.len(), 1, "an out-of-range close must be a no-op, not a panic");
+    }
+
+    /// J19: closing a tab behind the one in front moved the window to
+    /// that tab's neighbour, away from where the person was working.
+    #[test]
+    fn closing_a_background_tab_keeps_the_tab_in_front() {
+        let mut app = app_for_test(&["/a", "/b", "/c"]);
+        app.active = 2;
+        let _ = app.update(Message::CloseTab(0));
+        assert_eq!(app.active_tab().browser().current_dir(), Path::new("/c"), "left of it");
+        let mut app = app_for_test(&["/a", "/b", "/c"]);
+        app.active = 0;
+        let _ = app.update(Message::CloseTab(1));
+        assert_eq!(app.active_tab().browser().current_dir(), Path::new("/a"), "right of it");
     }
 
     /// [`neighbour_after_close`] pinned directly, independent of `App` —
