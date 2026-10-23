@@ -58,8 +58,14 @@ const FOLDER_SCAN: usize = 10_000;
 ///
 /// `edge` is the picture's widest side in physical pixels.
 pub fn build(path: &Path, mime: &hyprforge_mime::MimeDb, backend: &dyn FsBackend, edge: u32) -> Option<Preview> {
-    let preview = if path.is_dir() {
+    let meta = std::fs::metadata(path).ok()?;
+    let preview = if meta.is_dir() {
         folder(path)
+    } else if !meta.is_file() {
+        // A FIFO, a socket, a device: reading one to sniff it or
+        // decode it waits on whatever is at the other end — for ever,
+        // for a FIFO nobody writes — whatever its name says it is.
+        return None;
     } else {
         // By contents as well as name: a file called `notes` with no
         // extension is text, and only reading it can say so.
@@ -180,6 +186,10 @@ pub fn thumbnail(
     let source = hyprforge_files_core::preview::source_of(path).filter(|s| allowed.allows(*s))?;
     let size = Size::for_edge(edge);
     let edge = size.edge();
+    // A regular file only, for the reason `build` says.
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
     let stamp = Stamp::of(path).ok()?;
     if !allowed.allows_size(stamp.size) {
         return None;
@@ -572,6 +582,27 @@ fn run(command: &mut Command) -> Result<Option<Vec<u8>>, Unavailable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// J24: a FIFO named like a picture was opened to sniff and decode
+    /// it, and the read waited for a writer that never came — Quick
+    /// Look, and the worker it ran on, hung.
+    #[test]
+    fn a_fifo_named_like_a_picture_is_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("photo.png");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a live, NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mime = hyprforge_mime::MimeDb::default();
+            let built = build(&fifo, &mime, &hyprforge_files_core::StdBackend, 256);
+            let thumb = thumbnail(&fifo, 128, None, &mime, &Default::default());
+            let _ = tx.send((built.is_none(), thumb.is_none()));
+        });
+        let answered = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("it answered rather than waiting on the FIFO");
+        assert_eq!(answered, (true, true));
+    }
 
     /// D2: an SVG went to iced as a path before the size cap was looked
     /// at, and iced's SVG reader then read whatever file its
