@@ -284,15 +284,48 @@ pub fn check_changeable(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a copy or move landing on `to` may, with `on_collision`,
+/// replace what is already there.
+///
+/// [`check_changeable`] keeps `/` and the folders directly under it
+/// from being named, but Replace removes whatever the destination
+/// already is — so a copy *to* `/usr/bin`, answered Replace, removed
+/// `/usr/bin` through a guard that only ever refused `/usr`. A folder
+/// two levels down, or one that is a mount point at any depth (a
+/// filesystem of its own, `/boot/efi` or a whole disk), is refused as
+/// something to replace. A file there, or nothing at all, is not.
+fn check_replaceable(to: &Path, on_collision: OnCollision) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if on_collision != OnCollision::Replace {
+        return Ok(());
+    }
+    let Ok(there) = std::fs::symlink_metadata(to) else { return Ok(()) };
+    if !there.is_dir() {
+        return Ok(());
+    }
+    let depth = to.components().filter(|c| matches!(c, Component::Normal(_))).count();
+    let mount = to.parent().and_then(|p| std::fs::metadata(p).ok()).is_some_and(|parent| parent.dev() != there.dev());
+    if depth <= 2 || mount {
+        return Err(format!("{} is a system folder, and isn't replaced from here.", to.display()));
+    }
+    Ok(())
+}
+
 /// Checks a request against the rules before anything is touched.
 pub fn vet(op: &Op) -> Result<(), String> {
     match op {
         Op::ReadDir { path } | Op::Stat { path } | Op::CountChildren { path } => check(&path.to_path()),
-        Op::Copy { from, to, .. } => {
+        Op::Copy { from, to, on_collision } => {
             check(&from.to_path())?;
-            check_changeable(&to.to_path())
+            check_changeable(&to.to_path())?;
+            check_replaceable(&to.to_path(), *on_collision)
         }
-        Op::Move { from, to, .. } | Op::Rename { from, to } => {
+        Op::Move { from, to, on_collision } => {
+            check_changeable(&from.to_path())?;
+            check_changeable(&to.to_path())?;
+            check_replaceable(&to.to_path(), *on_collision)
+        }
+        Op::Rename { from, to } => {
             check_changeable(&from.to_path())?;
             check_changeable(&to.to_path())
         }
@@ -412,22 +445,28 @@ fn answer(
         }
         Op::Rename { from, to } => {
             let (from, to) = (from.to_path(), to.to_path());
-            match hyprforge_fileops::batch::rename_noreplace(&from, &to) {
-                Ok(()) => Body::Done,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => failed(&e, &to),
-                Err(e) => failed(&e, &from),
+            match (Held::parent_of(&from), Held::parent_of(&to)) {
+                (Err(e), _) => failed(&e, &from),
+                (_, Err(e)) => failed(&e, &to),
+                (Ok(held_from), Ok(held_to)) => {
+                    match hyprforge_fileops::batch::rename_noreplace(&held_from.path(), &held_to.path()) {
+                        Ok(()) => Body::Done,
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => failed(&e, &to),
+                        Err(e) => failed(&e, &from),
+                    }
+                }
             }
         }
         Op::Mkdir { path } => {
             let path = path.to_path();
-            match std::fs::create_dir(&path) {
+            match Held::parent_of(&path).and_then(|held| std::fs::create_dir(held.path())) {
                 Ok(()) => Body::Done,
                 Err(e) => failed(&e, &path),
             }
         }
         Op::Delete { path } => {
             let path = path.to_path();
-            match hyprforge_fileops::delete_permanently(&path) {
+            match Held::parent_of(&path).and_then(|held| hyprforge_fileops::delete_permanently(&held.path())) {
                 Ok(()) => Body::Done,
                 Err(e) => failed(&e, &path),
             }
@@ -436,6 +475,65 @@ fn answer(
         Op::Cancel => return Ok(()),
     };
     send(output, id, body)
+}
+
+/// A path's folder, opened without following a symbolic link anywhere
+/// on the way to it, and the last name in the path.
+///
+/// The helper runs as root, and a path is resolved afresh every time
+/// it is used: a folder somewhere along `/home/alex/a/b/x` replaced by a
+/// link to `/etc` after the window chose `x` would have a delete or a
+/// rename land in `/etc`. Opening each folder in turn with `O_NOFOLLOW`
+/// refuses a link at any step (`ELOOP`/`ENOTDIR`), and the open folder
+/// is then named through `/proc/self/fd/<n>`, which is the folder held
+/// rather than whatever has that path now — so the delete or rename
+/// itself, plain path calls as they are, cannot be steered either. The
+/// last name is never followed: a delete or rename of a link acts on
+/// the link.
+struct Held {
+    parent: std::os::fd::OwnedFd,
+    name: std::ffi::OsString,
+}
+
+impl Held {
+    fn parent_of(path: &Path) -> io::Result<Held> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let open = |at: libc::c_int, name: &std::ffi::OsStr| -> io::Result<std::os::fd::OwnedFd> {
+            let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            // SAFETY: a live, NUL-terminated name; `openat` keeps
+            // nothing, and a non-negative result is a descriptor this
+            // then owns.
+            let fd = unsafe {
+                libc::openat(at, name.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: just opened, and owned by nothing else.
+            Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+        };
+        let names: Vec<&std::ffi::OsStr> = path
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        let Some((last, folders)) = names.split_last() else {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        };
+        let mut parent = open(libc::AT_FDCWD, std::ffi::OsStr::new("/"))?;
+        for folder in folders {
+            parent = open(parent.as_raw_fd(), folder)?;
+        }
+        Ok(Held { parent, name: last.to_os_string() })
+    }
+
+    /// The path that names this, for a plain path call.
+    fn path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self.parent.as_raw_fd())).join(&self.name)
+    }
 }
 
 /// A copy or move, step by step, saying how far it has got and listening
@@ -544,6 +642,62 @@ mod tests {
         }
         assert!(check_changeable(Path::new("/etc/hosts")).is_ok());
         assert!(vet(&Op::ReadDir { path: WirePath::Text("/".into()) }).is_ok(), "looking is not changing");
+    }
+
+    /// A4: the helper runs as root, and a path is resolved again each
+    /// time it is used — so a folder swapped for a symbolic link between
+    /// the window choosing a file and the helper acting on it sent the
+    /// delete or the rename through the link, somewhere else entirely.
+    #[test]
+    fn a_delete_or_rename_never_goes_through_a_symbolic_link_on_the_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("x"), b"kept").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        let via = dir.path().join("link").join("x");
+
+        let replies = run(&[
+            Request { id: 1, op: Op::Delete { path: WirePath::from(via.as_path()) } },
+            Request { id: 2, op: Op::Rename { from: WirePath::from(via.as_path()), to: WirePath::from(dir.path().join("moved").as_path()) } },
+            Request { id: 3, op: Op::Mkdir { path: WirePath::from(dir.path().join("link").join("made").as_path()) } },
+        ]);
+
+        assert!(replies.iter().all(|r| matches!(r.body, Body::Failed { .. })), "{replies:?}");
+        assert!(real.join("x").exists(), "nothing was deleted or moved through the link");
+        assert!(!real.join("made").exists(), "nor made");
+
+        // And without a link, all three still work.
+        let plain = real.join("x");
+        let replies = run(&[
+            Request { id: 4, op: Op::Rename { from: WirePath::from(plain.as_path()), to: WirePath::from(real.join("y").as_path()) } },
+            Request { id: 5, op: Op::Mkdir { path: WirePath::from(real.join("made").as_path()) } },
+            Request { id: 6, op: Op::Delete { path: WirePath::from(real.join("y").as_path()) } },
+        ]);
+        assert!(replies.iter().all(|r| r.body == Body::Done), "{replies:?}");
+        assert!(real.join("made").is_dir() && !real.join("y").exists());
+    }
+
+    /// A5: the top-level guard looks one level down, and a collision
+    /// answered Replace removes what is there — so a copy *to*
+    /// `/usr/bin`, Replace, took `/usr/bin` away and put the copy in its
+    /// place, through a guard that only refused `/usr`.
+    #[test]
+    fn a_copy_may_not_replace_a_system_folder_two_levels_down() {
+        let top = tempfile::Builder::new().prefix("hf-admin-").tempdir_in("/tmp").unwrap();
+        assert_eq!(top.path().components().count(), 3, "/, tmp, and the folder: two levels down");
+        let deeper = top.path().join("deeper");
+        std::fs::create_dir(&deeper).unwrap();
+        let copy = |to: &Path, on_collision| Op::Copy {
+            from: WirePath::Text("/etc/hostname".into()),
+            to: WirePath::from(to),
+            on_collision,
+        };
+        assert!(vet(&copy(top.path(), OnCollision::Replace)).is_err(), "it would be removed");
+        assert!(vet(&copy(top.path(), OnCollision::KeepBoth)).is_ok(), "nothing is removed");
+        assert!(vet(&copy(&deeper, OnCollision::Replace)).is_ok(), "an ordinary folder further down");
+        let moving = Op::Move { from: WirePath::from(deeper.as_path()), to: WirePath::from(top.path()), on_collision: OnCollision::Replace };
+        assert!(vet(&moving).is_err(), "a move replaces the same way");
     }
 
     #[test]
