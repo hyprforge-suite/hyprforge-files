@@ -4426,11 +4426,11 @@ impl App {
     fn close_tab(&mut self, index: usize) -> Task<Message> {
         match neighbour_after_close(self.tabs.len(), index) {
             TabCloseOutcome::NoSuchTab => Task::none(),
-            TabCloseOutcome::WindowShouldClose => {
-                let task = self.quit();
-                self.tabs.clear();
-                task
-            }
+            // The tab stays. The window ends with the task `quit` hands
+            // back, but `update` and `view` still run before it does, and
+            // both read the tab in front — an emptied list panicked
+            // there, on the last Ctrl+W of every session.
+            TabCloseOutcome::WindowShouldClose => self.quit(),
             TabCloseOutcome::Activate(next) => {
                 self.tabs.remove(index);
                 self.active = next;
@@ -8645,11 +8645,16 @@ mod tests {
         assert_eq!(app.active, 1, "there is no slot to slide into past the end; the new last tab is picked");
     }
 
+    /// Through `update`, the road Ctrl+W takes: everything `update`
+    /// does after the message — Quick Look's sync, then `view` — reads
+    /// the tab in front, and an emptied list panicked there. Calling
+    /// `close_tab` directly, as this test once did, never got that far.
     #[test]
-    fn closing_the_last_tab_signals_the_window_should_close() {
+    fn closing_the_last_tab_closes_the_window_without_a_panic() {
         let mut app = app_for_test(&["/only"]);
-        let _ = app.close_tab(0);
-        assert!(app.tabs.is_empty(), "the tab list must actually be emptied so a later message can't reach a phantom tab");
+        let _ = app.update(Message::CloseTab(0));
+        let _ = app.view();
+        assert_eq!(app.tabs.len(), 1, "the window is closing; its last tab stays for what is still drawn");
     }
 
     #[test]
