@@ -282,6 +282,7 @@ fn main() -> iced::Result {
         queued: std::collections::VecDeque::new(),
         transfers: Transfers::default(),
         cut_from_archive: None,
+        archive_clip: 0,
         writeback: None,
         scratch: Arc::new(Scratch::default()),
         opener: Opener::default(),
@@ -518,6 +519,8 @@ enum Message {
     /// is carried so a Cut can arrange its own second half.
     ArchiveCopiesReady {
         verb: hyprforge_files_core::clipboard::ClipVerb,
+        /// Which request this answers — see `App::archive_clip`.
+        request: u64,
         result: Result<Vec<PathBuf>, String>,
     },
     /// Stop every job that is running.
@@ -995,6 +998,13 @@ struct App {
     /// Members cut out of an archive, waiting for the paste that
     /// finishes the move — see [`CutFromArchive`].
     cut_from_archive: Option<CutFromArchive>,
+    /// Which request for the clipboard is the newest. Copying out of an
+    /// archive unpacks first and sets the clipboard when that is done, so
+    /// two copies or cuts can finish in either order; one whose number
+    /// is not this is stale and is dropped. Without it, the older of two
+    /// cuts landing last put its copies beside the newer cut's members,
+    /// and the paste removed a member that was never pasted.
+    archive_clip: u64,
     /// An edit to one of those, waiting to be answered.
     ///
     /// One at a time: two notices stacked would be two questions about
@@ -2235,6 +2245,8 @@ impl App {
                 let scratch = self.scratch.clone();
                 let paths = clip.paths.clone();
                 let verb = clip.verb;
+                self.archive_clip += 1;
+                let request = self.archive_clip;
                 // One password lookup for the whole selection: every
                 // path in a listing is inside the same archive.
                 let unlock = clip
@@ -2303,10 +2315,15 @@ impl App {
                         .await
                         .unwrap_or_else(|e| Err(format!("Copying was interrupted: {e}")))
                     },
-                    move |result| Message::ArchiveCopiesReady { verb, result },
+                    move |result| Message::ArchiveCopiesReady { verb, request, result },
                 )
             }
             Outcome::SetClipboard(clip) => {
+                // Whatever was cut out of an archive is off the clipboard
+                // now, so no paste of it is coming; and an unpack still
+                // running for an earlier copy must not land on top.
+                self.cut_from_archive = None;
+                self.archive_clip += 1;
                 if let Err(e) = self.clipboard.set(clip) {
                     self.status = Some(format!("Couldn't copy: {e}"));
                 }
@@ -5461,7 +5478,11 @@ impl App {
                 let at = self.focused();
                 self.handle_outcome(at, Outcome::Activated(path))
             }
-            Message::ArchiveCopiesReady { verb, result: Ok(paths) } => {
+            // An answer to a copy or cut that a newer one has replaced.
+            // Its scratch copies stay where they are, with the rest of
+            // the scratch directory, until the window closes.
+            Message::ArchiveCopiesReady { request, .. } if request != self.archive_clip => Task::none(),
+            Message::ArchiveCopiesReady { verb, result: Ok(paths), .. } => {
                 // The clipboard always holds a *Copy* of the scratch
                 // files, whatever the verb was: a Cut would have the
                 // paste delete the scratch copy, which is neither here
@@ -7743,6 +7764,7 @@ mod tests {
             queued: std::collections::VecDeque::new(),
             transfers: Transfers::default(),
             cut_from_archive: None,
+            archive_clip: 0,
             writeback: None,
             scratch: Arc::new(Scratch::default()),
             // Never the real one: a test that opens a file would start
@@ -11385,6 +11407,58 @@ mod archive_tests {
             placed: vec![(from.to_path_buf(), to.to_path_buf())],
             ..JobSummary::default()
         }
+    }
+
+    /// J2: two cuts out of one archive, the first one's unpack landing
+    /// last. Its copies went on the clipboard and into the cut that was
+    /// noting the *second* one's members — so pasting them removed a
+    /// member nobody pasted, and kept the one that was.
+    #[test]
+    fn a_cut_whose_unpack_lands_after_a_newer_cut_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = archive_with(dir.path(), "sample.zip");
+        let mut app = app_for_test(&[archive.to_str().unwrap()]);
+        let at = At { tab: 0, pane: 0 };
+        let cut = |member: &str| {
+            Outcome::SetClipboard(hyprforge_files_core::clipboard::FileClip {
+                paths: vec![archive.join(member)],
+                verb: ClipVerb::Cut,
+            })
+        };
+        let _ = app.handle_outcome(at, cut("payload/readme.md"));
+        let first = app.archive_clip;
+        let _ = app.handle_outcome(at, cut("payload/docs/guide.txt"));
+        let second = app.archive_clip;
+        let [readme, guide] = [dir.path().join("readme.md"), dir.path().join("guide.txt")];
+
+        let _ = app.update(Message::ArchiveCopiesReady { verb: ClipVerb::Cut, request: second, result: Ok(vec![guide.clone()]) });
+        let _ = app.update(Message::ArchiveCopiesReady { verb: ClipVerb::Cut, request: first, result: Ok(vec![readme]) });
+
+        let pending = app.cut_from_archive.as_ref().expect("the newer cut stands");
+        assert_eq!(pending.members, ["payload/docs/guide.txt"]);
+        assert_eq!(pending.copies, [guide.clone()], "the copies of the members it will remove");
+        assert_eq!(app.clipboard.get().map(|c| c.paths), Some(vec![guide]), "and the clipboard holds those");
+    }
+
+    /// J2: a copy of ordinary files replaces what the clipboard held, so a
+    /// cut out of an archive that was waiting on the clipboard is over.
+    #[test]
+    fn copying_something_else_ends_a_cut_out_of_an_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = archive_with(dir.path(), "sample.zip");
+        let mut app = app_for_test(&[archive.to_str().unwrap()]);
+        let copy = dir.path().join("readme.md");
+        app.cut_from_archive = Some(cut_state(&archive, "payload/readme.md", &copy));
+
+        let _ = app.handle_outcome(
+            At { tab: 0, pane: 0 },
+            Outcome::SetClipboard(hyprforge_files_core::clipboard::FileClip {
+                paths: vec![dir.path().join("other.txt")],
+                verb: ClipVerb::Copy,
+            }),
+        );
+
+        assert!(app.cut_from_archive.is_none());
     }
 
     /// The whole point of deferring: the member is still in the archive
