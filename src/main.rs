@@ -5238,7 +5238,9 @@ impl App {
                     Ok(()) => {
                         self.status = None;
                         let _ = self.pane_mut(at).browser.update(BrowserMessage::SetAdmin(hyprforge_files_core::Admin::Elevated));
-                        self.spawn_read_dir(at, path)
+                        // Only if still there — see `TrashDone` for why a
+                        // read of a folder the pane has left strands it.
+                        self.refresh_dirs(&[path])
                     }
                     Err(why) => {
                         self.status = Some(why);
@@ -5388,19 +5390,21 @@ impl App {
                     self.status = Some(format!("Couldn't remove everything: {}", errors.join("; ")));
                 }
                 let noticed = self.record(hyprforge_files_core::undo::Undoable::Trashed(trashed));
-                let Some(at) = self.locate(pane_id) else {
+                if self.locate(pane_id).is_none() {
                     // The pane this delete was started from has since
                     // closed. The files are already trashed either way;
                     // there is simply no listing left to refresh.
                     return noticed;
-                };
+                }
                 // Refresh regardless of whether anything failed, so what
-                // did succeed disappears from the listing. Safe even if
-                // the user has since navigated elsewhere within this tab:
-                // this issues a plain read (not a navigation), and
-                // `Browser` ignores a `DirLoaded` for a directory that is
-                // no longer current.
-                Task::batch([self.spawn_read_dir(at, dir), noticed])
+                // did succeed disappears from the listing — but only where
+                // that folder is still on screen. Reading it in a pane
+                // that has moved on was not the harmless no-op it looked:
+                // the read bumps the pane's read number, so the listing
+                // of where it went arrived stale and was dropped, the
+                // browser dropped this one as somewhere it no longer is,
+                // and the pane sat on "Loading…" for good.
+                Task::batch([self.refresh_dirs(&[dir]), noticed])
             }
             Message::PrefsSaved(Ok(prefs)) => {
                 // Feeds the next `Ctrl+T`/`+` — see `last_prefs`'s own
@@ -5604,10 +5608,9 @@ impl App {
                 // there is no other way to hand it down.
                 self.keyring.remember(&unlocking.archive, unlocking.typed);
                 match unlocking.then {
-                    AfterUnlock::Listing { tab, dir } => match self.locate(tab) {
-                        Some(at) => self.spawn_read_dir(at, dir),
-                        None => Task::none(),
-                    },
+                    // Every pane still showing it — see `TrashDone` for why
+                    // not one that has moved on.
+                    AfterUnlock::Listing { dir, .. } => self.refresh_dirs(&[dir]),
                     AfterUnlock::Open(path) => self.open_from_archive(path),
                     AfterUnlock::Retry(work) => self.start_archive_job(work),
                 }
@@ -8503,6 +8506,48 @@ mod tests {
         let _ = app.handle_outcome(At { tab: 0, pane: 0 }, Outcome::Pins(PinChange::Pin("/b".into())));
         let _ = app.update(Message::PinnedLoaded(vec![pinned_item("/a")]));
         assert!(app.tabs[0].browser().pinned().is_empty());
+    }
+
+    /// J6: something finishes for the folder a pane has just left — a
+    /// trash, administrator access — and the pane must still show the
+    /// folder it went to. Reading the old folder again bumped the pane's
+    /// read number, so the new folder's listing arrived stale and was
+    /// dropped, and the read of the old one was dropped by the browser
+    /// as somewhere it no longer is: "Loading…" for good.
+    fn assert_moving_on_survives(finish: impl FnOnce(&mut App, u64)) {
+        let mut app = app_for_test(&["/a"]);
+        let id = app.tabs[0].panes[0].id;
+        let _ = app.update(Message::Browser(BrowserMessage::Navigate(PathBuf::from("/b"))));
+        let generation = app.tabs[0].panes[0].read_generation;
+        finish(&mut app, id);
+        let _ = app.update(Message::DirLoaded(id, generation, PathBuf::from("/b"), Ok(vec![entry_named("x")])));
+        assert_eq!(row_names(app.tabs[0].browser()), ["x"], "the folder moved to is listed");
+    }
+
+    #[test]
+    fn a_trash_finishing_after_moving_on_leaves_the_new_folder_listed() {
+        assert_moving_on_survives(|app, id| {
+            let _ = app.update(Message::TrashDone(id, PathBuf::from("/a"), Vec::new(), Vec::new()));
+        });
+    }
+
+    #[test]
+    fn administrator_access_arriving_after_moving_on_leaves_the_new_folder_listed() {
+        assert_moving_on_survives(|app, id| {
+            let _ = app.update(Message::AdminOpened(id, PathBuf::from("/a"), Ok(())));
+        });
+    }
+
+    #[test]
+    fn an_archive_password_arriving_after_moving_on_leaves_the_new_folder_listed() {
+        assert_moving_on_survives(|app, id| {
+            let _ = app.ask_for_password(
+                PathBuf::from("/a.7z"),
+                AfterUnlock::Listing { tab: id, dir: PathBuf::from("/a.7z") },
+            );
+            let _ = app.update(Message::UnlockTyped("dummy".to_string()));
+            let _ = app.update(Message::UnlockConfirm);
+        });
     }
 
     /// A tab saving its view settings must not put back pins or a window
