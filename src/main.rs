@@ -2210,7 +2210,7 @@ impl App {
             }
             Outcome::Compress { sources, into } => {
                 self.compressing = Some(Compressing::new(sources, into));
-                Task::none()
+                iced::widget::operation::focus(iced::widget::Id::new(COMPRESS_FIELD))
             }
             Outcome::OpenInNewTab(path) => self.open_tab(path),
             // Copying *out of* an archive. The paths on a listing
@@ -2788,7 +2788,7 @@ impl App {
             then,
             retry,
         });
-        Task::none()
+        iced::widget::operation::focus(iced::widget::Id::new(UNLOCK_FIELD))
     }
 
     /// Unpacks one member to a scratch directory and opens the copy.
@@ -4398,6 +4398,29 @@ impl App {
         iced::exit()
     }
 
+    /// Escape over a card with a field in it, whether the field had it
+    /// (`EscapeInField`) or not (`KeyPressed`): closes the card in front,
+    /// in the order `view` stacks them. `None` when no such card is up.
+    fn escape_field_card(&mut self) -> Option<Task<Message>> {
+        if self.unlocking.is_some() {
+            return Some(self.update(Message::UnlockCancel));
+        }
+        // The drive's passphrase prompt closes on Escape, unless an
+        // attempt is running — see `DriveUnlock::running`.
+        if self.drive_unlock.is_some() {
+            return Some(self.drive_unlock_update(devices_view::DriveUnlockMessage::Cancel));
+        }
+        // The Connect to Server dialog's fields keep Escape: it stops an
+        // attempt, or closes the dialog.
+        if self.connecting.is_some() {
+            return Some(self.connect_update(ConnectMessage::Cancel));
+        }
+        if self.compressing.is_some() {
+            return Some(self.update(Message::CompressCancel));
+        }
+        None
+    }
+
     /// `Ctrl+W`, or a tab's own close button. See [`neighbour_after_close`]
     /// for the "which neighbour" decision this applies.
     fn close_tab(&mut self, index: usize) -> Task<Message> {
@@ -4674,6 +4697,26 @@ impl App {
                 }
                 _ => Task::none(),
             },
+            // A card with a field in it — the archive password, the
+            // drive passphrase, Connect to Server, Compress — has the
+            // keyboard, whether or not its field has focus. Escape
+            // closes the one in front (the order `view` stacks them in);
+            // every other key is swallowed. Without this arm a key the
+            // field did not capture fell through to the listing behind:
+            // letters to type-to-search, which draws them in plain text
+            // — a password, there — and Delete to the selection.
+            Message::KeyPressed(press)
+                if self.unlocking.is_some()
+                    || self.drive_unlock.is_some()
+                    || self.connecting.is_some()
+                    || self.compressing.is_some() =>
+            {
+                if press.key == keymap::Key::Escape {
+                    self.escape_field_card().unwrap_or_else(Task::none)
+                } else {
+                    Task::none()
+                }
+            }
             // A conflict dialog has the keyboard. Escape cancels the job;
             // Enter keeps both, the one answer that neither loses a file
             // nor leaves one behind.
@@ -5233,15 +5276,8 @@ impl App {
                     self.tagging = None;
                     return Task::none();
                 }
-                // The drive's passphrase prompt closes on Escape, unless
-                // an attempt is running — see `DriveUnlock::running`.
-                if self.drive_unlock.is_some() {
-                    return self.drive_unlock_update(devices_view::DriveUnlockMessage::Cancel);
-                }
-                // The Connect to Server dialog's fields keep Escape: it
-                // stops an attempt, or closes the dialog.
-                if self.connecting.is_some() {
-                    return self.connect_update(ConnectMessage::Cancel);
+                if let Some(task) = self.escape_field_card() {
+                    return task;
                 }
                 let at = self.focused();
                 let browser = &mut self.pane_mut(at).browser;
@@ -6399,6 +6435,7 @@ fn unlock_dialog<'a>(unlocking: &Unlocking, scale: FontScale) -> Element<'a, Mes
     };
 
     let field = iced::widget::text_input("Password", unlocking.typed.expose())
+        .id(iced::widget::Id::new(UNLOCK_FIELD))
         .secure(true)
         .on_input(Message::UnlockTyped)
         .on_submit(Message::UnlockConfirm)
@@ -6527,6 +6564,16 @@ const QL_BAR: f32 = 44.0;
 /// The Tags sheet's field, which has the keyboard when it opens.
 const TAG_FIELD: &str = "tags-new";
 
+/// The archive password prompt's field, which has the keyboard the
+/// moment the prompt opens. Not a nicety: a prompt whose field is not
+/// focused sends every key typed at it to the listing behind, and the
+/// listing's type-to-search draws what it gets in plain text.
+const UNLOCK_FIELD: &str = "unlock-archive-password";
+
+/// The Compress dialog's name field, focused when the dialog opens for
+/// the same reason.
+const COMPRESS_FIELD: &str = "compress-name";
+
 /// The Tags sheet — see `hyprforge_files::tags_sheet`. A row per tag,
 /// marked by how many of the selection have it; a field for a new one.
 fn tags_dialog<'a>(sheet: &hyprforge_files::tags_sheet::TagSheet, scale: FontScale) -> Element<'a, Message> {
@@ -6591,6 +6638,7 @@ fn compress_dialog<'a>(compressing: &Compressing, scale: FontScale) -> Element<'
     };
 
     let name_field = iced::widget::text_input("Name", &compressing.name)
+        .id(iced::widget::Id::new(COMPRESS_FIELD))
         .on_input(Message::CompressNameChanged)
         .on_submit(Message::CompressConfirm)
         .size(scale.apply(BASE_TEXT_SIZE))
@@ -8686,12 +8734,12 @@ mod tests {
     // key takes, rather than asserting on `Keymap::resolve` alone — the
     // double-click bug was a unit that passed while the wiring was dead.
 
-    fn key(binding: &str) -> Message {
+    pub(super) fn key(binding: &str) -> Message {
         let combo = keymap::Combo::parse(binding).unwrap();
         Message::KeyPressed(keymap::KeyPress { key: combo.key, mods: combo.mods, text: None })
     }
 
-    fn typed(c: char) -> Message {
+    pub(super) fn typed(c: char) -> Message {
         Message::KeyPressed(keymap::KeyPress {
             key: keymap::Key::Char(c),
             mods: keymap::Modifiers::default(),
@@ -9421,14 +9469,14 @@ mod tests {
 
     // --- trash and delete confirmation ---------------------------------------
 
-    fn with_behaviour(app: &mut App, behaviour: hyprforge_files_core::config::Behaviour) {
+    pub(super) fn with_behaviour(app: &mut App, behaviour: hyprforge_files_core::config::Behaviour) {
         app.config = Arc::new(hyprforge_files_core::config::Config {
             behaviour,
             ..hyprforge_files_core::config::Config::default()
         });
     }
 
-    fn one_selected_file(app: &mut App) {
+    pub(super) fn one_selected_file(app: &mut App) {
         let _ = app.update(Message::Browser(BrowserMessage::DirLoaded(
             PathBuf::from("/dir"),
             Ok(vec![entry_named("a.txt")]),
@@ -10672,7 +10720,7 @@ mod tests {
 
 #[cfg(test)]
 mod archive_tests {
-    use super::tests::app_for_test;
+    use super::tests::{app_for_test, key, one_selected_file, typed, with_behaviour};
     use super::*;
     use hyprforge_archive::backend::{ArchiveBackend, NoProgress};
     use hyprforge_archive::{Format, Source, StdArchives, Unlock};
@@ -10981,6 +11029,79 @@ mod archive_tests {
         assert!(
             !app.keyring.knows(&archive),
             "a password that was cancelled was never given"
+        );
+    }
+
+    /// Every card that holds a text field the person types into, opened
+    /// over a listing with one file selected, and what a key behind it
+    /// would have done had it leaked: a letter starts a type-to-search,
+    /// and Delete asks to trash the selection.
+    ///
+    /// The letter is a stand-in, not anything a password would be —
+    /// what matters is where it went, never what it was.
+    fn assert_keys_stay_behind(open: impl Fn(&mut App), is_open: impl Fn(&App) -> bool) {
+        let mut app = app_for_test(&["/dir"]);
+        with_behaviour(
+            &mut app,
+            hyprforge_files_core::config::Behaviour {
+                confirm_trash: true,
+                ..hyprforge_files_core::config::Behaviour::default()
+            },
+        );
+        one_selected_file(&mut app);
+        let selected = app.tabs[0].browser().selection().clone();
+        open(&mut app);
+        assert!(is_open(&app), "the card must be up for this to mean anything");
+
+        let _ = app.update(typed('x'));
+        let _ = app.update(key("Delete"));
+        let _ = app.update(key("Down"));
+
+        assert!(is_open(&app), "a key behind the card does not close it");
+        // `is_empty`, not a comparison: an assertion that prints what a
+        // search box holds is one that would print a password.
+        assert!(app.tabs[0].browser().search_query().is_empty(), "a letter must not reach type-to-search");
+        assert!(app.confirm.is_none(), "Delete must not reach the selection behind the card");
+        assert_eq!(app.tabs[0].browser().selection(), &selected, "nor move it");
+
+        let _ = app.update(key("Escape"));
+        assert!(!is_open(&app), "Escape closes the card");
+    }
+
+    /// J4: the password prompt took no keyboard focus and the window
+    /// had no arm for it, so what was typed for the archive went to the
+    /// listing's type-to-search — drawn in plain text — and Delete
+    /// trashed the selection behind the dialog.
+    #[test]
+    fn a_key_pressed_while_a_password_is_asked_for_never_reaches_the_listing() {
+        assert_keys_stay_behind(
+            |app| {
+                let _ = app.ask_for_password(PathBuf::from("/dir/locked.zip"), AfterUnlock::Open("/dir/locked.zip/a".into()));
+            },
+            |app| app.unlocking.is_some(),
+        );
+    }
+
+    #[test]
+    fn a_key_pressed_while_compress_is_open_never_reaches_the_listing() {
+        assert_keys_stay_behind(
+            |app| {
+                let _ = app.handle_outcome(
+                    At { tab: 0, pane: 0 },
+                    Outcome::Compress { sources: vec!["/dir/a.txt".into()], into: "/dir".into() },
+                );
+            },
+            |app| app.compressing.is_some(),
+        );
+    }
+
+    #[test]
+    fn a_key_pressed_while_connect_to_server_is_open_never_reaches_the_listing() {
+        assert_keys_stay_behind(
+            |app| {
+                let _ = app.open_connect();
+            },
+            |app| app.connecting.is_some(),
         );
     }
 
