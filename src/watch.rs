@@ -192,7 +192,11 @@ fn refused_once(why: &str, error: &dyn std::fmt::Display) {
 /// descriptors is, and what is left to poll.
 struct SetUp {
     inotify: Option<Inotify>,
-    watching: HashMap<WatchDescriptor, PathBuf>,
+    /// Every path each descriptor stands for. More than one when a
+    /// folder is on screen under two names — itself, and through a link
+    /// — because the kernel gives one folder one watch however it is
+    /// named; keeping only the last name left the other pane deaf.
+    watching: HashMap<WatchDescriptor, Vec<PathBuf>>,
     polled: Vec<PathBuf>,
 }
 
@@ -226,7 +230,7 @@ fn set_up(watched: &Watched) -> SetUp {
     for dir in kernel {
         match watches.add(&dir, mask()) {
             Ok(wd) => {
-                watching.insert(wd, dir);
+                watching.entry(wd).or_insert_with(Vec::new).push(dir);
             }
             Err(e) => match after_refusal(&e) {
                 How::Skip => {}
@@ -273,13 +277,13 @@ where
 
 /// The folders a burst of events touched. A queue overflow means events
 /// were lost, so every watched folder might have changed.
-fn dirty(events: &[io::Result<inotify::EventOwned>], watching: &HashMap<WatchDescriptor, PathBuf>) -> BTreeSet<PathBuf> {
+fn dirty(events: &[io::Result<inotify::EventOwned>], watching: &HashMap<WatchDescriptor, Vec<PathBuf>>) -> BTreeSet<PathBuf> {
     let mut dirty = BTreeSet::new();
     for event in events.iter().flatten() {
         if event.mask.contains(EventMask::Q_OVERFLOW) {
-            dirty.extend(watching.values().cloned());
-        } else if let Some(dir) = watching.get(&event.wd) {
-            dirty.insert(dir.clone());
+            dirty.extend(watching.values().flatten().cloned());
+        } else if let Some(dirs) = watching.get(&event.wd) {
+            dirty.extend(dirs.iter().cloned());
         }
     }
     dirty
@@ -312,7 +316,7 @@ pub fn watch(watched: &Watched) -> impl Stream<Item = PathBuf> + use<> {
         });
         if events.is_none() {
             // Whatever the kernel was going to watch is now polled.
-            polled.extend(watching.values().cloned());
+            polled.extend(watching.values().flatten().cloned());
         }
         polled.sort();
         polled.dedup();
@@ -332,7 +336,7 @@ pub fn watch(watched: &Watched) -> impl Stream<Item = PathBuf> + use<> {
                         // The descriptor closed under us — nothing more
                         // will arrive, so fall back to looking.
                         events = None;
-                        polled.extend(watching.values().cloned());
+                        polled.extend(watching.values().flatten().cloned());
                         continue;
                     };
                     for dir in dirty(&got, &watching) {
@@ -437,6 +441,26 @@ mod tests {
         // then one quiet period. Printed so a run can be read for it.
         eprintln!("burst of 200 writes to re-read: {latency:?}");
         assert!(latency < QUIET + Duration::from_millis(750), "{latency:?}");
+    }
+
+    /// J25: the kernel gives a folder one watch however many paths name
+    /// it, so a folder on screen as itself in one pane and through a
+    /// link in another had its first path overwritten in the map, and
+    /// that pane never heard a change.
+    #[tokio::test]
+    async fn a_folder_shown_under_two_names_refreshes_under_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut stream = Box::pin(watch(&watched(&[&real, &link], &[], Duration::from_secs(3600))));
+        assert!(collect_for(&mut stream, Duration::from_millis(300)).await.is_empty(), "nothing yet");
+
+        std::fs::write(real.join("new"), b"x").unwrap();
+        let mut got = collect_for(&mut stream, QUIET * 4).await;
+        got.sort();
+        assert_eq!(got, [link, real]);
     }
 
     #[test]
