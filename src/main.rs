@@ -277,6 +277,7 @@ fn main() -> iced::Result {
         versions: None,
         bulk_rename: None,
         unlocking: None,
+        unlock_queue: std::collections::VecDeque::new(),
         keyring,
         opened_members: Vec::new(),
         queued: std::collections::VecDeque::new(),
@@ -982,6 +983,9 @@ struct App {
     bulk_rename: Option<(u64, hyprforge_files::bulk_rename::BulkRename)>,
     /// An open password prompt for an encrypted archive.
     unlocking: Option<Unlocking>,
+    /// Prompts asked for while one was already open, in order — see
+    /// [`App::ask_for_password`].
+    unlock_queue: std::collections::VecDeque<(PathBuf, AfterUnlock)>,
     /// Passwords typed into that prompt, shared with the backend that
     /// lists archives — see `hyprforge_archive::Keyring`. Held here as
     /// well as there because the prompt is the window's and the listing
@@ -2798,7 +2802,16 @@ impl App {
     /// refused, so the prompt says so — without it, a wrong password
     /// reopens an identical-looking box and reads as the window having
     /// ignored the first attempt.
+    ///
+    /// One prompt at a time. A second asked for while one is open waits
+    /// its turn rather than replacing it: replacing it lost what the
+    /// first was for — a job to run again, a listing to read — with
+    /// nothing to say so. See [`Self::after_unlock_answered`].
     fn ask_for_password(&mut self, archive: PathBuf, then: AfterUnlock) -> Task<Message> {
+        if self.unlocking.is_some() {
+            self.unlock_queue.push_back((archive, then));
+            return Task::none();
+        }
         let retry = self.keyring.knows(&archive);
         // Forgotten now rather than on the next attempt: whatever is in
         // there did not work, and leaving it would have every later read
@@ -2811,6 +2824,32 @@ impl App {
             retry,
         });
         iced::widget::operation::focus(iced::widget::Id::new(UNLOCK_FIELD))
+    }
+
+    /// Carries out what a password was asked for, once it is known.
+    fn unlocked(&mut self, then: AfterUnlock) -> Task<Message> {
+        match then {
+            // Every pane still showing it — see `TrashDone` for why
+            // not one that has moved on.
+            AfterUnlock::Listing { dir, .. } => self.refresh_dirs(&[dir]),
+            AfterUnlock::Open(path) => self.open_from_archive(path),
+            AfterUnlock::Retry(work) => self.start_archive_job(work),
+        }
+    }
+
+    /// The prompt for `archive` was answered (`given`) or cancelled. What
+    /// else was waiting on that archive is carried out with the same
+    /// answer — or, cancelled, dropped with it — and the next prompt
+    /// waiting on another archive opens.
+    fn after_unlock_answered(&mut self, archive: &Path, given: bool) -> Task<Message> {
+        let (same, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.unlock_queue).into_iter().partition(|(a, _)| a == archive);
+        self.unlock_queue = rest.into();
+        let mut tasks: Vec<Task<Message>> =
+            if given { same.into_iter().map(|(_, then)| self.unlocked(then)).collect() } else { Vec::new() };
+        if let Some((next, then)) = self.unlock_queue.pop_front() {
+            tasks.push(self.ask_for_password(next, then));
+        }
+        Task::batch(tasks)
     }
 
     /// Unpacks one member to a scratch directory and opens the copy.
@@ -5614,8 +5653,8 @@ impl App {
                 Task::none()
             }
             Message::UnlockCancel => {
-                self.unlocking = None;
-                Task::none()
+                let Some(unlocking) = self.unlocking.take() else { return Task::none() };
+                self.after_unlock_answered(&unlocking.archive, false)
             }
             Message::UnlockConfirm => {
                 let Some(unlocking) = self.unlocking.take() else {
@@ -5625,13 +5664,8 @@ impl App {
                 // through the backend and the backend asks the keyring —
                 // there is no other way to hand it down.
                 self.keyring.remember(&unlocking.archive, unlocking.typed);
-                match unlocking.then {
-                    // Every pane still showing it — see `TrashDone` for why
-                    // not one that has moved on.
-                    AfterUnlock::Listing { dir, .. } => self.refresh_dirs(&[dir]),
-                    AfterUnlock::Open(path) => self.open_from_archive(path),
-                    AfterUnlock::Retry(work) => self.start_archive_job(work),
-                }
+                let done = self.unlocked(unlocking.then);
+                Task::batch([done, self.after_unlock_answered(&unlocking.archive, true)])
             }
             Message::ArchiveMemberReady {
                 archive,
@@ -7784,6 +7818,7 @@ mod tests {
             versions: None,
             bulk_rename: None,
             unlocking: None,
+            unlock_queue: std::collections::VecDeque::new(),
             keyring: Arc::new(hyprforge_archive::Keyring::new()),
             opened_members: Vec::new(),
             queued: std::collections::VecDeque::new(),
@@ -8857,6 +8892,22 @@ mod tests {
 
         let state = format!("{:?}", app.tabs[0].browser());
         assert!(state.contains("Error(DirError"), "not still loading: {state}");
+    }
+
+    /// J18: a second prompt asked for while one was open replaced it,
+    /// and what the first was for was lost without a word.
+    #[test]
+    fn a_second_password_prompt_waits_for_the_first() {
+        let mut app = app_for_test(&["/a"]);
+        let (one, two) = (PathBuf::from("/a/one.zip"), PathBuf::from("/a/two.zip"));
+        let _ = app.ask_for_password(one.clone(), AfterUnlock::Open(one.join("x")));
+        let _ = app.ask_for_password(two.clone(), AfterUnlock::Open(two.join("y")));
+        assert_eq!(app.unlocking.as_ref().map(|u| u.archive.clone()), Some(one), "the first stays up");
+
+        let _ = app.update(Message::UnlockCancel);
+        assert_eq!(app.unlocking.as_ref().map(|u| u.then.clone()), Some(AfterUnlock::Open(two.join("y"))), "then the second");
+        let _ = app.update(Message::UnlockCancel);
+        assert!(app.unlocking.is_none());
     }
 
     /// J19: closing a tab behind the one in front moved the window to
