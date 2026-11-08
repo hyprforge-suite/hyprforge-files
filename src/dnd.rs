@@ -304,7 +304,7 @@ impl Dnd {
     /// left, and closing goes on — a window that will not close is a
     /// worse failure than the crash this prevents, which happens after
     /// everything worth keeping is saved. Left, but not loose: it, and
-    /// every other thread here, uses the display only while [`Life`]
+    /// every other thread here, uses the display only while `Life`
     /// says it may, and once this returns it never may again.
     ///
     /// An archive drag still unpacking is abandoned — it stops at its
