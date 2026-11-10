@@ -77,6 +77,19 @@ use std::path::{Path, PathBuf};
 const APP_ID: &str = "hyprforge-files";
 
 fn main() -> iced::Result {
+    // Asked by Settings' Keyboard page, before anything opens a window or
+    // a bus name.
+    if std::env::args().skip(1).any(|a| a == "--list-keys") {
+        match hyprforge_files_core::keymap::listing().render() {
+            Ok(text) => print!("{text}"),
+            Err(e) => {
+                eprintln!("hyprforge-files: can't list the keys: {e}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     // `warn` unless RUST_LOG says otherwise — see hyprforge-settings's
     // identical note: a GUI launched from a menu has no terminal, and
     // defaulting to ERROR would silence every `warn!` below, including
